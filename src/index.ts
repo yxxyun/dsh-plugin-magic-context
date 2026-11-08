@@ -77,6 +77,7 @@ import { SearchHintTracker } from './dsh/search-hint.ts'
 import { registerMagicCompactionEngine, type EngineHandle } from './dsh/compaction-engine.ts'
 import { liveJournal } from './dsh/live-journal.ts'
 import { createTelemetryService } from './dsh/telemetry.ts'
+import { createDashboardService } from './dsh/dashboard.ts'
 import { openMemoryLane } from './dsh/memory-lane.ts'
 import { injectReduceGuidance, preStepListener, type PreStepProjects } from './dsh/pre-step.ts'
 import { wireMaintenance } from './dsh/maintenance-wiring.ts'
@@ -774,6 +775,7 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
   // `ctx.inject` waits for the service and re-runs on its lifecycle, which is
   // how @deepseek-ai/dsh-client-modules attaches its own route.
   let telemetry: ReturnType<typeof createTelemetryService> | undefined
+  let dashboard: ReturnType<typeof createDashboardService> | undefined
   ctx.inject(['webServer'], (scope) => {
     const webServer = (scope as unknown as {
       webServer: {
@@ -829,6 +831,43 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
     journal?.info('boot', 'telemetry route attached for the browser half', {
       telemetry: '/mc-telemetry',
       routes: ['/mc-telemetry/summary', '/mc-telemetry/events'],
+    })
+
+    // ── The read-only dashboard ─────────────────────────────────────────────
+    // Upstream ships a Tauri app for this (packages/dashboard, Rust half opening
+    // the SQLite files directly); a DSH plugin cannot ship a window, and the
+    // harness already owns a web server, so the same surface is served as HTML +
+    // JSON here. No build step, no new dependency — the page is one string.
+    //
+    // Read-only by construction: only the store's list/get readers are called
+    // and there is no mutation route. The route has no auth beyond the loopback
+    // bind, so it serves counts, timestamps, kinds and identities — never
+    // message content, memory content, or file contents.
+    dashboard = createDashboardService({
+      stores,
+      ...journal === undefined ? {} : { journal },
+      ...memoryWriter === undefined ? {} : { memoryWriter },
+      meta: () => ({
+        engine: stores.getMeta('compaction_engine'),
+        memory: stores.getMeta('memory_bridge'),
+        memoryWrite: stores.getMeta('memory_write'),
+        toolsMode: toolMode,
+      }),
+      liveSessions: () => [...projects.sessionIdentity.keys()],
+      startedAt,
+    })
+    const dash = dashboard
+    scope.effect(() => webServer.register({
+      kind: 'prefix',
+      path: '/mc-dashboard',
+      handler: (req, res) => dash.handle(
+        req as unknown as Parameters<typeof dash.handle>[0],
+        res as unknown as Parameters<typeof dash.handle>[1],
+      ),
+    }))
+    journal?.info('boot', 'read-only dashboard attached', {
+      dashboard: '/mc-dashboard',
+      routes: ['/', '/api/overview', '/api/sessions', '/api/projects', '/api/journal', '/api/session'],
     })
   })
 

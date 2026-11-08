@@ -203,6 +203,25 @@ export interface MergeMemoryInput {
   readonly category?: string
 }
 
+/**
+ * One row of the dashboard's project list (see `MemoryWriter.listProjects`).
+ *
+ * Every field is a count already materialised in `memories`, so the list is one
+ * `GROUP BY` and never touches row content.
+ */
+export interface CorpusProjectRow {
+  readonly identity: string
+  /** Every row, archived included. */
+  readonly memories: number
+  /** Rows in `active`/`permanent`: the injectable set. */
+  readonly active: number
+  readonly archived: number
+  readonly verified: number
+  readonly unverified: number
+  readonly categories: number
+  readonly lastUpdatedAt?: number
+}
+
 export interface ListMemoriesOptions {
   /** Rows returned; omitted = every injectable row. */
   readonly limit?: number
@@ -352,6 +371,15 @@ export interface MemoryWriter {
   getMemory(identity: string, id: number): MemoryRecord | undefined
   /** `list`: injectable rows of `identity`, in MC's render order (§11.6). */
   listMemories(identity: string, options?: ListMemoriesOptions): readonly MemoryRecord[]
+  /**
+   * The dashboard's project list: every identity in the corpus with its tallies,
+   * newest activity first. Read-only and aggregate-only.
+   *
+   * The corpus is the ONLY source here, on purpose: the adapter's in-memory
+   * `seenIdentities` set is process-local (empty after a restart) and would make
+   * the list depend on which Sessions happened to run since boot.
+   */
+  listProjects(limit?: number): readonly CorpusProjectRow[]
   /**
    * Explicit-retrieval telemetry (§9.1): `retrieval_count + 1` and a fresh
    * `last_retrieved_at` for rows the agent explicitly retrieved, in one
@@ -705,6 +733,7 @@ export function openMemoryWriter(options: MemoryWriterOptions): MemoryWriter {
       mergeMemory: () => refused,
       getMemory: () => undefined,
       listMemories: () => [],
+      listProjects: () => [],
       listExpired: () => [],
       markVerified: () => 0,
       classifyMemories: () => 0,
@@ -1453,6 +1482,50 @@ export function openMemoryWriter(options: MemoryWriterOptions): MemoryWriter {
           return row
         } catch {
           return undefined
+        }
+      },
+      /**
+       * The dashboard's project list: one `GROUP BY` over `memories`, no content.
+       * A project with zero live rows still appears (its history is real); the
+       * archived count is what tells the two apart.
+       */
+      listProjects: (limit) => {
+        try {
+          const rows = db.prepare(`
+            SELECT project_path AS identity,
+                   COUNT(*) AS memories,
+                   SUM(CASE WHEN status IN ('active','permanent') THEN 1 ELSE 0 END) AS active,
+                   SUM(CASE WHEN status = 'archived' THEN 1 ELSE 0 END) AS archived,
+                   SUM(CASE WHEN status IN ('active','permanent') AND verified_at IS NOT NULL THEN 1 ELSE 0 END) AS verified,
+                   SUM(CASE WHEN status IN ('active','permanent') AND verified_at IS NULL THEN 1 ELSE 0 END) AS unverified,
+                   COUNT(DISTINCT category) AS categories,
+                   MAX(updated_at) AS lastUpdatedAt
+            FROM memories
+            GROUP BY project_path
+            ORDER BY MAX(updated_at) DESC
+            LIMIT ?
+          `).all(limit ?? 200) as Array<{
+            identity: string
+            memories: number
+            active: number
+            archived: number
+            verified: number
+            unverified: number
+            categories: number
+            lastUpdatedAt: number | null
+          }>
+          return rows.map(row => ({
+            identity: row.identity,
+            memories: Number(row.memories),
+            active: Number(row.active),
+            archived: Number(row.archived),
+            verified: Number(row.verified),
+            unverified: Number(row.unverified),
+            categories: Number(row.categories),
+            ...row.lastUpdatedAt === null ? {} : { lastUpdatedAt: row.lastUpdatedAt },
+          }))
+        } catch {
+          return []
         }
       },
       listMemories: (identity, listOptions) => {

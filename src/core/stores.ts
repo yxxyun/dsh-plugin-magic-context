@@ -205,6 +205,28 @@ export interface NoteRow {
   readonly anchorOrdinal?: number
 }
 
+/** One row of the dashboard's session list (see `AdapterStores.listSessions`).
+ *
+ * `latestPressure`/`latestTokens` come from the newest `context-pressure` or
+ * `pass` journal row of that Session — the two kinds that carry a reading. They
+ * are optional because a Session that never ran a pass has neither.
+ */
+export interface SessionSummaryRow {
+  readonly sessionId: string
+  readonly journalRows: number
+  readonly usageRows: number
+  readonly compartments: number
+  readonly landedCompartments: number
+  readonly tags: number
+  readonly pendingDrops: number
+  readonly notes: number
+  readonly firstAt?: number
+  readonly lastAt?: number
+  readonly latestPressure?: number
+  readonly latestTokens?: number
+  readonly latestContextWindow?: number
+}
+
 export interface AdapterStores {
   readonly dbPath: string
   /** Fails closed (returns null) when the persisted version is ahead. */
@@ -292,6 +314,17 @@ export interface AdapterStores {
   pruneMemoryStats(projectIdentity: string, keepIds: readonly number[]): number
   /** Row count plus the oldest/newest timestamps. */
   journalBounds(): { rows: number; oldest?: number; newest?: number }
+  /**
+   * The dashboard's session list: every Session this store has ever seen, with
+   * the facts a browser needs to pick one (rows, span, last activity, whether
+   * it is compacting right now). Read-only and aggregate-only.
+   *
+   * A Session is "known" if ANY of the per-session tables mentions it — journal,
+   * usage, compartments, tags, notes. Counting only the journal would hide a
+   * Session whose first pass never logged, and counting only `usage_records`
+   * would hide one that never completed a turn.
+   */
+  listSessions(limit?: number): SessionSummaryRow[]
 
   // ---- schema v8: global domains ------------------------------------------
   /**
@@ -1558,6 +1591,130 @@ export function openStores(dataDir: string): AdapterStores {
     return Number(result.changes)
   }
 
+  /**
+   * The dashboard's session list.
+   *
+   * One query over the union of the per-session tables rather than N queries per
+   * Session: an install with a few hundred sessions must not walk each one. The
+   * counters are `LEFT JOIN`ed subqueries because a Session missing from any one
+   * table must still appear (that is the point of the union).
+   */
+  const listSessions = (limit?: number): SessionSummaryRow[] => {
+    const rows = db.prepare(`
+      WITH known(session_id) AS (
+        SELECT session_id FROM journal WHERE session_id IS NOT NULL
+        UNION SELECT session_id FROM usage_records
+        UNION SELECT session_id FROM compartments
+        UNION SELECT session_id FROM tags
+        UNION SELECT session_id FROM notes WHERE session_id IS NOT NULL
+      ),
+      j AS (
+        SELECT session_id, COUNT(*) AS rows, MIN(at) AS firstAt, MAX(at) AS lastAt
+        FROM journal WHERE session_id IS NOT NULL GROUP BY session_id
+      ),
+      u AS (SELECT session_id, COUNT(*) AS rows FROM usage_records GROUP BY session_id),
+      c AS (
+        SELECT session_id, COUNT(*) AS all_rows,
+               SUM(CASE WHEN landed_event_seq IS NOT NULL THEN 1 ELSE 0 END) AS landed
+        FROM compartments GROUP BY session_id
+      ),
+      t AS (SELECT session_id, COUNT(*) AS rows FROM tags GROUP BY session_id),
+      d AS (
+        SELECT session_id, COUNT(*) AS rows FROM pending_drops
+        WHERE landed_event_seq IS NULL GROUP BY session_id
+      ),
+      n AS (
+        SELECT session_id, COUNT(*) AS rows FROM notes
+        WHERE session_id IS NOT NULL AND status <> 'dismissed' GROUP BY session_id
+      )
+      SELECT k.session_id AS sessionId,
+             COALESCE(j.rows, 0) AS journalRows,
+             COALESCE(u.rows, 0) AS usageRows,
+             COALESCE(c.all_rows, 0) AS compartments,
+             COALESCE(c.landed, 0) AS landedCompartments,
+             COALESCE(t.rows, 0) AS tags,
+             COALESCE(d.rows, 0) AS pendingDrops,
+             COALESCE(n.rows, 0) AS notes,
+             j.firstAt AS firstAt,
+             j.lastAt AS lastAt
+      FROM known k
+      LEFT JOIN j ON j.session_id = k.session_id
+      LEFT JOIN u ON u.session_id = k.session_id
+      LEFT JOIN c ON c.session_id = k.session_id
+      LEFT JOIN t ON t.session_id = k.session_id
+      LEFT JOIN d ON d.session_id = k.session_id
+      LEFT JOIN n ON n.session_id = k.session_id
+      ORDER BY COALESCE(j.lastAt, 0) DESC
+      LIMIT ?
+    `).all(limit ?? 200) as Array<Omit<SessionSummaryRow, 'latestPressure' | 'latestTokens' | 'latestContextWindow'> & {
+      firstAt: number | null
+      lastAt: number | null
+    }>
+
+    /**
+     * The newest pressure reading per Session.
+     *
+     * Read separately and only for the Sessions the page shows: the correlated
+     * form of this probe (`data` is JSON text) cannot use `journal_at` well, and
+     * the scan is bounded by `journal_at` anyway.
+     */
+    const reading = db.prepare(
+      `SELECT data FROM journal
+       WHERE session_id = ? AND data IS NOT NULL AND kind IN ('context-pressure', 'pass')
+       ORDER BY at DESC, id DESC LIMIT 12`,
+    )
+
+    return rows.map((row) => {
+      const base: SessionSummaryRow = {
+        sessionId: row.sessionId,
+        journalRows: Number(row.journalRows),
+        usageRows: Number(row.usageRows),
+        compartments: Number(row.compartments),
+        landedCompartments: Number(row.landedCompartments),
+        tags: Number(row.tags),
+        pendingDrops: Number(row.pendingDrops),
+        notes: Number(row.notes),
+        ...row.firstAt === null ? {} : { firstAt: row.firstAt },
+        ...row.lastAt === null ? {} : { lastAt: row.lastAt },
+      }
+      let latestPressure: number | undefined
+      let latestTokens: number | undefined
+      let latestContextWindow: number | undefined
+      try {
+        for (const candidate of reading.all(row.sessionId) as Array<{ data: string }>) {
+          let parsed: Record<string, unknown>
+          try {
+            parsed = JSON.parse(candidate.data) as Record<string, unknown>
+          } catch {
+            continue
+          }
+          if (latestContextWindow === undefined && typeof parsed.contextWindow === 'number') {
+            latestContextWindow = parsed.contextWindow
+          }
+          if (latestTokens === undefined) {
+            if (typeof parsed.projectedTokens === 'number') latestTokens = parsed.projectedTokens
+            else if (typeof parsed.tokensBefore === 'number') latestTokens = parsed.tokensBefore
+          }
+          if (latestPressure === undefined) {
+            if (typeof parsed.pressure === 'number') latestPressure = parsed.pressure
+            else if (typeof latestTokens === 'number' && typeof latestContextWindow === 'number' && latestContextWindow > 0) {
+              latestPressure = latestTokens / latestContextWindow * 100
+            }
+          }
+          if (latestPressure !== undefined && latestTokens !== undefined && latestContextWindow !== undefined) break
+        }
+      } catch {
+        /* a corrupted row must not hide the Session */
+      }
+      return {
+        ...base,
+        ...latestPressure === undefined ? {} : { latestPressure },
+        ...latestTokens === undefined ? {} : { latestTokens },
+        ...latestContextWindow === undefined ? {} : { latestContextWindow },
+      }
+    })
+  }
+
   return {
     dbPath,
     upsertDomain,
@@ -1583,6 +1740,7 @@ export function openStores(dataDir: string): AdapterStores {
     updateNote,
     retireNotes,
     pruneNotes,
+    listSessions,
     allocateTag,
     getTag,
     listTags,

@@ -34,6 +34,10 @@ const PHASE_BASE = [
   'tests/global-review.spec.ts',
   'tests/context-pressure.spec.ts',
   'tests/ctx-reduce-render.spec.ts',
+  // The read-only dashboard (`/mc-dashboard`): the surface upstream ships as a
+  // Tauri app. Gated here because it adds no behaviour to the compaction loop —
+  // it only reads what the baseline already writes.
+  'tests/dashboard.spec.ts',
   // ctx_search / ctx_note + the v11 notes table: the two capabilities the
   // port lacked (history recall, parked intentions). Gated here because they
   // extend the tool surface the baseline already ships.
