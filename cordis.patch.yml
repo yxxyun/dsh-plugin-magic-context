@@ -18,3 +18,30 @@
       name: 'dsh-plugin-magic-context'
       config:
         registerCompactionEngine: false
+
+# Session-history search for `ctx_search`.
+#
+# The base bundle mounts the SQLite session-query backend with
+# `openAt: never`, which keeps `ctx.sessionQuery` available for exact reads,
+# titles and lineage traces while making every search call fail with
+# SESSION_QUERY_SEARCH_DISABLED. That default exists because indexing every
+# session costs disk and startup work; it is opt-in per deployment.
+#
+# This layer opts in, because it is the layer that ships the tool asking the
+# question. `first-search` builds the index on the first search instead of at
+# startup, so a profile that never searches pays nothing. The path must be a
+# durable file — `:memory:` would rebuild an empty index on every boot — and
+# `path` is a required field of the backend's config schema, so an override
+# that carries only `openAt` would be rejected at load.
+#
+# Patch semantics: each `config` here REPLACES the row's config object (the
+# profile loader assigns per key, it does not deep-merge), so any field the
+# base row set and this one omits falls back to the backend's own schema
+# default — `defaultLimit 20`, `maxLimit 100`, `snippetChars 240`, wal — which
+# is what we want. A profile that wants its own location can append a later
+# patch layer; profile layers apply after bundle layers, so the last one wins.
+- id: session-query-sqlite
+  name: '@deepseek-ai/dsh-session-query-sqlite'
+  config:
+    path: !!js dshHomePath('session-search.db')
+    openAt: first-search

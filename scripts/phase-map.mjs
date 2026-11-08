@@ -30,6 +30,14 @@ const PHASE_BASE = [
   'tests/global-review.spec.ts',
   'tests/context-pressure.spec.ts',
   'tests/ctx-reduce-render.spec.ts',
+  // ctx_search / ctx_note + the v11 notes table: the two capabilities the
+  // port lacked (history recall, parked intentions). Gated here because they
+  // extend the tool surface the baseline already ships.
+  'tests/ctx-search-note.spec.ts',
+  // /ctx-wrapup + the manual-checkpoint primitives: the one upstream entry
+  // point the port could only reach by adopting the adapter as its compaction
+  // engine. Gated here because it adds a command to the baseline surface.
+  'tests/wrapup.spec.ts',
   'tests/embedding-wasm.spec.ts',
   'tests/emergency-drop.spec.ts',
   'tests/historian-chunking.spec.ts',

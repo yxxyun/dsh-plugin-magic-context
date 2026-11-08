@@ -43,6 +43,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import {
   CONTEXT_WINDOW_EXCEEDED_CODE,
   DSH_EVENTS,
+  enumerateSurfaceNodes,
   enumerateSurfaceToolResults,
   probeDshSeams,
   readUsageFields,
@@ -56,10 +57,19 @@ import { reclaimForEmergency } from './dsh/emergency.ts'
 import type { HistorianLlm } from './dsh/historian.ts'
 import { historianInFlight } from './dsh/historian.ts'
 import { publishReadyCompartments, surfaceTokens } from './dsh/management-pass.ts'
-import { defineCtxExpandTool, defineCtxReduceTool, defineCtxMemoryTool, type LocalDefineTool } from './dsh/tool-bridge.ts'
+import {
+  defineCtxExpandTool,
+  defineCtxReduceTool,
+  defineCtxMemoryTool,
+  defineCtxSearchTool,
+  defineCtxNoteTool,
+  type LocalDefineTool,
+} from './dsh/tool-bridge.ts'
+import type { SessionQueryLike } from './core/message-search.ts'
 import { ReduceNudgeTracker } from './dsh/reduce-guidance.ts'
 import { registerCtxStatusCommand } from './dsh/status-command.ts'
 import { registerCtxRecompCommand } from './dsh/recomp.ts'
+import { registerCtxWrapupCommand } from './dsh/wrapup.ts'
 import { registerCtxGlobalCommand, registerCtxProfileCommand } from './dsh/command-surface.ts'
 import { reviewGlobalCandidates, type GlobalReviewAsker } from './dsh/global-review.ts'
 import { promoteMemoryToCandidate } from './core/global-domains.ts'
@@ -557,8 +567,13 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
       const deps = { stores, defineTool: defineTool as LocalDefineTool, ...journal === undefined ? {} : { journal } }
       registrar.register(defineCtxReduceTool(deps))
       registrar.register(defineCtxExpandTool(deps))
-      if (memoryRecall !== undefined) {
-        registrar.register(defineCtxMemoryTool(lane.ctxMemoryRegistration({
+      // One registration object serves both ctx_memory and ctx_search's memory
+      // lane: the search closure, the identity resolver and the visible-id set
+      // are the same three things in both tools, and building it twice would
+      // rebind the lane journal for no reason.
+      const memoryRegistration = memoryRecall === undefined
+        ? undefined
+        : lane.ctxMemoryRegistration({
           activePolicy,
           defineTool,
           journal,
@@ -627,9 +642,54 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
               detail: r.lines.length === 0 ? undefined : r.lines.join('\n'),
             }))
           },
-        })))
+        })
+      if (memoryRegistration !== undefined) {
+        registrar.register(defineCtxMemoryTool(memoryRegistration))
       }
-      ctx.logger.info(`magic-context dsh adapter: ctx_reduce / ctx_expand registered (${toolMode})`)
+      // ctx_search — one query across memory / session history / notes. The
+      // session lane is OPTIONAL: `ctx.sessionQuery` is a soft service (the
+      // host mounts it, but ships its search index with `openAt: never`), so it
+      // is read per call through `ctx.get` rather than declared in `inject` —
+      // declaring it would pend this whole plugin on a service that is only
+      // present in compositions that opted into the query backend.
+      const sessionQueryOf = (): SessionQueryLike | undefined => {
+        try {
+          const query = (ctx as unknown as { get?: (name: string) => unknown }).get?.('sessionQuery')
+          return query as SessionQueryLike | undefined
+        } catch {
+          return undefined
+        }
+      }
+      registrar.register(defineCtxSearchTool({
+        ...deps,
+        ...memoryRegistration?.search === undefined ? {} : { search: memoryRegistration.search },
+        ...memoryRegistration?.resolveIdentity === undefined
+          ? {}
+          : { resolveIdentity: memoryRegistration.resolveIdentity },
+        ...memoryRegistration?.visibleMemoryIdsOf === undefined
+          ? {}
+          : { visibleMemoryIdsOf: memoryRegistration.visibleMemoryIdsOf },
+        sessionQueryOf,
+      }))
+      // ctx_note — the pending-intention queue (write/read/update/dismiss). The
+      // anchor ordinal records where in the session the note was written so a
+      // later reader can expand back to that point; it degrades to `null` when
+      // the session index is off, which costs nothing.
+      registrar.register(defineCtxNoteTool({
+        ...deps,
+        anchorOrdinalOf: exec => {
+          const session = exec?.agent?.session
+          if (session === undefined) return undefined
+          try {
+            const nodes = enumerateSurfaceNodes(session as unknown as Session)
+            const last = nodes[nodes.length - 1]
+            return last === undefined ? undefined : last.seq as unknown as number
+          } catch {
+            return undefined
+          }
+        },
+      }))
+      ctx.logger.info(`magic-context dsh adapter: ctx_reduce / ctx_expand / ctx_search / ctx_note registered (${toolMode})`)
     } catch (error) {
       // Fail closed: without its tools the adapter cannot accept the
       // agent's reduce marks, so a mount without them must be loud, not
@@ -678,6 +738,21 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
       ...memoryWriter === undefined || memoryWriter.status.ok !== true ? {} : { publisher: memoryWriter },
     })
     ctx.logger.info('magic-context dsh adapter: /ctx-profile and /ctx-global registered')
+    // `/ctx-wrapup` deliberately sits OUTSIDE the `registerCompactionEngine`
+    // gate: it needs the historian's LLM seam, not `ctx.compaction`. Bundling
+    // the two made the useful half (ask for one summary before moving on)
+    // unreachable for every user who did not also adopt this adapter as their
+    // compaction engine. See docs/decision-wrapup-outside-engine-gate.md.
+    registerCtxWrapupCommand(ctx, {
+      stores,
+      policy: activePolicy,
+      logger: ctx.logger,
+      enabled: () => liveBoolean(config.historianEnabled, true) !== false,
+      ...journal === undefined ? {} : { journal },
+      ...llm === undefined ? {} : { llm },
+      activeRoute: historianRouteOf,
+    })
+    ctx.logger.info('magic-context dsh adapter: /ctx-wrapup registered')
   }
 
   stores.setMeta('adapter_version', 'phase2')

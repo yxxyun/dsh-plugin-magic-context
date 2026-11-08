@@ -21,19 +21,20 @@
  * dynamic import in a proper package install) supplies the seam class.
  */
 import type { Context } from '@deepseek-ai/cordis'
-import { randomUUID } from 'node:crypto'
-import { compactedPlaceholder, estimateTokens, type CompartmentDraft } from '../core/compartments.ts'
+import { estimateTokens, type CompartmentDraft } from '../core/compartments.ts'
 import type { Journal } from '../core/journal.ts'
 import type { PressurePolicy } from '../core/policy.ts'
 import type { AdapterStores } from '../core/stores.ts'
 import { errText } from '../core/types.ts'
 import { callHistorian, type HistorianLlm } from './historian.ts'
+import {
+  pickManualSpan,
+  writeManualCheckpoint,
+  type ManualCheckpointResult,
+} from './manual-compaction.ts'
 import { runManagementPass } from './management-pass.ts'
 import {
-  compactCheckpointSource,
   enumerateSurfaceNodes,
-  replaceSurfaceRange,
-  syntheticNodeId,
   type ContentBlock,
   type Session,
   type SurfaceNode,
@@ -89,27 +90,7 @@ export interface EngineHandle {
 }
 
 /** A structurally complete `CompactionResult` (the seam's result shape). */
-interface CheckpointResult {
-  readonly compactionId: string
-  readonly sourceCommandId?: string
-  readonly startSeq: number
-  readonly summarySeq: number
-  readonly endSeq: number
-  readonly summary: ContentBlock[]
-  readonly shadowedRange: { start: number; end: number }
-  readonly shadowedSeqs: number[]
-  readonly shadowedTokenCount: number
-}
-
-function digestText(draft: CompartmentDraft): string {
-  const lines = [draft.tiers.p1]
-  if (draft.facts.length > 0) {
-    lines.push(`facts: ${draft.facts.map(fact =>
-      fact.category.length === 0 ? fact.content : `[${fact.category}] ${fact.content}`).join(' | ')}`)
-  }
-  if (draft.events.length > 0) lines.push(`events: ${draft.events.join(' | ')}`)
-  return lines.join('\n')
-}
+type CheckpointResult = ManualCheckpointResult
 
 /** Map an explicit surface span (first/last node seqs, either order) to nodes. */
 function regionNodes(nodes: readonly SurfaceNode[], start: number, end: number): SurfaceNode[] {
@@ -146,106 +127,28 @@ export async function registerMagicCompactionEngine(
     return session
   }
 
-  /** The manual checkpoint: summarize the span, then write the protocol. */
+  /**
+   * The manual checkpoint. The writer lives in `manual-compaction.ts` so
+   * `/ctx-wrapup` can reach it without mounting this engine — and therefore
+   * without taking over `ctx.compaction`.
+   */
   const writeCheckpoint = async (input: {
     readonly session: Session
     readonly nodes: readonly SurfaceNode[]
     readonly sourceCommandId?: string
     readonly signal?: AbortSignal
-  }): Promise<CheckpointResult> => {
-    if (deps.llm === undefined) throw new Error('no LLM seam available for a manual compaction')
-    const sessionId = input.session.id
-    const generationRoute = routeNow()
-    const systemSeq = enumerateSurfaceNodes(input.session).find(node => node.role === 'system')?.seq
-    const draft = await callHistorian(
+  }): Promise<CheckpointResult> =>
+    writeManualCheckpoint(
       {
-        policy: policyNow(),
-        llm: deps.llm,
+        stores: deps.stores,
+        policy: policyNow,
         logger: deps.logger,
+        activeRoute: routeNow,
         ...deps.journal === undefined ? {} : { journal: deps.journal },
-        ...generationRoute === undefined ? {} : { route: generationRoute },
+        ...deps.llm === undefined ? {} : { llm: deps.llm },
       },
-      {
-        sessionId,
-        session: input.session,
-        nodes: input.nodes,
-        trigger: 'manual',
-        ...generationRoute === undefined ? {} : { route: generationRoute },
-        ...input.signal === undefined ? {} : { signal: input.signal },
-        ...systemSeq === undefined ? {} : { systemSeq },
-      },
+      input,
     )
-    const compactionId = `mc-${randomUUID()}`
-    const summary: ContentBlock[] = [{
-      type: 'text',
-      text: `${compactedPlaceholder(0).replace('§C0§', '§checkpoint§')}\n${digestText(draft)}`,
-    }]
-    const shadowedSeqs = input.nodes.map(node => node.seq)
-    const first = input.nodes[0] as SurfaceNode
-    const last = input.nodes[input.nodes.length - 1] as SurfaceNode
-    const shadowedTokenCount = input.nodes.reduce((total, node) => total + estimateTokens(node.text), 0)
-    // `Session.append` accepts an options argument only for *surface* event
-    // types; `compaction/*` are not among them, so these appends take two.
-    const startEvent = input.session.append('compaction/start', {
-      compactionId,
-      ...input.sourceCommandId === undefined ? {} : { sourceCommandId: input.sourceCommandId },
-      turn: null,
-    } as never)
-    const summaryEvent = input.session.append('compaction/summary', {
-      compactionId,
-      ...input.sourceCommandId === undefined ? {} : { sourceCommandId: input.sourceCommandId },
-      summary,
-      shadowedRange: { start: first.seq, end: last.seq },
-      shadowedSeqs,
-      shadowedTokenCount,
-      provider: generationRoute?.provider ?? 'unknown',
-      model: generationRoute?.model ?? 'unknown',
-      maxTokens: policyNow().historianMaxTokens,
-      rawOutput: summary,
-      llmStreamCall: true,
-    } as never)
-    // The replacement is appended synchronously after its metering event —
-    // the shared shadow-price protocol the session documents.
-    replaceSurfaceRange(
-      input.session,
-      first.seq,
-      last.seq,
-      summary,
-      shadowedSeqs,
-      syntheticNodeId('mc-checkpoint'),
-      compactCheckpointSource(compactionId, input.sourceCommandId),
-    )
-    const endEvent = input.session.append('compaction/end', {
-      compactionId,
-      ...input.sourceCommandId === undefined ? {} : { sourceCommandId: input.sourceCommandId },
-      turn: null,
-    } as never)
-    deps.logger.info(
-      `magic-context compaction: checkpoint over ${String(input.nodes.length)} nodes `
-        + `(~${String(shadowedTokenCount)} tokens, importance ${String(draft.importance)})`,
-    )
-    deps.journal?.info('engine', `manual checkpoint over ${String(input.nodes.length)} nodes (~${String(shadowedTokenCount)} tokens)`, {
-      action: 'checkpoint',
-      compactionId,
-      sourceCommandId: input.sourceCommandId,
-      nodes: input.nodes.length,
-      shadowedTokenCount,
-      importance: draft.importance,
-      startSeq: startEvent.seq,
-      endSeq: endEvent.seq,
-    }, sessionId)
-    return {
-      compactionId,
-      ...input.sourceCommandId === undefined ? {} : { sourceCommandId: input.sourceCommandId },
-      startSeq: startEvent.seq,
-      summarySeq: summaryEvent.seq,
-      endSeq: endEvent.seq,
-      summary,
-      shadowedRange: { start: first.seq, end: last.seq },
-      shadowedSeqs,
-      shadowedTokenCount,
-    }
-  }
 
   const EngineClass = class MagicContextCompactionEngine extends base {
     static inject: string[] = []
@@ -325,27 +228,16 @@ export async function registerMagicCompactionEngine(
   return await ctx.plugin(EngineClass, {})
 }
 
-/** The manual range: the same eligibility rules, without the token gate. */
+/**
+ * The manual range: the same eligibility rules, without the token gate.
+ * Delegates to the shared picker so `/compact` and `/ctx-wrapup` can never
+ * disagree about what is eligible.
+ */
 function selectManualRange(
   nodes: readonly SurfaceNode[],
   stores: AdapterStores,
   sessionId: string,
   policy: PressurePolicy,
 ): SurfaceNode[] {
-  const covered = stores.coveredSeqs(sessionId)
-  const baselineNodeSeq = stores.baselineState(sessionId)?.nodeSeq
-  const skippable = (node: SurfaceNode): boolean =>
-    node.role === 'system'
-    || node.seq === baselineNodeSeq
-    || covered.has(node.seq)
-    || node.isPlaceholder
-    || /^\[(?:dropped|compacted|checkpoint) §/.test(node.text.trim().slice(0, 24))
-    || !node.hasText
-  let start = 0
-  while (start < nodes.length && skippable(nodes[start] as SurfaceNode)) start += 1
-  if (start >= nodes.length) return []
-  let cut = Math.max(start, nodes.length - Math.max(0, policy.historianProtectedNodes))
-  while (cut > start && (nodes[cut] as SurfaceNode | undefined)?.role === 'tool') cut -= 1
-  const slice = nodes.slice(start, cut)
-  return slice.length >= Math.max(2, policy.historianMinNodes) ? slice : []
+  return pickManualSpan(nodes, stores, sessionId, policy)
 }

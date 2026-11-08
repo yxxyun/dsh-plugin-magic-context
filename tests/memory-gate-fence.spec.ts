@@ -494,4 +494,20 @@ describe('the memory.enabled gate (task-9 ①)', () => {
     expect(names).toContain('ctx_expand')
     expect(names).not.toContain('ctx_memory')
   })
+
+  it('registers ctx_search / ctx_note outside the memory and engine gates', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'mc-gate-surface-'))
+    tempDirs.push(dataDir)
+    // No memory lane and no compaction engine: the two switches most likely to
+    // be off on a fresh install. History search and the note queue must not be
+    // collateral damage — they need neither the corpus nor `ctx.compaction`.
+    // (/ctx-wrapup has the same requirement and is pinned in wrapup.spec.ts.)
+    const ctx = await bootPlugin({ dataDir, memory: { enabled: false } })
+    const names = toolNames(ctx)
+    expect(names).toContain('ctx_search')
+    expect(names).toContain('ctx_note')
+    // The lane really is off, so neither tool is riding on it.
+    expect(meta(dataDir, 'memory_bridge')).toBe('disabled-by-config')
+    expect(meta(dataDir, 'compaction_engine')).toBe('disabled-by-config')
+  })
 })

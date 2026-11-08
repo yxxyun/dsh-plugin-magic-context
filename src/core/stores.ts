@@ -20,7 +20,7 @@ import type { DomainKind } from './domains.ts'
 import { parseShareCategories, serializeShareCategories } from './domains.ts'
 import type { TagRecord, TagTarget, UsageRecord } from './types.ts'
 
-export const SCHEMA_VERSION = 10
+export const SCHEMA_VERSION = 11
 
 /** The m[0]/m[1] baseline identity for one session. */
 export interface BaselineState {
@@ -180,6 +180,31 @@ export interface ProfileConfirmationRow {
   readonly decidedAt?: number
 }
 
+/**
+ * Schema v11: one pending intention (`ctx_note`).
+ *
+ * Not a memory: a note is work the session means to return to, so it carries a
+ * status that expires by human dismissal rather than a category, a TTL and a
+ * promote lane. Keeping the two apart is the whole point — a stale note must be
+ * allowed to rot silently, which a memory may never do.
+ */
+export interface NoteRow {
+  readonly id: number
+  /** `session` today; `smart` reserved for a future externally-checked lane. */
+  readonly type: 'session' | 'smart'
+  readonly status: 'active' | 'pending' | 'ready' | 'dismissed'
+  readonly content: string
+  readonly sessionId?: string
+  readonly projectPath?: string
+  readonly surfaceCondition?: string
+  readonly createdAt: number
+  readonly updatedAt: number
+  readonly readyAt?: number
+  readonly readyReason?: string
+  /** Message ordinal the note was written at, when the session could provide one. */
+  readonly anchorOrdinal?: number
+}
+
 export interface AdapterStores {
   readonly dbPath: string
   /** Fails closed (returns null) when the persisted version is ahead. */
@@ -329,6 +354,35 @@ export interface AdapterStores {
   ): ProfileConfirmationRow
   listProfileConfirmations(state?: ProfileConfirmationRow['state']): ProfileConfirmationRow[]
   decideProfileConfirmation(id: number, state: 'approved' | 'rejected', now: number): void
+  /** v11: store one pending intention; the returned row carries the new id. */
+  createNote(
+    input: {
+      content: string
+      sessionId?: string
+      projectPath?: string
+      anchorOrdinal?: number
+      type?: NoteRow['type']
+    },
+    now: number,
+  ): NoteRow
+  getNote(id: number): NoteRow | undefined
+  /**
+   * Notes for the read view: this session's active rows first (newest first),
+   * then any smart rows that became ready. `filter: 'all'` also returns
+   * dismissed rows, which is what the agent needs to prove a dismissal landed.
+   */
+  listNotes(filter: {
+    sessionId?: string
+    projectPath?: string
+    status?: NoteRow['status'] | 'open'
+    limit?: number
+  }): NoteRow[]
+  /** Rewrite one note's content; `undefined` when the id does not exist. */
+  updateNote(id: number, content: string, now: number): NoteRow | undefined
+  /** Retire notes: `dismissed` keeps them readable, `delete` removes the row. */
+  retireNotes(ids: readonly number[], mode: 'dismiss' | 'delete', now: number): number
+  /** Age out dismissed rows (maintenance tick). */
+  pruneNotes(before: number): number
   close(): void
   /**
    * True once `close()` ran. A remounted adapter (hmr reload) closes the old
@@ -652,6 +706,47 @@ const MIGRATIONS: readonly Migration[] = [
       db.exec(`
         ALTER TABLE global_candidates ADD COLUMN suggested_domain TEXT;
         ALTER TABLE global_candidates ADD COLUMN suggestion_reason TEXT;
+      `)
+    },
+  },
+  {
+    // v11: pending intentions (`ctx_note`).
+    //
+    // Magic Context's notes vocabulary, narrowed to the shape DSH can honor:
+    // the upstream table carries the whole dreamer machinery (compiled_*,
+    // check_status, surface_condition, anchor_block_id) because an external
+    // checker polls it on a schedule. DSH has no cron and no out-of-band
+    // checker, so smart notes would be a table nobody ever advances — this
+    // version stores the half that pays for itself: a queue of "come back to
+    // this" items with a status, an anchor message and a dismissal path, which
+    // ctx_search can surface and ctx_note can retire.
+    //
+    // `type` is kept even though only 'session' is written today: the column is
+    // what a future smart-note lane would filter on, and adding it later would
+    // mean a second migration over the same rows for no gain. `status` mirrors
+    // upstream's active|pending|ready|dismissed; only active/dismissed are
+    // reachable without a checker, and the machine reads no meaning from the
+    // others — they are just non-active.
+    version: 11,
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE notes(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          type TEXT NOT NULL DEFAULT 'session',
+          status TEXT NOT NULL DEFAULT 'active',
+          content TEXT NOT NULL,
+          session_id TEXT,
+          project_path TEXT,
+          surface_condition TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          ready_at INTEGER,
+          ready_reason TEXT,
+          anchor_ordinal INTEGER
+        );
+        CREATE INDEX idx_notes_session_status ON notes(session_id, status);
+        CREATE INDEX idx_notes_project_status ON notes(project_path, status);
+        CREATE INDEX idx_notes_type_status ON notes(type, status);
       `)
     },
   },
@@ -1367,6 +1462,102 @@ export function openStores(dataDir: string): AdapterStores {
     db.prepare('UPDATE profile_confirmations SET state = ?, decided_at = ? WHERE id = ?').run(state, now, id)
   }
 
+  interface NoteDbRow {
+    id: number; type: string; status: string; content: string
+    session_id: string | null; project_path: string | null; surface_condition: string | null
+    created_at: number; updated_at: number; ready_at: number | null
+    ready_reason: string | null; anchor_ordinal: number | null
+  }
+
+  const toNote = (row: NoteDbRow): NoteRow => ({
+    id: row.id,
+    type: row.type as NoteRow['type'],
+    status: row.status as NoteRow['status'],
+    content: row.content,
+    ...row.session_id === null ? {} : { sessionId: row.session_id },
+    ...row.project_path === null ? {} : { projectPath: row.project_path },
+    ...row.surface_condition === null ? {} : { surfaceCondition: row.surface_condition },
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    ...row.ready_at === null ? {} : { readyAt: row.ready_at },
+    ...row.ready_reason === null ? {} : { readyReason: row.ready_reason },
+    ...row.anchor_ordinal === null ? {} : { anchorOrdinal: row.anchor_ordinal },
+  })
+
+  const createNote: AdapterStores['createNote'] = (input, now) => {
+    const row = db.prepare(
+      'INSERT INTO notes(type, status, content, session_id, project_path, created_at, updated_at, anchor_ordinal) '
+        + "VALUES(?, 'active', ?, ?, ?, ?, ?, ?) RETURNING *",
+    ).get(
+      input.type ?? 'session',
+      input.content,
+      input.sessionId ?? null,
+      input.projectPath ?? null,
+      now,
+      now,
+      input.anchorOrdinal ?? null,
+    ) as unknown as NoteDbRow
+    return toNote(row)
+  }
+
+  const getNote = (id: number): NoteRow | undefined => {
+    const row = db.prepare('SELECT * FROM notes WHERE id = ?').get(id) as NoteDbRow | undefined
+    return row === undefined ? undefined : toNote(row)
+  }
+
+  const listNotes: AdapterStores['listNotes'] = (filter) => {
+    const clauses: string[] = []
+    const parameters: Array<string | number> = []
+    if (filter.status === 'open') {
+      // "Open" is the read view's default: everything that is still a live
+      // intention. Dismissed rows are retired and stay out of it.
+      clauses.push("status <> 'dismissed'")
+    } else if (filter.status !== undefined) {
+      clauses.push('status = ?')
+      parameters.push(filter.status)
+    }
+    // Session scope and project scope are alternatives, not a conjunction: a
+    // session's own notes belong to it, and a project's notes survive across
+    // sessions of the same project, so either match is relevant.
+    const scopes: string[] = []
+    if (filter.sessionId !== undefined) {
+      scopes.push('session_id = ?')
+      parameters.push(filter.sessionId)
+    }
+    if (filter.projectPath !== undefined) {
+      scopes.push('project_path = ?')
+      parameters.push(filter.projectPath)
+    }
+    if (scopes.length > 0) clauses.push(`(${scopes.join(' OR ')})`)
+    const where = clauses.length === 0 ? '' : ` WHERE ${clauses.join(' AND ')}`
+    const limit = filter.limit === undefined ? 25 : Math.max(1, Math.min(100, filter.limit))
+    const rows = db.prepare(
+      `SELECT * FROM notes${where} ORDER BY created_at DESC, id DESC LIMIT ?`,
+    ).all(...parameters, limit) as unknown as NoteDbRow[]
+    return rows.map(toNote)
+  }
+
+  const updateNote: AdapterStores['updateNote'] = (id, content, now) => {
+    const row = db.prepare(
+      'UPDATE notes SET content = ?, updated_at = ? WHERE id = ? RETURNING *',
+    ).get(content, now, id) as NoteDbRow | undefined
+    return row === undefined ? undefined : toNote(row)
+  }
+
+  const retireNotes: AdapterStores['retireNotes'] = (ids, mode, now) => {
+    if (ids.length === 0) return 0
+    const placeholders = ids.map(() => '?').join(', ')
+    const result = mode === 'dismiss'
+      ? db.prepare(`UPDATE notes SET status = 'dismissed', updated_at = ? WHERE id IN (${placeholders})`).run(now, ...ids)
+      : db.prepare(`DELETE FROM notes WHERE id IN (${placeholders})`).run(...ids)
+    return Number(result.changes)
+  }
+
+  const pruneNotes = (before: number): number => {
+    const result = db.prepare("DELETE FROM notes WHERE status = 'dismissed' AND updated_at < ?").run(before)
+    return Number(result.changes)
+  }
+
   return {
     dbPath,
     upsertDomain,
@@ -1386,6 +1577,12 @@ export function openStores(dataDir: string): AdapterStores {
     enqueueProfileConfirmation,
     listProfileConfirmations,
     decideProfileConfirmation,
+    createNote,
+    getNote,
+    listNotes,
+    updateNote,
+    retireNotes,
+    pruneNotes,
     allocateTag,
     getTag,
     listTags,

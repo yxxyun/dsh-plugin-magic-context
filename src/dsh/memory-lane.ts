@@ -412,8 +412,7 @@ export function openMemoryLane(
       } catch {
         /* scoring stats are advisory */
       }
-      return { ok: true as const, text: outcome.text, hits: outcome.hits.map(hit => ({ id: hit.id })) }
-    }
+      return { ok: true as const, text: outcome.text, hits: outcome.hits.map(hit => ({ id: hit.id })) }    }
 
   /**
    * One wording for the writer's state, used by both the boot log and the

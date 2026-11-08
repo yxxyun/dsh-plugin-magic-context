@@ -25,7 +25,10 @@ import type { Journal } from '../core/journal.ts'
 import type { MemoryWriter } from '../core/memory-write.ts'
 import { parseTagRanges } from '../core/policy.ts'
 import type { AdapterStores } from '../core/stores.ts'
+import { searchMessageHistory, type SessionQueryLike } from '../core/message-search.ts'
+import { previewText } from '../core/memory-search.ts'
 import {
+  enumerateSurfaceNodes,
   enumerateSurfaceToolResults,
   originalContentOfPlaceholder,
   replaceToolResultContent,
@@ -702,6 +705,371 @@ export function defineCtxMemoryTool(deps: MemoryToolDeps): unknown {
         })
       }
       return finish({ outcome: `Unknown action "${action}".` })
+    },
+  })
+}
+
+/**
+ * `ctx_search` — one query across the three recall surfaces the model cannot
+ * see at once: project memory, this session's earlier history, and the note
+ * queue.
+ *
+ * Why one tool instead of three: the agent's question is "did we already
+ * establish this somewhere", and the answer's source is an implementation
+ * detail of where it was stored. Upstream MC unifies five lanes; three of its
+ * sources have no DSH analogue (`git_commit` has no commit index here,
+ * `primer` and `improvement` are dreamer artifacts that were deliberately not
+ * ported), and `facts` is excluded upstream too — the injected m[0] block
+ * already renders it, so searching it returns what the model is reading.
+ *
+ * Failure discipline: every lane is independent and reports its own state. A
+ * disabled session index (the host ships `openAt: never`) must not fail the
+ * whole call — memory and notes still answer, with one line saying history was
+ * not searched and why.
+ */
+export interface SearchToolDeps {
+  readonly defineTool: ToolBridgeDeps['defineTool']
+  readonly journal?: Journal
+  readonly stores: AdapterStores
+  /** Memory lane (the `ctx_memory search` closure), absent when memory is off. */
+  readonly search?: MemoryToolDeps['search']
+  /** The session's project identity for the memory lane. */
+  readonly resolveIdentity?: MemoryToolDeps['resolveIdentity']
+  /** Memory ids the injected block already renders (suppressed from hits). */
+  readonly visibleMemoryIdsOf?: MemoryToolDeps['visibleMemoryIdsOf']
+  /**
+   * The host's session index, resolved per call: `ctx.sessionQuery` is an
+   * optional service, so the composition root passes a getter rather than a
+   * value captured at mount.
+   */
+  readonly sessionQueryOf?: (exec?: MemoryToolRunContext) => SessionQueryLike | undefined
+}
+
+const SEARCH_SOURCES: readonly string[] = ['memory', 'message', 'note']
+const DEFAULT_SEARCH_LIMIT = 8
+
+function normalizeSources(raw: unknown): readonly string[] {
+  if (!Array.isArray(raw)) return SEARCH_SOURCES
+  const seen = new Set<string>()
+  for (const entry of raw) {
+    if (typeof entry !== 'string') continue
+    const name = entry.trim().toLowerCase()
+    if (SEARCH_SOURCES.includes(name)) seen.add(name)
+  }
+  // An explicit empty list means "no filter", same as upstream: the agent that
+  // named only unknown sources wants the default, not silence.
+  return seen.size === 0 ? SEARCH_SOURCES : [...seen]
+}
+
+/** `now - t` as the compact age upstream prints (`3h`, `12d`, `2mo`). */
+function ageOf(ageMs: number): string {
+  const minutes = Math.max(0, Math.round(ageMs / 60_000))
+  if (minutes < 60) return `${String(minutes)}m`
+  const hours = Math.round(minutes / 60)
+  if (hours < 24) return `${String(hours)}h`
+  const days = Math.round(hours / 24)
+  if (days < 60) return `${String(days)}d`
+  return `${String(Math.round(days / 30))}mo`
+}
+
+export function defineCtxSearchTool(deps: SearchToolDeps): unknown {
+  const defineTool = deps.defineTool
+  return defineTool<{
+    readonly query: string
+    readonly limit?: number
+    readonly sources?: readonly string[]
+  }>({
+    name: 'ctx_search',
+    description:
+      'Search across project memory, this session\'s earlier conversation (including turns the context '
+        + 'manager has since compacted or dropped), and pending notes. Use it when the answer may already '
+        + 'have been established earlier — a decision, a config value, a command that worked, a file you '
+        + 'touched — instead of re-deriving it or asking the user again. '
+        + 'sources accepts memory, message, note (default: all three). '
+        + 'History hits come back as event seqs: read them with ctx_expand or the session reader.',
+    parameters: {
+      query: { type: 'string', required: true },
+      limit: { type: 'integer' },
+      sources: { type: 'array', items: { type: 'string', enum: [...SEARCH_SOURCES] } },
+    },
+    output: {
+      schema: { type: 'json' },
+      render: (_args, value) => {
+        const payload = value as { lines?: string[]; empty?: boolean; reason?: string }
+        // A refusal is a REFUSAL, not "no results": the empty-query path sets
+        // both `reason` and `empty`, and rendering it as "No results." would
+        // teach the model that the corpus has nothing rather than that it
+        // forgot to say what to look for.
+        if (payload.reason !== undefined) {
+          return ackText([payload.lines === undefined ? `Search unavailable: ${payload.reason}` : payload.reason])
+        }
+        const lines = payload.lines ?? []
+        if (lines.length === 0) return ackText(['No results.'])
+        return ackText(lines)
+      },
+    },
+    async execute(args, exec) {
+      const startedAt = Date.now()
+      const sessionId = sessionIdOf(exec)
+      const query = typeof args.query === 'string' ? args.query.trim() : ''
+      const limit = Math.max(1, Math.min(25, args.limit ?? DEFAULT_SEARCH_LIMIT))
+      if (query.length === 0) {
+        return { lines: [], empty: true, reason: 'ctx_search needs a query' }
+      }
+      const sources = normalizeSources(args.sources)
+      const blocks: string[] = []
+      const notes: string[] = []
+
+      if (sources.includes('memory') && deps.search !== undefined) {
+        const identity = (() => {
+          try {
+            return deps.resolveIdentity?.(exec as Parameters<NonNullable<MemoryToolDeps['resolveIdentity']>>[0])
+          } catch {
+            return undefined
+          }
+        })()
+        if (identity === undefined) {
+          notes.push('memory: no project identity for this session')
+        } else {
+          const visible = deps.visibleMemoryIdsOf?.(exec)
+          const outcome = await deps.search({
+            query,
+            limit,
+            identity,
+            ...visible === undefined ? {} : { visibleMemoryIds: visible },
+          })
+          if (outcome.ok) {
+            // The memory lane already renders MC's hit format; reuse it rather
+            // than reformat and drift from the `ctx_memory search` output.
+            if (outcome.hits.length > 0) blocks.push(outcome.text)
+          } else {
+            notes.push(`memory: ${outcome.reason}`)
+          }
+        }
+      }
+
+      if (sources.includes('message') && sessionId !== undefined) {
+        // Live surface seqs are excluded: they are already in the window, and
+        // returning them spends output tokens on what the model just read.
+        const live = new Set<number>()
+        try {
+          const session = exec.agent?.session
+          if (session !== undefined) {
+            for (const node of enumerateSurfaceNodes(session)) live.add(node.seq as unknown as number)
+          }
+        } catch {
+          /* no session view: no exclusion, worst case a redundant hit */
+        }
+        const outcome = await searchMessageHistory(deps.sessionQueryOf?.(exec), {
+          sessionId,
+          query,
+          limit,
+          ...live.size === 0 ? {} : { liveSeqs: live },
+        })
+        if (outcome.ok) {
+          if (outcome.hits.length > 0) {
+            const rendered = outcome.hits.map((hit, index) =>
+              `[${String(index + 1)}] [message] seq=${String(hit.seq)} type=${hit.type}\n${previewText(hit.snippet)}`)
+            blocks.push(`History (${String(outcome.hits.length)} hit${outcome.hits.length === 1 ? '' : 's'}):\n\n${rendered.join('\n\n')}`)
+          }
+        } else if (outcome.reason === 'disabled') {
+          notes.push('message history: the session index is disabled in this deployment (openAt: never)')
+        } else {
+          notes.push(`message: ${outcome.reason}`)
+        }
+      }
+
+      if (sources.includes('note')) {
+        // Notes are a small local table: a substring match over the content is
+        // honest and cheap, and there is no ranking to get wrong.
+        const cwd = exec.agent?.session.header?.cwd
+        const rows = deps.stores.listNotes({
+          ...sessionId === undefined ? {} : { sessionId },
+          ...cwd === undefined ? {} : { projectPath: cwd },
+          status: 'open',
+          limit: 50,
+        })
+        const needle = query.toLowerCase()
+        const matched = rows.filter(row => row.content.toLowerCase().includes(needle)).slice(0, limit)
+        if (matched.length > 0) {
+          const now = Date.now()
+          const rendered = matched.map((row, index) =>
+            `[${String(index + 1)}] [note] id=#${String(row.id)} status=${row.status} age=${ageOf(now - row.createdAt)}\n${previewText(row.content)}`)
+          blocks.push(`Notes (${String(matched.length)} hit${matched.length === 1 ? '' : 's'}):\n\n${rendered.join('\n\n')}`)
+        }
+      }
+
+      deps.journal?.info('tool-call', `ctx_search: ${String(blocks.length)} lane(s) matched`, {
+        tool: 'ctx_search',
+        query,
+        sources,
+        blocks: blocks.length,
+        ms: Date.now() - startedAt,
+        notes,
+      }, sessionId)
+
+      if (blocks.length === 0) {
+        return {
+          lines: [
+            `No results for "${query}" across ${sources.join(', ')}.`,
+            ...notes.map(note => `(${note})`),
+          ],
+          empty: true,
+        }
+      }
+      return {
+        lines: [
+          ...blocks,
+          ...notes.length === 0 ? [] : ['', ...notes.map(note => `(${note})`)],
+        ],
+      }
+    },
+  })
+}
+
+/**
+ * `ctx_note` — the pending-intention queue.
+ *
+ * What this is NOT: a second memory store. A note is a thing you mean to come
+ * back to WITH its findings attached; it is expected to go stale and be
+ * dismissed, and nothing depends on it. Durable facts, rules and configuration
+ * belong in memory (`ctx_memory`), where the injected baseline keeps them
+ * alive. Upstream states the same boundary in the tool description, and the
+ * distinction is the only reason the two stores are separate.
+ */
+export interface NoteToolDeps {
+  readonly defineTool: ToolBridgeDeps['defineTool']
+  readonly journal?: Journal
+  readonly stores: AdapterStores
+  /** Records the note's anchor ordinal (the newest indexed message). */
+  readonly anchorOrdinalOf?: (exec?: MemoryToolRunContext) => number | undefined
+}
+
+const NOTE_READ_LIMIT = 25
+const DISMISS_FOOTER = 'To dismiss a stale note: ctx_note(action="dismiss", note_ids=[N])'
+
+export function defineCtxNoteTool(deps: NoteToolDeps): unknown {
+  const defineTool = deps.defineTool
+  return defineTool<{
+    readonly action: string
+    readonly content?: string
+    readonly note_ids?: readonly number[]
+  }>({
+    name: 'ctx_note',
+    description:
+      'Session notes are pending intentions: work you intend to return to, with its findings attached. '
+        + 'Write one when you park a thread mid-way and would lose its context. '
+        + 'Do NOT use notes for: the next few steps (keep working), an active plan, a restart/crash '
+        + 'cushion, or a plain record of how things stand that you do not intend to act on — that goes '
+        + 'stale silently; a fact worth keeping is memory, the rest is nothing. '
+        + 'Active work belongs in todos; if the detail already lives in a file, note the path instead '
+        + 'of copying it; durable facts belong in ctx_memory. '
+        + 'Actions: write (content), read (optionally note_ids), update (note_ids exactly one + content), '
+        + 'dismiss (1..50 ids — a queue you never dismiss from stops being read).',
+    parameters: {
+      action: { type: 'string', required: true, enum: ['write', 'read', 'update', 'dismiss'] },
+      content: { type: 'string' },
+      note_ids: { type: 'array', items: { type: 'integer' } },
+    },
+    output: {
+      schema: { type: 'json' },
+      render: (_args, value) => {
+        const payload = value as {
+          lines?: string[]
+          reason?: string
+          outcome?: string
+          detail?: string
+        }
+        if (payload.reason !== undefined) return ackText([`Notes unavailable: ${payload.reason}`])
+        if (payload.outcome !== undefined) {
+          return ackText([payload.outcome, ...payload.detail === undefined ? [] : [payload.detail]])
+        }
+        const lines = payload.lines ?? []
+        return ackText(lines.length === 0 ? ['No notes.'] : lines)
+      },
+    },
+    async execute(args, exec) {
+      const startedAt = Date.now()
+      const sessionId = sessionIdOf(exec)
+      const action = typeof args.action === 'string' ? args.action : 'read'
+      const cwd = exec.agent?.session.header?.cwd
+      const now = Date.now()
+      const ids = Array.isArray(args.note_ids)
+        ? args.note_ids.filter((id): id is number => typeof id === 'number' && Number.isInteger(id))
+        : []
+      const finish = (payload: Record<string, unknown>): Record<string, unknown> => {
+        deps.journal?.info('tool-call', `ctx_note ${action}`, {
+          tool: 'ctx_note',
+          action,
+          count: Array.isArray(payload.lines) ? (payload.lines as string[]).length : ids.length,
+          ms: Date.now() - startedAt,
+          ok: payload.reason === undefined,
+        }, sessionId)
+        return payload
+      }
+
+      if (action === 'write') {
+        const content = typeof args.content === 'string' ? args.content.trim() : ''
+        if (content.length === 0) return finish({ reason: 'write needs content' })
+        const anchor = deps.anchorOrdinalOf?.(exec)
+        const row = deps.stores.createNote({
+          content,
+          ...sessionId === undefined ? {} : { sessionId },
+          ...cwd === undefined ? {} : { projectPath: cwd },
+          ...anchor === undefined ? {} : { anchorOrdinal: anchor },
+        }, now)
+        return finish({ outcome: `Saved note #${String(row.id)}.` })
+      }
+
+      if (action === 'read') {
+        if (ids.length > 0) {
+          const lines: string[] = []
+          for (const id of ids) {
+            const row = deps.stores.getNote(id)
+            if (row === undefined) {
+              lines.push(`#${String(id)}: no such note.`)
+              continue
+            }
+            lines.push(`#${String(row.id)} · ${ageOf(now - row.createdAt)} · ${row.status}`)
+            lines.push(row.content)
+            lines.push('')
+          }
+          return finish({ lines })
+        }
+        const rows = deps.stores.listNotes({
+          ...sessionId === undefined ? {} : { sessionId },
+          ...cwd === undefined ? {} : { projectPath: cwd },
+          status: 'open',
+          limit: NOTE_READ_LIMIT,
+        })
+        if (rows.length === 0) return finish({ lines: [] })
+        const lines = rows.map(row => {
+          const stale = now - row.createdAt > 30 * 24 * 3600 * 1000 ? ' (stale)' : ''
+          const first = row.content.split('\n')[0]?.trim() ?? ''
+          const title = first.length > 80 ? `${first.slice(0, 79)}…` : first
+          return `#${String(row.id)} · ${ageOf(now - row.createdAt)} · ${title}${stale}`
+        })
+        lines.push('', DISMISS_FOOTER)
+        return finish({ lines })
+      }
+
+      if (action === 'update') {
+        if (ids.length !== 1) return finish({ reason: 'update needs exactly one note id' })
+        const content = typeof args.content === 'string' ? args.content.trim() : ''
+        if (content.length === 0) return finish({ reason: 'update needs content' })
+        const row = deps.stores.updateNote(ids[0]!, content, now)
+        if (row === undefined) return finish({ reason: `no note #${String(ids[0])}` })
+        return finish({ outcome: `Updated note #${String(row.id)}.` })
+      }
+
+      if (action === 'dismiss') {
+        if (ids.length === 0) return finish({ reason: 'dismiss needs at least one note id' })
+        if (ids.length > 50) return finish({ reason: 'dismiss takes at most 50 ids at once' })
+        const count = deps.stores.retireNotes(ids, 'dismiss', now)
+        return finish({ outcome: `Dismissed ${String(count)} note(s).` })
+      }
+
+      return finish({ reason: `unknown action "${action}"` })
     },
   })
 }
