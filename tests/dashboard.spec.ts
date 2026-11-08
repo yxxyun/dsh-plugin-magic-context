@@ -275,4 +275,21 @@ describe('dashboard data', () => {
     const payload = call(service, '/mc-dashboard/api/projects').json() as Record<string, unknown>
     expect(payload).toMatchObject({ available: false, projects: [] })
   })
+
+  it('serves an embedded variant that keeps one document but tightens the margins', () => {
+    const service = createDashboardService({ stores: tempStore(), meta: () => ({}) })
+    const plain = call(service, '/mc-dashboard')
+    const embedded = call(service, '/mc-dashboard?embed=1')
+    expect(embedded.status).toBe(200)
+    // Derived from the same source: both keep the four tabs and the shell id.
+    for (const marker of ['ov-cards', 'sess-body', 'proj-body', 'log-body']) {
+      expect(plain.text).toContain(marker)
+      expect(embedded.text).toContain(marker)
+    }
+    // The embed only changes the outer breathing room the panel already supplies.
+    expect(plain.text).toContain('padding: 18px 20px 60px')
+    expect(embedded.text).toContain('padding: 10px 12px 40px')
+    expect(embedded.text).not.toContain('padding: 18px 20px 60px')
+    expect(embedded.text.length).toBeLessThan(plain.text.length)
+  })
 })

@@ -76,7 +76,7 @@ export interface DashboardService {
   journalTail(limit: number, sessionId?: string): Record<string, unknown>
   projects(): Record<string, unknown>
   /** The page itself (one string; cheap to rebuild, no template engine). */
-  html(): string
+  html(options?: { readonly embed?: boolean }): string
   close(): void
 }
 
@@ -290,8 +290,6 @@ export function createDashboardService(deps: DashboardDeps): DashboardService {
     session,
     journalTail,
     projects,
-    // Rebuilt per request on purpose: the page reads its numbers from the JSON
-    // routes, so the HTML is a static shell and needs no per-request data.
     html: () => PAGE,
     close: () => undefined,
     handle: (req, res) => {
@@ -306,7 +304,9 @@ export function createDashboardService(deps: DashboardDeps): DashboardService {
       }
       const sessionId = sessionOf(requestUrl.searchParams.get('session'))
       if (path === '/' || path === '' || path === '/index.html') {
-        sendHtml(res, PAGE)
+        // `?embed=1` is the shell's iframe: the page keeps its own header, but
+        // drops the outer padding it does not need inside a panel.
+        sendHtml(res, requestUrl.searchParams.get('embed') === '1' ? EMBED_PAGE : PAGE)
         return
       }
       if (path === '/api/overview') {
@@ -746,3 +746,24 @@ const PAGE = `<!doctype html>
 `
 
 export { PAGE as DASHBOARD_PAGE }
+
+/**
+ * The same document, tuned for the in-shell iframe (`?embed=1`).
+ *
+ * Derived from {@link PAGE} rather than kept as a second copy: there is exactly
+ * one document, and embedding only changes the outer breathing room (the panel
+ * already supplies the shell's margins). Keeping two literals in sync by hand is
+ * how a page starts disagreeing with itself.
+ */
+const EMBED_PAGE = PAGE.replace(
+  'main { padding: 18px 20px 60px; max-width: 1180px; }',
+  'main { padding: 10px 12px 40px; max-width: none; }',
+).replace(
+  'header {\n    position: sticky; top: 0; z-index: 2; background: var(--bg);\n    border-bottom: 1px solid var(--line); padding: 12px 20px;',
+  'header {\n    position: sticky; top: 0; z-index: 2; background: var(--bg);\n    border-bottom: 1px solid var(--line); padding: 8px 12px;',
+).replace(
+  'footer { color: var(--dim); font-size: 11px; padding: 0 20px 24px; max-width: 1180px; }',
+  'footer { color: var(--dim); font-size: 11px; padding: 0 12px 16px; max-width: none; }',
+)
+
+export { EMBED_PAGE as DASHBOARD_EMBED_PAGE }

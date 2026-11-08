@@ -120,6 +120,16 @@ window.__ModuleLoader__.load({
     const OVERLAY_FALLBACK_MS = 1_500
 
     /**
+     * The dashboard's row/page order in the shell's global panel list.
+     *
+     * Same numbering space as the other panel rows (Plugins 0, Schedule 10,
+     * board 20, skill center 30, SSH 40), so this sits directly beneath SSH.
+     */
+    const DASHBOARD_ORDER = 50
+    /** The Host route the panel page embeds (see src/dsh/dashboard.ts). */
+    const DASHBOARD_URL = '/mc-dashboard'
+
+    /**
      * `@deepseek-ai/dsh-client-ui-primitives` is one of the shell's platform
      * modules. The require is guarded so a deployment whose module table lacks
      * it still materializes this bundle and keeps the telemetry badge; the
@@ -1124,6 +1134,12 @@ window.__ModuleLoader__.load({
         // Slot labels (ledger rows the shell projects).
         'title': 'Magic Context',
         'label.telemetry': 'Magic Context 遥测',
+        // The sidebar row + the main panel that hosts the dashboard page.
+        'label.dashboard': 'Magic Context 仪表板',
+        'dashboard.frameTitle': 'Magic Context 仪表板',
+        'dashboard.reload': '重新加载',
+        'dashboard.open': '在新标签页打开',
+        'dashboard.hint': '只读面板 · 数据来自本机双库',
       },
       en: {
         'category.write': 'Memory written',
@@ -1207,6 +1223,11 @@ window.__ModuleLoader__.load({
         'records.beats': 'Beats: {beats}',
         'title': 'Magic Context',
         'label.telemetry': 'Magic Context telemetry',
+        'label.dashboard': 'Magic Context dashboard',
+        'dashboard.frameTitle': 'Magic Context dashboard',
+        'dashboard.reload': 'Reload',
+        'dashboard.open': 'Open in a new tab',
+        'dashboard.hint': 'Read-only · data from the local store pair',
       },
     }
 
@@ -2120,6 +2141,130 @@ window.__ModuleLoader__.load({
      * ------------------------------------------------------------------ */
 
     /**
+     * The sidebar row glyph, drawn the way every other panel row draws one: the
+     * shell owns the button, label, tooltip and rail geometry, and this component
+     * contributes only the square glyph at the size the shell asks for.
+     *
+     * `data-dsh-panel-entry` is the only DOM this plugin owns inside that
+     * shell-owned row; the L2 skin contract resolves panel ownership through it
+     * (the shell stamps no per-entry hook of its own).
+     * @param props - the shell's icon share: square edge and selection state.
+     * @returns the decorative dashboard glyph.
+     */
+    function DashboardPanelIcon(props) {
+      const size = props !== undefined && typeof props.size === 'number' ? props.size : 16
+      return el('svg', {
+        'data-dsh-panel-entry': 'magic-context.dashboard',
+        viewBox: '0 0 16 16',
+        width: size,
+        height: size,
+        fill: 'none',
+        stroke: 'currentColor',
+        strokeWidth: 1.5,
+        strokeLinecap: 'round',
+        strokeLinejoin: 'round',
+        'aria-hidden': 'true',
+      },
+        el('rect', { key: 'frame', x: 1.75, y: 2.25, width: 12.5, height: 11.5, rx: 1.75 }),
+        el('path', { key: 'bar1', d: 'M4.25 10.25v2' }),
+        el('path', { key: 'bar2', d: 'M8 7.5v4.75' }),
+        el('path', { key: 'bar3', d: 'M11.75 4.75v7.5' }),
+      )
+    }
+
+    /**
+     * The main-slot page: the dashboard, embedded.
+     *
+     * Why an iframe and not a re-implementation: the page is served by the Host
+     * half as one self-contained document (`src/dsh/dashboard.ts` builds it as a
+     * single string, styles and script inline). Rendering it here would mean a
+     * second copy of that document in this half — two sources of truth for the
+     * same numbers. The iframe keeps one, and it also keeps the page's own CSP
+     * (`default-src 'none'`) intact instead of inheriting the shell's.
+     *
+     * The frame is `sandbox`ed WITHOUT `allow-same-origin` and WITHOUT
+     * `allow-scripts`… except that the page needs its own script. So the grant is
+     * exactly what the page uses: `allow-scripts` for its renderer, nothing else.
+     * No `allow-same-origin` means the embedded document is an opaque origin: it
+     * cannot read the shell's cookies, storage, or DOM, which is the property that
+     * matters for a route with no auth beyond the loopback bind.
+     *
+     * @returns the panel page.
+     */
+    function DashboardPage(props) {
+      const t = props !== undefined && typeof props.t === 'function' ? props.t : REFERENCE_T
+      const [nonce, setNonce] = useState(0)
+      const frameRef = useRef(null)
+      const src = DASHBOARD_URL + '?embed=1&n=' + String(nonce)
+
+      const reload = () => setNonce(value => value + 1)
+      const openExternal = () => {
+        try {
+          window.open(DASHBOARD_URL, '_blank', 'noopener')
+        } catch (error) {
+          /* a blocked popup is not an error worth reporting */
+        }
+      }
+
+      return el('div', {
+        'data-dsh-mc-dashboard': '',
+        style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 },
+      },
+        el('div', {
+          style: {
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            padding: '8px 12px',
+            borderBottom: '1px solid var(--dsh-border-subtle, rgba(128,128,128,.22))',
+            flex: '0 0 auto',
+          },
+        },
+          el('span', { style: { fontWeight: 600 } }, t('label.dashboard')),
+          el('span', {
+            style: { color: 'var(--dsh-text-tertiary, #8a8f98)', fontSize: 'calc(var(--dsh-content-font-size-secondary, 13px) - 1px)' },
+          }, t('dashboard.hint')),
+          el('span', { style: { marginLeft: 'auto', display: 'inline-flex', gap: 6 } },
+            el('button', {
+              type: 'button',
+              onClick: reload,
+              style: BUTTON_STYLE,
+            }, t('dashboard.reload')),
+            el('button', {
+              type: 'button',
+              onClick: openExternal,
+              style: BUTTON_STYLE,
+            }, t('dashboard.open')),
+          ),
+        ),
+        el('iframe', {
+          ref: frameRef,
+          key: nonce,
+          src,
+          title: t('dashboard.frameTitle'),
+          // No `allow-same-origin`: the document stays an opaque origin and cannot
+          // reach the shell's cookies, storage or DOM. `allow-scripts` is what the
+          // page's own renderer needs; nothing else is granted.
+          sandbox: 'allow-scripts',
+          referrerPolicy: 'no-referrer',
+          style: { flex: '1 1 auto', width: '100%', border: '0', minHeight: 0, background: 'transparent' },
+        }),
+      )
+    }
+
+    /** The two panel-page buttons: quiet until hovered, sized to the page header. */
+    const BUTTON_STYLE = {
+      font: 'inherit',
+      fontSize: 'calc(var(--dsh-content-font-size-secondary, 13px) - 1px)',
+      color: 'inherit',
+      background: 'transparent',
+      border: '1px solid var(--dsh-border-subtle, rgba(128,128,128,.28))',
+      borderRadius: 6,
+      padding: '3px 9px',
+      cursor: 'pointer',
+    }
+
+    /**
      * Register the telemetry pill and the settings card.
      *
      * The pill goes into the composer's dock row (`conversation.composer.dock`,
@@ -2229,7 +2374,38 @@ window.__ModuleLoader__.load({
           }
         }), 'magic-context: settings card')
       })
+
+      // ---- The dashboard as a first-class panel -----------------------------
+      // The page itself is served by the Host half at `/mc-dashboard` (a route
+      // this plugin owns; see src/dsh/dashboard.ts). Here it becomes a sidebar
+      // row next to Plugins / Schedule / board / skill center / SSH, and a main
+      // panel page — the same two seats `@linxin666/dsh-ssh` takes, which is why
+      // the order sits just after it (50 vs its 40).
+      //
+      // Both seats go through `slots.inject`: the callback runs only after the
+      // owning shell entry declares the seat, so a shell without them leaves the
+      // row absent instead of failing boot.
+      ctx.effect(() => {
+        const offRow = ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
+          name: 'sidebar.panellist',
+          id: 'magic-context.dashboard',
+          order: DASHBOARD_ORDER,
+          label: () => t('label.dashboard'),
+          locale: LOCALE_NS,
+        }, DashboardPanelIcon))
+        const offPage = ctx.slots.inject('main', () => ctx.slots.register({
+          name: 'main',
+          key: 'magic-context.dashboard',
+          order: DASHBOARD_ORDER,
+          locale: LOCALE_NS,
+        }, DashboardPage))
+        return () => {
+          offRow()
+          offPage()
+        }
+      }, 'magic-context: dashboard panel')
     }
+
 
     /**
      * `apply` is the only thing the loader needs. `__diagnostics` exists so the
