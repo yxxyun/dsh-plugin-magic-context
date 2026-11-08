@@ -22,6 +22,10 @@
 const PHASE_BASE = [
   'tests/phase-map.spec.ts',
   'tests/client-pure.spec.ts',
+  // The dock pill's hover contract: portal out of the composer dock, a finite
+  // bubble width, and one pointer handler family (the duplicate mouse pair made
+  // the whole window flicker). Baseline: it pins shipped behaviour, not new work.
+  'tests/client-hover-tooltip.spec.ts',
   'tests/compaction-engine.spec.ts',
   'tests/compaction-conflict.spec.ts',
   'tests/compartments.spec.ts',

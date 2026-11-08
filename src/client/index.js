@@ -1817,8 +1817,13 @@ window.__ModuleLoader__.load({
         // The official pill's hover/open skin, driven by state: an injected
         // :hover rule kept losing to (or sticking past) the inline styles, so
         // the background is computed here instead — same token, no specificity.
-        onMouseEnter: () => setHovered(true),
-        onMouseLeave: () => setHovered(false),
+        //
+        // POINTER events, not mouse events: the official Tooltip clones this
+        // element and chains `onPointerEnter`/`onPointerLeave` of its own, so a
+        // mouse handler here ran a SECOND, independent hover truth for the same
+        // gesture (two `setState` passes per crossing). One pairing only.
+        onPointerEnter: () => setHovered(true),
+        onPointerLeave: () => setHovered(false),
         style: {
           pointerEvents: 'auto',
           display: 'inline-flex',
@@ -1864,7 +1869,26 @@ window.__ModuleLoader__.load({
         el('span', { key: 'text' }, collapsed),
       ])
       const pill = Tooltip !== undefined
-        ? el(Tooltip, { label: tipText, side: 'top', delayMs: 200, disabled: open }, pillCore)
+        ? el(Tooltip, {
+          label: tipText,
+          side: 'top',
+          delayMs: 200,
+          disabled: open,
+          // The bubble is a `position: fixed` span rendered as a SIBLING of the
+          // pill in this same React tree unless `portal` is set — which lands it
+          // inside the composer dock, where the shell's `backdrop-filter` /
+          // transform ancestors become its containing block. Measured
+          // consequence: the fixed coordinates are reinterpreted against that
+          // box, the bubble is clipped, its own ResizeObserver re-fires on every
+          // write, and the whole window repaints — the dock pill "flickers" on
+          // hover. A portal takes it out of the dock entirely.
+          portal: inDock,
+          // Pin the width band so the bubble cannot change size between the
+          // pressure / error / memories variants of `tipText` (a `width:max-content`
+          // bubble with `overflow:auto` grows a scrollbar mid-hover, which is the
+          // other half of the loop). Fixed cap ⇒ no size step ⇒ no re-measure.
+          maxWidth: 280,
+        }, pillCore)
         : pillCore
 
       const place = anchor === null ? PANEL_FALLBACK_ANCHOR : anchor
