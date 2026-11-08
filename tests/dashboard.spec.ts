@@ -292,4 +292,23 @@ describe('dashboard data', () => {
     expect(embedded.text).not.toContain('padding: 18px 20px 60px')
     expect(embedded.text.length).toBeLessThan(plain.text.length)
   })
+
+  it('never fetches an unprefixed relative path (that resolves to the shell and 401s)', () => {
+    const service = createDashboardService({ stores: tempStore(), meta: () => ({}) })
+    for (const url of ['/mc-dashboard', '/mc-dashboard?embed=1']) {
+      const text = call(service, url).text
+      // The page lives at `/mc-dashboard` with NO trailing slash, so a relative
+      // `api/overview` resolves against the parent and becomes `/api/overview` —
+      // the shell's own route, behind its cookie gate. That is exactly how the
+      // in-shell panel rendered blank: every request came back 401.
+      // Only the fetch/open sites matter: `getJson('api/...')` or a bare
+      // `window.open('api/...')`. Route names in prose are harmless.
+      expect(text).not.toMatch(/getJson\(\s*['"]api\//)
+      expect(text).not.toMatch(/window\.open\(\s*['"]api\//)
+      expect(text).toContain("var API = '/mc-dashboard/api/'")
+      for (const route of ['overview', 'sessions', 'projects', 'journal?limit=400', 'session?session=']) {
+        expect(text).toContain(route)
+      }
+    }
+  })
 })

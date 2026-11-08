@@ -681,16 +681,21 @@ const PAGE = `<!doctype html>
   }
 
   // ── loaders ──────────────────────────────────────────────────────────────
-  function loadOverview() { return getJson('api/overview').then(renderOverview) }
+  // Absolute, prefixed paths — not a bare relative one. The page is served at
+  // /mc-dashboard (no trailing slash), so a relative "api/overview" resolves
+  // against the parent and becomes /api/overview: the shell's own route, which
+  // answers 401 behind its cookie gate. That is exactly how the panel went blank.
+  var API = '/mc-dashboard/api/'
+  function loadOverview() { return getJson(API + 'overview').then(renderOverview) }
   function loadSessions() {
-    return getJson('api/sessions').then(function (data) {
+    return getJson(API + 'sessions').then(function (data) {
       state.sessions = data.sessions || []
       renderSessions()
     })
   }
-  function loadProjects() { return getJson('api/projects').then(renderProjects) }
+  function loadProjects() { return getJson(API + 'projects').then(renderProjects) }
   function loadJournal() {
-    return getJson('api/journal?limit=400').then(function (data) {
+    return getJson(API + 'journal?limit=400').then(function (data) {
       state.journal = (data.entries || []).slice().reverse()
       renderJournal()
     })
@@ -734,7 +739,7 @@ const PAGE = `<!doctype html>
     var id = row.getAttribute('data-session')
     // The session detail is a JSON read; opening it in a new tab keeps this page
     // stateless and gives a URL an operator can paste into a bug report.
-    window.open('api/session?session=' + encodeURIComponent(id), '_blank', 'noopener')
+    window.open(API + 'session?session=' + encodeURIComponent(id), '_blank', 'noopener')
   })
 
   refresh()
