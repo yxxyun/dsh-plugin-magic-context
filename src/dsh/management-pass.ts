@@ -647,6 +647,11 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
   try {
     const toolNodes = enumerateSurfaceToolResults(input.session, callId =>
       input.stores.getTag(input.sessionId, { kind: 'tool-result', callId }))
+    // Capture the pre-drop text BEFORE any replacement: rebuilding this map after
+    // the loop reads back the placeholder, so every drop estimated as 0 tokens
+    // and the reclaim accounting showed nothing (measured 2026-11-09: one record,
+    // 165 tags, estTokens 0).
+    const textBySeq = new Map(enumerateSurfaceNodes(input.session).map(node => [node.seq, node.text]))
     for (const tag of input.stores.listPendingDrops(input.sessionId)) {
       const node = toolNodes.find(candidate => candidate.tagNumber === tag)
       if (node === undefined) continue
@@ -659,7 +664,6 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
       landedDrops.push(tag)
     }
     if (landedDrops.length > 0) {
-      const textBySeq = new Map(enumerateSurfaceNodes(input.session).map(node => [node.seq, node.text]))
       input.journal?.info(
         'drop-landed',
         `landed ${String(landedDrops.length)} drop(s): ${landedDrops.map(tag => `§${String(tag)}§`).join(', ')}`,

@@ -236,6 +236,49 @@ describe('dashboard data', () => {
     expect(all.entries).toHaveLength(6)
   })
 
+  it('reports the reclaim lane as tags landed, not as batch rows', () => {
+    const stores = tempStore()
+    seed(stores, 'sess-r')
+    // One record batching 165 tags is how the lane really behaves: a pass lands
+    // every queued stamp at once. Counting rows shows 1 and hides the work, so
+    // the overview must serve the batched payload (tags + token estimate).
+    stores.appendJournal({
+      at: 4_000,
+      level: 'info',
+      kind: 'drop-landed',
+      sessionId: 'sess-r',
+      summary: 'landed 165 drop(s)',
+      data: { tags: [1, 2, 3], count: 165, estTokens: 42_000 },
+    } as never)
+    const service = createDashboardService({ stores, meta: () => ({}), now: () => 10_000 })
+    const payload = call(service, '/mc-dashboard/api/overview').json() as {
+      reclaim24h: { rows: number; tags: number; estTokens: number }
+      rollup24h: Record<string, number>
+    }
+    expect(payload.reclaim24h).toEqual({ rows: 1, tags: 165, estTokens: 42_000 })
+    // The row-based rollup still says 1 — that is why the second field exists.
+    expect(payload.rollup24h['drop-landed']).toBe(1)
+  })
+
+  it('renders the reclaim card with its yield, not its row count', () => {
+    const stores = tempStore()
+    seed(stores, 'sess-r')
+    stores.appendJournal({
+      at: 4_000,
+      level: 'info',
+      kind: 'drop-landed',
+      sessionId: 'sess-r',
+      summary: 'landed 165 drop(s)',
+      data: { tags: [1, 2, 3], count: 165, estTokens: 42_000 },
+    } as never)
+    const service = createDashboardService({ stores, meta: () => ({}), now: () => 10_000 })
+    const page = call(service, '/mc-dashboard').text
+    // 165 tags and a 42k estimate must be reachable from the served page.
+    expect(page).toContain('reclaim24h')
+    expect(page).toContain('rec.tags')
+    expect(page).toContain('kfmt')
+  })
+
   it('answers 404 for an unknown session and 400 without one', () => {
     const stores = tempStore()
     seed(stores, 'sess-a')

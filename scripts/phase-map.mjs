@@ -26,6 +26,11 @@ const PHASE_BASE = [
   // bubble width, and one pointer handler family (the duplicate mouse pair made
   // the whole window flicker). Baseline: it pins shipped behaviour, not new work.
   'tests/client-hover-tooltip.spec.ts',
+  // The reclaim lane's accounting: `drop-landed` estimates from the text it
+  // removed (the map used to be built after the replace and read the placeholder,
+  // so every drop recorded 0 tokens), and the dashboard reports tags landed
+  // rather than batch rows. Baseline: it pins shipped behaviour.
+  'tests/drop-estimate.spec.ts',
   'tests/compaction-engine.spec.ts',
   'tests/compaction-conflict.spec.ts',
   'tests/compartments.spec.ts',

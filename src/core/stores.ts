@@ -296,6 +296,21 @@ export interface AdapterStores {
    * @param sessionId - restrict the rollup to one Session; every Session when omitted.
    */
   journalByKind(since?: number, sessionId?: string): Array<{ kind: string; level: JournalLevel; count: number }>
+  /**
+   * Sum one numeric field across a kind's journal rows in a window.
+   *
+   * `journalByKind` answers "how many events", which is the wrong unit for a
+   * lane whose records are batched: one `drop-landed` row can carry 165 tags, so
+   * counting rows shows 1 and hides the whole reclaim. This reads the batched
+   * payload instead. Rows whose JSON is malformed are skipped rather than
+   * failing the rollup.
+   *
+   * @param kind - journal kind to aggregate.
+   * @param field - numeric field inside each row's `data` object.
+   * @param since - only rows at or after this time; every row when omitted.
+   * @param sessionId - restrict to one Session; every Session when omitted.
+   */
+  journalSumField(kind: string, field: string, since?: number, sessionId?: string): number
   /** Delete entries older than the cutoff; returns the number removed. */
   pruneJournal(before: number): number
   /**
@@ -1842,6 +1857,33 @@ export function openStores(dataDir: string): AdapterStores {
       return db.prepare(
         `SELECT kind, level, COUNT(*) AS count FROM journal${where} GROUP BY kind, level ORDER BY count DESC`,
       ).all(...parameters) as Array<{ kind: string; level: JournalLevel; count: number }>
+    },
+    journalSumField: (kind, field, since, sessionId) => {
+      const clauses = ['kind = ?']
+      const parameters: Array<string | number> = [kind]
+      if (since !== undefined) {
+        clauses.push('at >= ?')
+        parameters.push(since)
+      }
+      if (sessionId !== undefined) {
+        clauses.push('session_id = ?')
+        parameters.push(sessionId)
+      }
+      const rows = db.prepare(
+        `SELECT data FROM journal WHERE ${clauses.join(' AND ')}`,
+      ).all(...parameters) as Array<{ data: string | null }>
+      let total = 0
+      for (const row of rows) {
+        if (row.data === null || row.data === undefined) continue
+        try {
+          const parsed = JSON.parse(row.data) as Record<string, unknown>
+          const value = parsed[field]
+          if (typeof value === 'number' && Number.isFinite(value)) total += value
+        } catch {
+          /* one malformed payload must not void the whole sum */
+        }
+      }
+      return total
     },
     pruneJournal: (before) => {
       const result = db.prepare('DELETE FROM journal WHERE at < ?').run(before)

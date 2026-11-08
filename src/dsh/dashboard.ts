@@ -118,7 +118,9 @@ export function createDashboardService(deps: DashboardDeps): DashboardService {
     }
   }
 
-  /** 24h journal rollup, shared by the overview and the page header. */
+  /** 24h window start, resolved per call so a long-lived service stays correct. */
+  const since24h = (): number => now() - DAY_MS
+
   const rollup = (): Record<string, number> => {
     const since = now() - DAY_MS
     const counts: Record<string, number> = {}
@@ -146,6 +148,8 @@ export function createDashboardService(deps: DashboardDeps): DashboardService {
     const bounds = safe(() => deps.stores.journalBounds(), { rows: 0 })
     const projects = safe(() => deps.memoryWriter?.listProjects(500) ?? [], [])
     const corpus = safe(() => deps.memoryWriter?.status, undefined)
+    // Computed once: the rollup walks every journal row of the window.
+    const rollup24h = rollup()
     return {
       generatedAt: now(),
       adapter: {
@@ -177,7 +181,17 @@ export function createDashboardService(deps: DashboardDeps): DashboardService {
         activeMemories: projects.reduce((sum, row) => sum + row.active, 0),
         unverifiedMemories: projects.reduce((sum, row) => sum + row.unverified, 0),
       },
-      rollup24h: rollup(),
+      rollup24h: rollup24h,
+      // The reclaim lane's real yield. `rollup24h['drop-landed']` counts ROWS,
+      // and one row batches every queued stamp of a pass (measured 2026-11-09:
+      // 165 tags in a single row), so the count reads as "1" and the lane looks
+      // idle. Serve the batched payload too: tags actually landed and their
+      // token estimate.
+      reclaim24h: {
+        rows: rollup24h['drop-landed'] ?? 0,
+        tags: safe(() => deps.stores.journalSumField('drop-landed', 'count', since24h()), 0),
+        estTokens: safe(() => deps.stores.journalSumField('drop-landed', 'estTokens', since24h()), 0),
+      },
     }
   }
 
@@ -513,6 +527,14 @@ const PAGE = `<!doctype html>
     if (typeof value !== 'number') return esc(value)
     return value.toLocaleString('en-US')
   }
+  // Compact token counts: 12.4k / 1.2M. The rollup cards have a fixed width and
+  // raw six-digit numbers wrap.
+  var kfmt = function (value) {
+    if (typeof value !== 'number' || !isFinite(value)) return '—'
+    if (value >= 1e6) return (value / 1e6).toFixed(1).replace(/\\.0$/, '') + 'M'
+    if (value >= 1e3) return (value / 1e3).toFixed(1).replace(/\\.0$/, '') + 'k'
+    return String(Math.round(value))
+  }
   var ago = function (at) {
     if (typeof at !== 'number') return '—'
     var d = Date.now() - at
@@ -576,6 +598,13 @@ const PAGE = `<!doctype html>
       'context-pressure': '压力读数', 'errors': '错误'
     }
     write('ov-rollup', order.map(function (key) {
+      // The reclaim lane reports its yield, not its row count: a single row can
+      // batch every stamp of a pass, so "1" both hides and misstates the work.
+      if (key === 'drop-landed') {
+        var rec = data.reclaim24h || {}
+        return card(labels[key], num(rec.tags || 0),
+          (rec.estTokens ? '≈' + kfmt(rec.estTokens) + ' tokens · ' : '') + num(rec.rows || 0) + ' 次落地')
+      }
       return card(labels[key] || key, num(roll[key] || 0))
     }).join(''))
 
