@@ -132,8 +132,13 @@ describe('dashboard routes', () => {
     expect(page.headers['content-type']).toContain('text/html')
     expect(page.headers['x-content-type-options']).toBe('nosniff')
     expect(page.text).toContain('Magic Context')
-    // The page must not ship a mutation affordance: read-only by construction.
-    expect(page.text).not.toMatch(/method:\s*['"]POST/i)
+    // The page has exactly ONE write affordance: the policy form. Before that
+    // route existed this asserted "no POST at all"; the invariant that still
+    // matters is that no other mutation exists, so the check narrows to "the only
+    // POST target is the policy route" rather than dropping it.
+    const postTargets = [...page.text.matchAll(/method:\s*['"]POST['"][\s\S]{0,200}?fetch\(([^,)]+)/g)].map(m => m[1])
+    for (const target of postTargets) expect(target).toContain("'policy'")
+    expect(page.text).not.toMatch(/method:\s*['"](PUT|PATCH)['"]/i)
   })
 
   it('refuses non-GET methods instead of falling through to a read', () => {

@@ -39,6 +39,7 @@
  *  - a custom CompactionEngine occupies the `ctx.compaction` seam so no
  *    checkpoint-summarizing engine competes with the reclaim lanes.
  */
+import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import {
   CONTEXT_WINDOW_EXCEEDED_CODE,
@@ -85,6 +86,14 @@ import { SWITCH_SNAPSHOT_META_KEY, buildSwitchSnapshot, diffSwitches } from './d
 import { isQuotaExhaustedDetail, RouteHealth, type RouteChoice } from './core/route-health.ts'
 import type { MagicContextDshConfig, MagicContextDshConfigDefineTool } from './dsh/config.ts'
 import { DEFAULT_POLICY, type PressurePolicy } from './core/policy.ts'
+import {
+  applyOverride,
+  createOverrideReader,
+  OVERRIDE_FILENAME,
+  parseOverride,
+  writeOverride,
+  clearOverride,
+} from './core/policy-override.ts'
 import z from '@deepseek-ai/schemastery'
 import { ensureTag, tagPrefix } from './core/tagger.ts'
 import { recoverOrphanHistorianRuns, type Journal } from './core/journal.ts'
@@ -161,8 +170,6 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
   }
 
   const policy: PressurePolicy = policyOf(config.policy)
-  /** Re-evaluated per pass so a settings-form edit applies immediately. */
-  const activePolicy = (): PressurePolicy => policyOf(config.policy)
   /**
    * The generation pin (historian + `/compact` summaries), re-read at every use
    * point so a settings-form edit reaches the next run without a remount.
@@ -175,6 +182,19 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
   const startedAt = Date.now()
   const storeDir = config.dataDir ?? defaultDataDir()
   const stores = openStores(storeDir)
+  /**
+   * The dashboard-editable thresholds, as a plugin-owned overlay.
+   *
+   * Kept separate from `config.policy` on purpose: those are schemastery
+   * volatile references the host's settings form owns, and a plugin cannot
+   * commit into them. This file is the channel the plugin does own, so the
+   * dashboard can tune 30/50 without rewriting the desktop profile's patch
+   * (hand-written comments + js-tagged nodes would not survive a round-trip).
+   */
+  const policyOverridePath = join(storeDir, OVERRIDE_FILENAME)
+  const readPolicyOverride = createOverrideReader(policyOverridePath)
+  /** Re-evaluated per pass so a settings-form edit or dashboard save applies immediately. */
+  const activePolicy = (): PressurePolicy => applyOverride(policyOf(config.policy), readPolicyOverride())
   ctx.logger.info(`magic-context dsh adapter: stores at ${stores.dbPath}`)
   // §N§ registry retention (the tags table only ever grows; the journal's
   // mount-time prune is the precedent): one DELETE per mount, logged only when
@@ -843,6 +863,11 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
     // and there is no mutation route. The route has no auth beyond the loopback
     // bind, so it serves counts, timestamps, kinds and identities — never
     // message content, memory content, or file contents.
+    // Read-only by construction with one narrow write: `POST /api/policy` edits
+    // the two pressure thresholds through `policy-override.ts`. The route has no
+    // auth beyond the loopback bind, so it serves counts, timestamps, kinds and
+    // identities — never message content, memory content, or file contents — and
+    // the write cannot name a path: the target is fixed here.
     dashboard = createDashboardService({
       stores,
       ...journal === undefined ? {} : { journal },
@@ -855,6 +880,9 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
       }),
       liveSessions: () => [...projects.sessionIdentity.keys()],
       startedAt,
+      policy: activePolicy,
+      configuredPolicy: () => policyOf(config.policy),
+      policyOverridePath,
     })
     const dash = dashboard
     scope.effect(() => webServer.register({
