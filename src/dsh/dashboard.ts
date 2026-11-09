@@ -11,20 +11,19 @@
  * served from a route we own, as plain HTML + JSON, with no build step and no
  * new dependency — the same contract `src/client/index.js` keeps.
  *
- * Read-only by construction, with ONE exception: `POST /api/policy`.
+ * Read-only by construction.
  *
- * Every other route is a GET that calls only the store's `list*`/`get*` readers.
+ * Every route is a GET that calls only the store's `list*`/`get*` readers.
  * Upstream lets the dashboard write memories and edit config; doing that from a
  * page with no authentication (see below) would hand anyone on the loopback
  * interface a corpus editor, so the corpus editor is out of scope on purpose.
  *
- * The one write is deliberately the narrowest thing that is still useful: the two
- * pressure thresholds, and nothing else. It cannot name a file, cannot touch the
- * corpus, and its payload is validated by `parseOverride` (percent bounds, force
- * >= execute) before anything reaches disk. Rationale for having it at all: the
- * alternative is hand-editing `cordis.patch.yml` in the desktop profile, which is
- * Electron-exclusive and full of hand-written comments and js-tagged nodes — a
- * two-number preference should not require that surgery.
+ * The pressure thresholds are NOT editable here. They live in `config.policy`,
+ * which the Plugins page's own config card already edits — that card writes
+ * through the host's `configEditor.edit` and applies without a remount. An
+ * earlier version of this file added a second, plugin-owned overlay file for the
+ * same two numbers; it was removed because two writable copies of one preference
+ * can disagree, and nothing then says which one the pass used.
  *
  * Authentication: like `/mc-telemetry`, this route has none beyond the loopback
  * bind — the web server's own cookie gate sits in front of `/` and `/api`, and a
@@ -39,13 +38,6 @@ import { SCHEMA_VERSION } from '../core/stores.ts'
 import type { Journal, JournalLevel } from '../core/journal.ts'
 import type { MemoryWriter } from '../core/memory-write.ts'
 import type { PressurePolicy } from '../core/policy.ts'
-import {
-  clearOverride,
-  parseOverride,
-  readOverride,
-  writeOverride,
-  type ThresholdOverride,
-} from '../core/policy-override.ts'
 
 /** The slice of the harness request/response we use (structural, no imports). */
 export interface DashboardRequest {
@@ -84,23 +76,6 @@ export interface DashboardDeps {
   readonly now?: () => number
   /** Session ids the process currently serves, newest first. */
   readonly liveSessions?: () => readonly string[]
-  /**
-   * The effective pressure policy (config + dashboard override), re-read per
-   * call. Without it the page still renders; the policy panel says "unavailable"
-   * rather than inventing numbers.
-   */
-  readonly policy?: () => PressurePolicy
-  /**
-   * The policy WITHOUT the dashboard override — i.e. what the config alone says.
-   * The form needs both: `policy()` to show what is in force, this one so
-   * "restore to configured" can name the target instead of guessing it.
-   */
-  readonly configuredPolicy?: () => PressurePolicy
-  /**
-   * Where the dashboard-editable override lives. `path` is also the write target,
-   * so the route can only ever touch this one file.
-   */
-  readonly policyOverridePath?: string
 }
 
 export interface DashboardService {
@@ -111,8 +86,6 @@ export interface DashboardService {
   session(sessionId: string): Record<string, unknown> | undefined
   journalTail(limit: number, sessionId?: string): Record<string, unknown>
   projects(): Record<string, unknown>
-  /** The thresholds as they stand now, plus where the override sits. */
-  policyState(): Record<string, unknown>
   /** The page itself (one string; cheap to rebuild, no template engine). */
   html(options?: { readonly embed?: boolean }): string
   close(): void
@@ -313,68 +286,6 @@ export function createDashboardService(deps: DashboardDeps): DashboardService {
     }
   }
 
-  /**
-   * The thresholds an operator may tune, and what is currently in force.
-   *
-   * `override` is the file's content (undefined = the configured values are in
-   * force); `effective` is what the next pass will actually use, which is what
-   * the form has to show — a stale override the operator forgot about must be
-   * visible rather than silently winning.
-   */
-  const policyState = (): Record<string, unknown> => {
-    const path = deps.policyOverridePath
-    const effective = safe(() => deps.policy?.(), undefined)
-    if (effective === undefined) {
-      return { generatedAt: now(), available: false }
-    }
-    const configured = safe(() => deps.configuredPolicy?.() ?? deps.policy?.(), effective)
-    const override = path === undefined ? undefined : safe(() => readOverride(path), undefined)
-    return {
-      generatedAt: now(),
-      available: true,
-      overridePath: path,
-      effective: {
-        executeThreshold: effective.executeThreshold,
-        forceThreshold: effective.forceThreshold,
-      },
-      override: override === undefined
-        ? undefined
-        : {
-          ...override.executeThreshold === undefined ? {} : { executeThreshold: override.executeThreshold },
-          ...override.forceThreshold === undefined ? {} : { forceThreshold: override.forceThreshold },
-        },
-      configured: {
-        // What the config alone says, so "restore to configured" can name the
-        // target. Reading `policy()` here would echo the override back and make
-        // the form claim the override IS the configured value.
-        executeThreshold: configured?.executeThreshold,
-        forceThreshold: configured?.forceThreshold,
-      },
-    }
-  }
-
-  /** Apply a validated override. Returns the state payload, or an error string. */
-  const applyPolicyOverride = (raw: unknown): { ok: true } | { ok: false; error: string } => {
-    const path = deps.policyOverridePath
-    if (path === undefined) return { ok: false, error: 'policy override is not wired on this install' }
-    const parsed = parseOverride(raw)
-    if (!parsed.ok) return { ok: false, error: parsed.error }
-    // Merge onto whatever is already stored: the form may submit one field.
-    const current = safe(() => readOverride(path), undefined) ?? {}
-    const merged: ThresholdOverride = {
-      ...current,
-      ...parsed.value,
-    }
-    // Re-validate the merged pair: two individually valid values can still cross.
-    const checked = parseOverride(merged)
-    if (!checked.ok) return { ok: false, error: checked.error }
-    try {
-      writeOverride(path, checked.value)
-      return { ok: true }
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : 'write failed' }
-    }
-  }
 
   const sendJson = (res: DashboardResponse, status: number, payload: unknown): void => {
     const body = JSON.stringify(payload)
@@ -399,42 +310,12 @@ export function createDashboardService(deps: DashboardDeps): DashboardService {
     res.end(body)
   }
 
-  /**
-   * Read a request body with a hard ceiling.
-   *
-   * The cap is not politeness: this route has no auth beyond the loopback bind,
-   * so an unbounded read is a memory-exhaustion lever for any local process. 8 KiB
-   * is several orders of magnitude above the two numbers this route accepts.
-   */
-  const MAX_BODY_BYTES = 8 * 1024
-  const readBody = (req: DashboardRequest): Promise<string> =>
-    new Promise<string>((resolve, reject) => {
-      if (req.on === undefined) {
-        resolve('')
-        return
-      }
-      let size = 0
-      const chunks: string[] = []
-      req.on('data', (chunk) => {
-        const text = typeof chunk === 'string' ? chunk : String(chunk)
-        size += Buffer.byteLength(text)
-        if (size > MAX_BODY_BYTES) {
-          reject(new Error(`body exceeds ${String(MAX_BODY_BYTES)} bytes`))
-          return
-        }
-        chunks.push(text)
-      })
-      req.on('end', () => { resolve(chunks.join('')) })
-      req.on('error', () => { reject(new Error('body read failed')) })
-    })
-
   return {
     sessions,
     overview,
     session,
     journalTail,
     projects,
-    policyState,
     html: () => PAGE,
     close: () => undefined,
     handle: (req, res) => {
@@ -443,47 +324,8 @@ export function createDashboardService(deps: DashboardDeps): DashboardService {
       const path = requestUrl.pathname.startsWith(base)
         ? requestUrl.pathname.slice(base.length) || '/'
         : requestUrl.pathname
-      // The ONE write route. Everything else stays a read; the method check below
-      // is deliberately after this branch so a POST to any other path is still a
-      // 405 rather than falling through to a reader.
-      if (path === '/api/policy') {
-        if (req.method === 'DELETE') {
-          const target = deps.policyOverridePath
-          if (target === undefined) {
-            sendJson(res, 400, { error: 'policy override is not wired on this install' })
-            return
-          }
-          safe(() => clearOverride(target), false)
-          sendJson(res, 200, { ok: true, ...policyState() })
-          return
-        }
-        if (req.method === 'POST') {
-          void readBody(req).then((body) => {
-            let parsed: unknown
-            try {
-              parsed = body.trim() === '' ? {} : JSON.parse(body)
-            } catch {
-              sendJson(res, 400, { error: 'body must be JSON' })
-              return
-            }
-            const outcome = applyPolicyOverride(parsed)
-            if (!outcome.ok) {
-              sendJson(res, 400, { error: outcome.error })
-              return
-            }
-            sendJson(res, 200, { ok: true, ...policyState() })
-          }).catch((error: unknown) => {
-            sendJson(res, 413, { error: error instanceof Error ? error.message : 'body rejected' })
-          })
-          return
-        }
-        if (req.method === 'GET' || req.method === 'HEAD') {
-          sendJson(res, 200, policyState())
-          return
-        }
-        sendJson(res, 405, { error: 'method not allowed', allow: ['GET', 'HEAD', 'POST', 'DELETE'] })
-        return
-      }
+      // Every route is a read. The method check comes first so a POST anywhere is
+      // a 405 rather than falling through to a reader.
       if (req.method !== 'GET' && req.method !== 'HEAD') {
         sendJson(res, 405, { error: 'read-only surface', allow: ['GET', 'HEAD'] })
         return
@@ -639,7 +481,6 @@ const PAGE = `<!doctype html>
     <button data-tab="overview" aria-current="page">概览</button>
     <button data-tab="sessions">会话</button>
     <button data-tab="projects">项目记忆</button>
-    <button data-tab="policy">策略</button>
     <button data-tab="journal">日志</button>
   </nav>
 </header>
@@ -677,32 +518,6 @@ const PAGE = `<!doctype html>
     </table>
   </section>
 
-  <section id="policy">
-    <div class="grid" id="pol-cards"></div>
-    <h2>压力阈值</h2>
-    <p class="dim" style="margin:0 0 10px">
-      达到「压缩」百分比时，管理轮开始重写上下文（压缩 + 落地排队的 reduce）；
-      达到「强制」百分比时，不再等待，直接应急回收最旧、最低优先级的工具输出。
-      强制值必须 ≥ 压缩值。保存后下一次管理轮即刻生效，无需重启。
-    </p>
-    <div class="toolbar" style="gap:10px;align-items:flex-end;flex-wrap:wrap">
-      <label style="display:flex;flex-direction:column;gap:4px">
-        <span class="dim">压缩 executeThreshold (%)</span>
-        <input type="number" id="pol-exec" min="1" max="100" step="1" style="width:110px">
-      </label>
-      <label style="display:flex;flex-direction:column;gap:4px">
-        <span class="dim">强制 forceThreshold (%)</span>
-        <input type="number" id="pol-force" min="1" max="100" step="1" style="width:110px">
-      </label>
-      <button id="pol-save">保存</button>
-      <button id="pol-reset">恢复配置值</button>
-      <span id="pol-msg" class="dim"></span>
-    </div>
-    <h2>快捷预设</h2>
-    <div class="toolbar" style="gap:8px;flex-wrap:wrap" id="pol-presets"></div>
-    <h2>生效来源</h2>
-    <table><tbody id="pol-detail"></tbody></table>
-  </section>
 
   <section id="journal">
     <div class="toolbar">
@@ -934,100 +749,10 @@ const PAGE = `<!doctype html>
     var job = state.tab === 'overview' ? loadOverview()
       : state.tab === 'sessions' ? loadSessions()
       : state.tab === 'projects' ? loadProjects()
-      : state.tab === 'policy' ? loadPolicy()
       : loadJournal()
     job.catch(function (error) {
       write('stamp', '读取失败：' + esc(error.message))
     })
-  }
-
-  // ── policy (the one editable surface) ────────────────────────────────────
-  // Presets are the shapes an operator actually wants: the shipped defaults, the
-  // aggressive pair this install has been running, and a conservative pair for
-  // long sessions where a cache bust is expensive.
-  var PRESETS = [
-    { label: '保守 65 / 85（默认）', exec: 65, force: 85 },
-    { label: '激进 30 / 50', exec: 30, force: 50 },
-    { label: '更激进 20 / 40', exec: 20, force: 40 },
-    { label: '宽松 80 / 95', exec: 80, force: 95 }
-  ]
-
-  function polMsg(text, bad) {
-    var node = document.getElementById('pol-msg')
-    if (!node) return
-    node.textContent = text
-    node.style.color = bad ? 'var(--bad, #e5484d)' : ''
-  }
-
-  function renderPolicy(data) {
-    if (!data || data.available === false) {
-      write('pol-cards', card('策略', '不可用', '未接上 policy 读取'))
-      write('pol-detail', '')
-      return
-    }
-    var eff = data.effective || {}
-    var ov = data.override || {}
-    write('pol-cards',
-      card('压缩阈值', num(eff.executeThreshold) + '%',
-        ov.executeThreshold === undefined ? '来自配置' : '来自仪表板覆盖') +
-      card('强制阈值', num(eff.forceThreshold) + '%',
-        ov.forceThreshold === undefined ? '来自配置' : '来自仪表板覆盖') +
-      card('覆盖状态', data.override ? '已覆盖' : '无覆盖',
-        data.override ? '点「恢复配置值」撤销' : '配置值原样生效'))
-
-    // Fill the form only when the operator is not mid-edit: overwriting a
-    // half-typed number on the 5s poll would fight the user.
-    var exec = document.getElementById('pol-exec')
-    var force = document.getElementById('pol-force')
-    var active = document.activeElement
-    if (exec && active !== exec) exec.value = eff.executeThreshold == null ? '' : eff.executeThreshold
-    if (force && active !== force) force.value = eff.forceThreshold == null ? '' : eff.forceThreshold
-
-    var rows = [
-      ['生效值', num(eff.executeThreshold) + '% / ' + num(eff.forceThreshold) + '%'],
-      ['覆盖文件', data.overridePath ? esc(data.overridePath) : '—'],
-      ['覆盖内容', data.override
-        ? 'execute=' + num(ov.executeThreshold) + ' force=' + num(ov.forceThreshold)
-        : '（无，使用配置值）'],
-      ['说明', '保存后下一次管理轮生效；ctx_reduce 的落地仍绑定在压缩轮上（KV cache 取舍）。']
-    ]
-    write('pol-detail', rows.map(function (row) {
-      return '<tr><th>' + esc(row[0]) + '</th><td>' + row[1] + '</td></tr>'
-    }).join(''))
-  }
-
-  function loadPolicy() {
-    return getJson(API + 'policy').then(renderPolicy)
-  }
-
-  function savePolicy(body) {
-    return fetch(API + 'policy', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', accept: 'application/json' },
-      body: JSON.stringify(body)
-    }).then(function (r) {
-      return r.json().then(function (payload) {
-        if (!r.ok) throw new Error(payload.error || ('HTTP ' + r.status))
-        return payload
-      })
-    }).then(function (payload) {
-      renderPolicy(payload)
-      polMsg('已保存，下一次管理轮生效')
-      return payload
-    }).catch(function (error) {
-      polMsg('保存失败：' + error.message, true)
-      throw error
-    })
-  }
-
-  function resetPolicy() {
-    return fetch(API + 'policy', { method: 'DELETE', headers: { accept: 'application/json' } })
-      .then(function (r) { return r.json() })
-      .then(function (payload) {
-        renderPolicy(payload)
-        polMsg('已恢复为配置值')
-      })
-      .catch(function (error) { polMsg('恢复失败：' + error.message, true) })
   }
 
   // ── wiring ───────────────────────────────────────────────────────────────
@@ -1051,44 +776,6 @@ const PAGE = `<!doctype html>
   if (sessFilter) sessFilter.addEventListener('input', renderSessions)
   var logFilter = document.getElementById('log-filter')
   if (logFilter) logFilter.addEventListener('input', renderJournal)
-
-  var polSave = document.getElementById('pol-save')
-  if (polSave) polSave.addEventListener('click', function () {
-    var exec = document.getElementById('pol-exec')
-    var force = document.getElementById('pol-force')
-    var body = {}
-    if (exec && exec.value !== '') body.executeThreshold = Number(exec.value)
-    if (force && force.value !== '') body.forceThreshold = Number(force.value)
-    if (body.executeThreshold === undefined && body.forceThreshold === undefined) {
-      polMsg('先填一个数值', true)
-      return
-    }
-    // Client-side pre-check for the pair rule, so the common mistake gets an
-    // instant message instead of a round-trip.
-    if (body.executeThreshold !== undefined && body.forceThreshold !== undefined
-      && body.forceThreshold < body.executeThreshold) {
-      polMsg('强制阈值必须 ≥ 压缩阈值', true)
-      return
-    }
-    polSave.disabled = true
-    savePolicy(body).catch(function () {}).then(function () { polSave.disabled = false })
-  })
-  var polReset = document.getElementById('pol-reset')
-  if (polReset) polReset.addEventListener('click', function () {
-    polReset.disabled = true
-    resetPolicy().then(function () { polReset.disabled = false })
-  })
-  var polPresets = document.getElementById('pol-presets')
-  if (polPresets) {
-    PRESETS.forEach(function (preset) {
-      var button = document.createElement('button')
-      button.textContent = preset.label
-      button.addEventListener('click', function () {
-        savePolicy({ executeThreshold: preset.exec, forceThreshold: preset.force }).catch(function () {})
-      })
-      polPresets.appendChild(button)
-    })
-  }
 
   document.getElementById('sess-body').addEventListener('click', function (event) {
     var row = event.target.closest('tr[data-session]')

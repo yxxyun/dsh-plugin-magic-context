@@ -31,9 +31,6 @@ const PHASE_BASE = [
   // so every drop recorded 0 tokens), and the dashboard reports tags landed
   // rather than batch rows. Baseline: it pins shipped behaviour.
   'tests/drop-estimate.spec.ts',
-  // The dashboard's one write route: the two pressure thresholds, validated
-  // before disk, target fixed by the caller, and every other route still a 405.
-  'tests/policy-override.spec.ts',
   'tests/compaction-engine.spec.ts',
   'tests/compaction-conflict.spec.ts',
   'tests/compartments.spec.ts',

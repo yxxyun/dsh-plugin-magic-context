@@ -86,14 +86,6 @@ import { SWITCH_SNAPSHOT_META_KEY, buildSwitchSnapshot, diffSwitches } from './d
 import { isQuotaExhaustedDetail, RouteHealth, type RouteChoice } from './core/route-health.ts'
 import type { MagicContextDshConfig, MagicContextDshConfigDefineTool } from './dsh/config.ts'
 import { DEFAULT_POLICY, type PressurePolicy } from './core/policy.ts'
-import {
-  applyOverride,
-  createOverrideReader,
-  OVERRIDE_FILENAME,
-  parseOverride,
-  writeOverride,
-  clearOverride,
-} from './core/policy-override.ts'
 import z from '@deepseek-ai/schemastery'
 import { ensureTag, tagPrefix } from './core/tagger.ts'
 import { recoverOrphanHistorianRuns, type Journal } from './core/journal.ts'
@@ -183,18 +175,15 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
   const storeDir = config.dataDir ?? defaultDataDir()
   const stores = openStores(storeDir)
   /**
-   * The dashboard-editable thresholds, as a plugin-owned overlay.
+   * Re-evaluated per pass, so a settings-form edit applies immediately.
    *
-   * Kept separate from `config.policy` on purpose: those are schemastery
-   * volatile references the host's settings form owns, and a plugin cannot
-   * commit into them. This file is the channel the plugin does own, so the
-   * dashboard can tune 30/50 without rewriting the desktop profile's patch
-   * (hand-written comments + js-tagged nodes would not survive a round-trip).
+   * The thresholds are edited in the Plugins page's own config card, which writes
+   * through the host's `configEditor.edit` into `config.policy`. That card is the
+   * one channel: a plugin-owned overlay file was tried and removed — it duplicated
+   * the same two numbers in a second place, so the two could disagree with no way
+   * to tell which one the pass had actually used.
    */
-  const policyOverridePath = join(storeDir, OVERRIDE_FILENAME)
-  const readPolicyOverride = createOverrideReader(policyOverridePath)
-  /** Re-evaluated per pass so a settings-form edit or dashboard save applies immediately. */
-  const activePolicy = (): PressurePolicy => applyOverride(policyOf(config.policy), readPolicyOverride())
+  const activePolicy = (): PressurePolicy => policyOf(config.policy)
   ctx.logger.info(`magic-context dsh adapter: stores at ${stores.dbPath}`)
   // §N§ registry retention (the tags table only ever grows; the journal's
   // mount-time prune is the precedent): one DELETE per mount, logged only when
@@ -863,11 +852,6 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
     // and there is no mutation route. The route has no auth beyond the loopback
     // bind, so it serves counts, timestamps, kinds and identities — never
     // message content, memory content, or file contents.
-    // Read-only by construction with one narrow write: `POST /api/policy` edits
-    // the two pressure thresholds through `policy-override.ts`. The route has no
-    // auth beyond the loopback bind, so it serves counts, timestamps, kinds and
-    // identities — never message content, memory content, or file contents — and
-    // the write cannot name a path: the target is fixed here.
     dashboard = createDashboardService({
       stores,
       ...journal === undefined ? {} : { journal },
@@ -880,9 +864,6 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
       }),
       liveSessions: () => [...projects.sessionIdentity.keys()],
       startedAt,
-      policy: activePolicy,
-      configuredPolicy: () => policyOf(config.policy),
-      policyOverridePath,
     })
     const dash = dashboard
     scope.effect(() => webServer.register({
@@ -984,6 +965,49 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
   } catch (error) {
     journal?.warn('config-drift', `switch snapshot diff failed: ${error instanceof Error ? error.message : String(error)}`)
   }
+
+  // Settings-card diagnostic. The browser half only registers its Plugins-page
+  // card when the Host's settings document serves OUR namespace (`whileServed`),
+  // and that list is derived from `settings.describe()` — which silently drops an
+  // entry whose schema, fiber state, or volatile fields are not all present. When
+  // the card is missing there is no other way to tell "namespace absent" from
+  // "browser half never loaded", so the answer is recorded once at boot.
+  ctx.inject(['settings'], (settingsScope: unknown) => {
+    try {
+      const service = (settingsScope as {
+        settings?: { describe?: (options?: { redactSecrets?: boolean }) => Array<{ ns: string }> }
+      }).settings
+      const rows = service?.describe?.({ redactSecrets: true }) ?? []
+      const namespaces = rows.map(row => row.ns)
+      journal?.info('boot', `settings namespaces served: ${String(namespaces.length)}`, {
+        settingsCard: namespaces.includes('magic-context-dsh') ? 'available' : 'absent',
+        namespaces,
+      })
+      // Why a namespace can be missing even though the schema is fine: the
+      // settings surface reads `configEditor.entries()`, which keeps only loader
+      // entries whose parent is the `include` plugin AND whose id occurs exactly
+      // once. A row the profile patch declares *and* a bundle patch inserts lands
+      // twice, so the pair is dropped as ambiguous — no error, no card. Count the
+      // raw loader entries so the cause is visible instead of guessed.
+      const loader = (settingsScope as {
+        loader?: { entries?: () => Array<{ options?: { id?: string }, parent?: { tree?: { ctx?: { fiber?: { entry?: { id?: string } } } } } }> }
+      }).loader
+      const raw = [...(loader?.entries?.() ?? [])]
+      const counts = new Map<string, number>()
+      for (const entry of raw) {
+        const id = entry.options?.id
+        if (id !== undefined) counts.set(id, (counts.get(id) ?? 0) + 1)
+      }
+      const underInclude = raw.filter(entry => entry.parent?.tree?.ctx?.fiber?.entry?.id === 'include')
+      journal?.info('boot', `loader entries: ${String(raw.length)}, under include: ${String(underInclude.length)}`, {
+        ourEntryCount: counts.get('magic-context-dsh') ?? 0,
+        duplicates: [...counts.entries()].filter(([, count]) => count > 1).map(([id, count]) => `${id}x${String(count)}`).slice(0, 20),
+      })
+    } catch (error) {
+      // A settings service that refuses describe must not break the mount.
+      journal?.warn('boot', `settings namespace probe failed: ${errText(error)}`)
+    }
+  })
 
   journal?.info('boot', `adapter booted (tools: ${toolMode}, historian: ${liveBoolean(config.historianEnabled, true) === false ? 'off' : llm === undefined ? 'no-llm' : 'on'})`, {
     version: 'phase2',
