@@ -5,8 +5,10 @@
  *
  * Discipline note (load-bearing): landing a durable drop is a priced cache
  * bust in DSH exactly like a wire rewrite is in OpenCode. The execute band
- * (pressure >= threshold, or the cache presumed dead past the TTL) is the
- * one permission under which queued drops land; below it the adapter defers.
+ * (pressure >= threshold) is the one permission under which queued drops land;
+ * below it the adapter defers. Idle expiry used to be a second such permission
+ * and no longer is — see {@link decidePass} for why the reversal is the better
+ * reading of the same trade.
  */
 import type { UsageRecord } from './types.ts'
 
@@ -25,7 +27,12 @@ export interface PressurePolicy {
    * {@link historianAssumedWindow}.
    */
   readonly assumedContextWindow: number
-  /** Idle past this since the last response presumes the provider cache dead (MC cache TTL). */
+  /**
+   * Diagnostic only since v0.49.44: idle past this since the last response
+   * means the provider's cache is presumed dead, but that is no longer a
+   * reason to rebuild (see {@link decidePass}). `/ctx-status` reports it so
+   * an operator can tell "cache is cold" apart from "nothing to reclaim".
+   */
   readonly ttlMs: number
   /** Newest tool-result tags the reclaim never touches (MC protected tail, count-based MVP). */
   readonly protectedToolResults: number
@@ -120,13 +127,29 @@ export function pressureWindowTokens(
 }
 
 export type PassDecision =
-  | { readonly kind: 'execute'; readonly reason: 'execute-threshold' | 'cache-ttl-expired' | 'wire-repair' }
+  // `cache-ttl-expired` was removed from this union in the v0.49.44 alignment:
+  // no path can produce it. Historic journal rows still carry that string, so
+  // readers of stored data must keep tolerating it.
+  | { readonly kind: 'execute'; readonly reason: 'execute-threshold' | 'wire-repair' }
   | { readonly kind: 'defer'; readonly reason: 'no-usage' | 'no-window' | 'below-threshold' }
 
 /**
- * One pass decision. Mirrors MC's scheduler: execute at the threshold, or
- * when the idle clock (last served response, not last prepared request)
- * passes the cache TTL; otherwise defer.
+ * One pass decision. Mirrors MC's scheduler: execute at the threshold,
+ * otherwise defer.
+ *
+ * An expired provider cache is deliberately NOT an execute pass (MC v0.49.44
+ * reversed the original position, and the reversal is the better reading of
+ * the same trade). When only the provider forgot the cache, resending the same
+ * bytes keeps every signed thinking block valid and the re-read costs the same
+ * either way — so rebuilding then buys nothing and loses two things: the kept
+ * reasoning blocks, and context the agent may still need well before the
+ * window is full. Measured against the local store, TTL-driven passes landed at
+ * a median 14.9% pressure (min 4.2%), i.e. they rewrote the prefix while 85% of
+ * the window was still free.
+ *
+ * `ttlMs` therefore stays in the policy as a diagnostic only (see
+ * `/ctx-status`), not as a trigger; queued drops and cleanup wait for the
+ * execute threshold, a model/system-prompt change, or an explicit bust.
  *
  * Iron rule: the adapter must never leave the main wire unpairable. A
  * stranded `tool_result` 400s every strict-provider request, so any live
@@ -135,7 +158,12 @@ export type PassDecision =
 export function decidePass(args: {
   latest: UsageRecord | undefined
   pressure: number | undefined
-  now: number
+  /**
+   * Retained so every call site keeps passing its clock, but the decision no
+   * longer reads it: the idle clock stopped being a trigger in MC v0.49.44.
+   * `/ctx-status` reports idle age from `latest.recordedAt` directly.
+   */
+  now?: number
   policy: PressurePolicy
   /** Live tool/results whose tool_use left the wire (see `wireStrandedResults`). */
   wireDefects?: number
@@ -144,9 +172,8 @@ export function decidePass(args: {
   if (args.latest === undefined) return { kind: 'defer', reason: 'no-usage' }
   if (args.pressure === undefined) return { kind: 'defer', reason: 'no-window' }
   if (args.pressure >= args.policy.executeThreshold) return { kind: 'execute', reason: 'execute-threshold' }
-  if (args.now - args.latest.recordedAt > args.policy.ttlMs) {
-    return { kind: 'execute', reason: 'cache-ttl-expired' }
-  }
+  // No idle-clock branch: see the header. An expired provider cache replays the
+  // same bytes, so it is neither a rebuild nor a fold reason.
   return { kind: 'defer', reason: 'below-threshold' }
 }
 

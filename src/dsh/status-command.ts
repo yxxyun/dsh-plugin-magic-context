@@ -99,7 +99,9 @@ export function registerCtxStatusCommand(ctx: Context, deps: StatusDeps): void {
             + `frozen ${new Date(baseline.frozenAt).toISOString()}`
             + `${baseline.memoriesDigest === undefined ? '' : ', memories injected'}`}`,
         `- policy: execute ≥ ${String(policy.executeThreshold)}%, force ≥ ${String(policy.forceThreshold)}%, `
-          + `ttl ${String(Math.round(policy.ttlMs / 1000))}s, protect newest ${String(policy.protectedToolResults)} `
+          // `ttl` is a diagnostic since v0.49.44, never a trigger: the label
+          // says so, otherwise the line reads like a second execute band.
+          + `ttl ${String(Math.round(policy.ttlMs / 1000))}s (diagnostic only), protect newest ${String(policy.protectedToolResults)} `
           + `(+${String(policy.historianProtectedNodes)} from the historian), `
           + `assumed window ${String(policy.assumedContextWindow)} tokens`,
         journalLine,
