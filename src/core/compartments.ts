@@ -1013,7 +1013,11 @@ export function parseHistorianEnvelope(text: string): CompartmentDraft {
       }
     }
   }
-  const content = tierOf('p1') || tierOf('p2') || tierOf('p4')
+  // A digest that answers in one tier still lands: the fallback fills the rest,
+  // and p3 belongs in the chain — a p3-only answer used to be rejected as
+  // 'no tier text' and thrown away, word for word the loss this envelope exists
+  // to prevent.
+  const content = tierOf('p1') || tierOf('p2') || tierOf('p3') || tierOf('p4')
   // WP5 lane: statements about the PERSON, not the project. The prompt asks for
   // them under `<user_observations>`, and `historian.ts` writes them to the
   // candidate pool from `draft.userObservations` — if this block is ever dropped

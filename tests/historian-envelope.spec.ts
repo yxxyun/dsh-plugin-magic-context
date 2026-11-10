@@ -218,3 +218,17 @@ describe('the parser survives what models really write', () => {
     expect(draft.facts).toEqual([{ category: 'NAMING', content: 'Real legacy fact' }])
   })
 })
+
+describe('a digest that answers in one tier', () => {
+  it('keeps a p3-only compartment instead of rejecting it', () => {
+    // The fallback chain (p1 || p2 || p3 || p4) used to skip p3, so a model that
+    // put its whole summary in p3 produced "carries no tier text" and the chunk
+    // was thrown away — the exact loss the envelope format exists to prevent.
+    const draft = parseHistorianEnvelope(
+      '<output><compartments><compartment importance="45"><p3>only paragraph</p3>'
+        + '</compartment></compartments></output>',
+    )
+    expect(draft.tiers.p3).toBe('only paragraph')
+    expect(draft.tiers.p1).toBe('only paragraph')
+  })
+})
