@@ -9,7 +9,10 @@ import {
   describeJsonImbalance,
   findBaselineRange,
   parseHistorianOutput,
+  compartmentHeader,
   renderBaseline,
+  renderCompartment,
+  repairHistorianJson,
   selectTier,
   stripBaseline,
   type Compartment,
@@ -91,18 +94,30 @@ describe('historian output contract', () => {
 })
 
 describe('tier ladder', () => {
-  it('degrades by age and promotes/demotes by importance', () => {
-    const minute = 60_000
-    expect(selectTier(50, 5 * minute)).toBe('p1')
-    expect(selectTier(50, 60 * minute)).toBe('p2')
-    expect(selectTier(50, 5 * 60 * minute)).toBe('p3')
-    expect(selectTier(50, 48 * 60 * minute)).toBe('p4')
+  it('renders the same bytes whenever it is rendered', () => {
+    const row = compartment({ compartmentId: 7, createdAt: 0 })
+    const header = compartmentHeader(row, 0)
+    expect(header).toContain('§C7§')
+    expect(header).not.toMatch(/\d+m ago/)
+    // Pure function of (row, positional age): no clock, no drift.
+    expect(renderCompartment(row, 0)).toBe(renderCompartment(row, 0))
+  })
+
+  it('degrades by positional age (compartments), never by the clock', () => {
+    expect(selectTier(50, 0)).toBe('p1')
+    expect(selectTier(50, 3)).toBe('p2')
+    expect(selectTier(50, 8)).toBe('p3')
+    expect(selectTier(50, 20)).toBe('p4')
     // importance promotes one step, never beyond p1
-    expect(selectTier(90, 60 * minute)).toBe('p1')
-    expect(selectTier(90, 48 * 60 * minute)).toBe('p3')
+    expect(selectTier(90, 3)).toBe('p1')
+    expect(selectTier(90, 20)).toBe('p3')
     // low importance demotes one step, never beyond p4
-    expect(selectTier(10, 5 * minute)).toBe('p2')
-    expect(selectTier(10, 48 * 60 * minute)).toBe('p4')
+    expect(selectTier(10, 0)).toBe('p2')
+    expect(selectTier(10, 20)).toBe('p4')
+    // Positional age, not wall-clock age — the clock is not an input at all,
+    // which is what makes the rendered block byte-stable (upstream
+    // `mc-core/src/decay.rs:61-62`: "`a` is the 0-based age").
+    expect(selectTier(50, -3)).toBe('p1')
   })
 })
 
@@ -209,5 +224,47 @@ describe('describeJsonImbalance', () => {
       expect((error as Error).message).not.toContain('unclosed')
       expect((error as Error).message).not.toContain('unexpected')
     }
+  })
+})
+
+/**
+ * `repairHistorianJson` — the two shapes that break `JSON.parse` on a real
+ * model response, and the one shape that must keep failing.
+ *
+ * Live trigger (2026-11-10 16:49:17): a 105k-token span chunked 3 ways came
+ * back `finishReason=stop`, 6,131 characters, `invalid JSON (position 1132,
+ * line 3 column 1116)` — one long line, i.e. a digest written with real
+ * newlines instead of `\n`.
+ */
+describe('historian JSON repair', () => {
+  const round = (raw: string) => JSON.parse(repairHistorianJson(raw).text) as Record<string, unknown>
+
+  it('escapes raw newlines and tabs inside strings', () => {
+    const raw = '{"summary":{"p1":"line one\nline two\tend","p2":"b","p3":"c","p4":"d"}}'
+    const repaired = repairHistorianJson(raw)
+    expect(repaired.notes).toContain('raw-newline')
+    expect(repaired.notes).toContain('raw-tab')
+    expect(round(raw).summary).toMatchObject({ p1: 'line one\nline two\tend' })
+    // …and the real parser accepts it end to end.
+    expect(parseHistorianOutput(raw).tiers.p1).toBe('line one\nline two\tend')
+  })
+
+  it('doubles a backslash that starts no valid escape', () => {
+    // NB `C:\temp` would NOT be repaired: `\t` is a valid JSON escape, so the
+    // text is legal JSON whose meaning is a tab. Only invalid escapes (a path
+    // like `C:\data`, a `\§` in prose) are unambiguous enough to fix.
+    const raw = '{"summary":{"p1":"path C:\\data\\§x","p2":"b","p3":"c","p4":"d"}}'
+    expect(repairHistorianJson(raw).notes).toContain('bad-escape')
+    expect(round(raw).summary).toMatchObject({ p1: 'path C:\\data\\§x' })
+  })
+
+  it('leaves a well-formed response byte-identical', () => {
+    const raw = JSON.stringify({ summary: { p1: 'a', p2: 'b', p3: 'c', p4: 'd' }, importance: 55 })
+    expect(repairHistorianJson(raw)).toEqual({ text: raw, notes: [] })
+  })
+
+  it('does NOT rescue a truncated object — a half digest must fail loudly', () => {
+    const raw = '{"summary":{"p1":"only the first tier","p2":"b"'
+    expect(() => parseHistorianOutput(raw)).toThrow(/no JSON object|invalid JSON/)
   })
 })

@@ -77,6 +77,7 @@ function baseStores(pending: number[]): AdapterStores {
       return map[ref.callId]
     },
     markDropLanded: () => {},
+    retireDrop: () => {},
     markCompartmentLanded: () => {},
     listCompartments: () => [],
     listNotes: () => [],
@@ -127,3 +128,58 @@ describe('drop-landed reports the tokens the drop removed', () => {
 function nextSeqOf(session: { snapshotEvents: () => unknown[] }): number {
   return session.snapshotEvents().length + 1
 }
+
+/**
+ * 目标消失的队列行必须退休。
+ *
+ * 2026-11-10 之前：`listPendingDrops` 里的 tag 在 surface 上找不到对应 tool
+ * result 时只是 `continue` —— 行永远留着。于是每次 execute pass 都重试一个再也
+ * 不会出现的 tag，面板上的「待落地回收」只增不减。目标消失的真实成因有两种：
+ * 消息被压进 compartment（surface 上只剩 `[compacted §Cn§]`），或 call id 不再
+ * 映射到 tag。
+ */
+describe('a queued drop whose target is gone is retired, not retried', () => {
+  it('retires it once, journals the reason, and never counts it as reclaimed', () => {
+    const entries: Recorded[] = []
+    const session = surfaceSession()
+    const retired: number[] = []
+
+    // One live tool result (§7) and one pending drop for §9, which is NOT on
+    // the surface — the compacted-away shape.
+    ;(session as unknown as { append: (t: string, d: unknown) => { seq: number } }).append('tool/call', {
+      callId: 'call-a',
+      name: 'Read',
+    })
+    ;(session as unknown as { append: (t: string, d: unknown) => { seq: number } }).append('tool/result', {
+      turn: 1,
+      step: 1,
+      message: { toolCallId: 'call-a', content: [{ type: 'text', text: BODY }] },
+    })
+
+    const stores = {
+      ...baseStores([7, 9]),
+      retireDrop: (_sessionId: string, tagNumber: number) => { retired.push(tagNumber) },
+    } as unknown as AdapterStores
+
+    const result = runManagementPass({
+      session: session as never,
+      sessionId: 'mc-drop-retired',
+      stores,
+      policy: DEFAULT_POLICY,
+      logger: silentLogger,
+      pass: { kind: 'execute', reason: 'cache-ttl-idle' },
+      pressure: 12,
+      journal: recordingJournal(entries),
+    })
+
+
+    expect(retired).toEqual([9])
+    expect(result.retiredDrops).toEqual([9])
+    expect(result.landedDrops).toEqual([7])
+    const row = entries.find(entry => entry.kind === 'drop-retired')
+    expect(row?.data).toMatchObject({ tags: [9], count: 1, reason: 'target-gone' })
+    // The reclaim proof stays honest: a retired drop removed nothing.
+    const landed = entries.find(entry => entry.kind === 'drop-landed')
+    expect(landed?.data?.tags).toEqual([7])
+  })
+})

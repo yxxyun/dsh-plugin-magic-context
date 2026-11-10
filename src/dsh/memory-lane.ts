@@ -450,7 +450,9 @@ export function openMemoryLane(
     : async (session, query, limit) => {
       const spec = config.memory?.project ?? (session as { header?: { cwd?: string } }).header?.cwd
       if (spec === undefined) return []
-      const space = memoryRecall.searchSpace(resolveIdentitySpec(spec))
+      const identity = resolveIdentitySpec(spec)
+      if (identity === undefined) return []
+      const space = memoryRecall.searchSpace(identity)
       if (space === undefined) return []
       // FTS-only: no embedding request, so no model load on the turn path. The
       // stored-vector lane stays available to ctx_search, where the agent asked.
@@ -466,9 +468,22 @@ export function openMemoryLane(
         queryEmbedding: null,
         queryModelId: null,
       })
-      return outcome.ok ? outcome.hits : []
+      if (!outcome.ok) return []
+      // S(t) sidecar: this lane searches on every real user turn (711
+      // `search-hint` rows in the 2026-11-09..10 store), and what it surfaces
+      // IS a retrieval for this project's work. `memory_stats.hits` sat at 0 for
+      // two days — 85 rows, 1,645 injections, 0 hits — because only the explicit
+      // `ctx_search` tool path recorded them, so the decay half of the score
+      // read "never retrieved" for every memory. Fail-open: advisory stats must
+      // never fail a search.
+      try {
+        const now = Date.now()
+        for (const hit of outcome.hits) stores.recordMemoryEvent(identity, hit.id, 'hit', now)
+      } catch {
+        /* scoring stats are advisory */
+      }
+      return outcome.hits
     }
-
   /**
    * The volatile `memory.scoring` overrides, unwrapped at every read (nested
    * schemastery references wrap each level — see volatile.ts's measured

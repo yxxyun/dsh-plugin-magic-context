@@ -16,7 +16,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { AdapterStores } from '../core/stores.ts'
 import type { Journal } from '../core/journal.ts'
-import { decidePass, pressurePercent, pressureWindowTokens, type PressurePolicy } from '../core/policy.ts'
+import { decidePass, pressurePercent, pressureWindowTokens, withTokenThreshold, type PressurePolicy } from '../core/policy.ts'
 import { PROFILE_M0_BUDGET_TOKENS, resolveIdentitySpec } from '../core/memory-bridge.ts'
 import type { MemoryFact } from '../core/memory-categories.ts'
 import { errText } from '../core/types.ts'
@@ -267,11 +267,16 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
       const latest = stores.latestUsage(sessionId)
       const context = requestContextOf(payload.agent.session)
       // Live thresholds: a settings-form edit reaches this pass immediately.
-      const policy = activePolicy()
+      const configured = activePolicy()
       // A route that discloses no window is scheduled against the assumed one:
       // an undefined denominator defers 'no-window' on every step, so the
       // execute band — and every drop waiting behind it — would never open.
-      const pressureWindow = pressureWindowTokens(context.contextWindow, policy)
+      const pressureWindow = pressureWindowTokens(context.contextWindow, configured)
+      // MC `execute_threshold_tokens` (CONFIGURATION.md:296): when the knob is
+      // set the band is expressed in the unit the decision is actually about —
+      // on a 1M-token route "30%" means "compact at 300k" and the session then
+      // lives inside the band forever.
+      const policy = withTokenThreshold(configured, pressureWindow)
       const pressure = pressurePercent(latest, pressureWindow)
       const pass = decidePass({
         latest,
@@ -548,10 +553,11 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
           decision: 'execute',
           ...basePassData,
           landed: outcome.landedDrops,
+          ...outcome.retiredDrops.length === 0 ? {} : { retired: outcome.retiredDrops },
           published: outcome.published,
           forceDropped: outcome.forceDropped,
           baseline: outcome.baselineUpdated ? 'refreshed' : 'unchanged',
-          historianStarted: outcome.historianStarted,
+          historianRequested: outcome.historianRequested,
           // Net reclaim proof: surface estimate before/after this pass.
           tokensBefore: outcome.tokensBefore,
           tokensAfter: outcome.tokensAfter,

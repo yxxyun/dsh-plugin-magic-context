@@ -8,6 +8,30 @@
 的上下文管理与记忆能力移植到 DSH 的插件 / surface 体系上。代码出处、被 vendored 的第三方文件与
 钉住的上游 revision 见 [NOTICE](NOTICE)；上游自身的变更历史请见上游仓库。
 
+## [Unreleased]
+
+**缓存前缀不再被一次空转的 execute 重写；historian 信封解析补齐上游语义。** 两件都不是新特性，
+是把上游写进文件头和 golden 里的既有约定补回来。
+
+### Fixed
+
+- **baseline 用冻结时钟渲染**：`refreshBaseline` 的 SOFT 路径取 `previous.frozenAt`，只有 HARD 才推进它。
+  此前 `renderBaseline({ now: Date.now() })` 让 `compartmentHeader` 的 `§Cn§ [… 12m ago]` 每分钟变一次、
+  `selectTier` 还会按墙钟换档，于是 `baselineBlockOf(target.text) === block` 这个「字节相同就不动」的保护
+  永远不成立——**每一次 execute pass 都重写挂在第一个 user 节点上的 baseline**，后面整段 prompt 全按未命中重算。
+  上游口径见 `crates/mc-module/src/m0_compose.rs:1-9`：「same inputs → same bytes … the expiry cutoff is
+  frozen at the HARD by the caller, never read here from a live clock」。回归用例
+  `tests/baseline-clock-freeze.spec.ts`（删掉那一行即两条全红）。
+- **实测代价**（2026-11-09 11:57 → 11-10 17:03，1726 步）：43 条 baseline 记录里 35 条是软刷新，而同一会话
+  只发布了 10 个 compartment；`published=[] 且 tokensDelta=0` 的 8 连发 execute 各烧掉 27–30 万 token；
+  一次空转 pass 之后的下一步 `cacheRead=32,768`、prompt=303k（只有系统提示存活）。
+- **historian 信封解析对齐上游 8 例 golden（7 例逐字一致，1 例仅空白）**：切信封当晚有 4 个用例读错 ——
+  XML 实体不解码（`&lt;` 原样入库）、`<p1>` 正文里被引用的 `</p1>` 截断段落、正文里被引用的
+  `</compartment>` 砍断整块（顺带把 1 条事实虚增成 15 条）、乱序 compartment 取错锚点。四种都是静默错误：
+  不抛异常，只把摘要写坏。修法照上游语义 —— 实体只解一次、正文里的 close 只在最外层算、事件只认
+  `<events>` 的顶层子元素、多个 compartment 取 `start` 最小者；legacy 裸 `<NAMING>` 块也认。
+  `tests/historian-envelope.spec.ts` 新增 5 条用例钉住，删掉任一规则即红。
+
 ## [0.11.1] - 2026-11-07
 
 **设置卡片目录自检。** 修复卡片把有效路由钉误标为 `(not in catalog)`：移除或改名 provider

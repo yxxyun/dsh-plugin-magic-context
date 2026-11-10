@@ -150,7 +150,7 @@ describe('the historian output contract carries userObservations', () => {
     // The instruction is a constant and the prompt builder takes no arguments,
     // so the switch in pre-step CANNOT change these bytes. Collected here as a
     // fact about the contract rather than a property of a config value.
-    expect(HISTORIAN_INSTRUCTION).toContain('"userObservations"')
+    expect(HISTORIAN_INSTRUCTION).toContain('<user_observations>')
     expect(historianPromptText()).toBe(historianPromptText())
   })
 })

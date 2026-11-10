@@ -86,30 +86,49 @@ export function estimateTokens(text: string): number {
 }
 
 /**
- * Pick the detail tier for one compartment from its importance and age.
- * Adapter-side approximation of Magic Context's decay math (documented
- * divergence): four fixed age bands, promoted/demoted one step by importance.
+ * Pick the detail tier for one compartment from its importance and its
+ * POSITIONAL age (0 = newest), never its wall-clock age.
+ *
+ * Upstream: `crates/mc-core/src/decay.rs:61-62` — "the half-life-scaled age
+ * `z = a / H` … `a` is the 0-based age", i.e. the index in the chronological
+ * list — and `decay.rs:109 rendered_tier(compartment_index, importance,
+ * budget_pressure, anchor_overlap)`. Time never enters the render, which is
+ * what makes `same inputs → same bytes` true (`m0_compose.rs:1-9`).
+ *
+ * Adapter-side approximation of the decay curve (documented divergence): the
+ * same four bands, measured in compartments rather than minutes — the newest
+ * three keep full fidelity, then 3–7, 8–19, and everything older collapses to
+ * the p4 skeleton. Importance still nudges one step.
  */
-export function selectTier(importance: number, ageMs: number): CompartmentTier {
+export function selectTier(importance: number, positionalAge: number): CompartmentTier {
   const bands: readonly CompartmentTier[] = ['p1', 'p2', 'p3', 'p4']
-  const age = Math.max(0, ageMs)
-  let index = age < 10 * 60_000 ? 0 : age < 2 * 60 * 60_000 ? 1 : age < 24 * 60 * 60_000 ? 2 : 3
+  const age = Math.max(0, Math.floor(positionalAge))
+  let index = age < 3 ? 0 : age < 8 ? 1 : age < 20 ? 2 : 3
   if (importance >= 80) index -= 1
   else if (importance <= 20) index += 1
   return bands[Math.min(bands.length - 1, Math.max(0, index))] as CompartmentTier
 }
 
 /** The text of one compartment at its natural tier. */
-export function tierText(compartment: Compartment, now: number): { tier: CompartmentTier; text: string } {
-  const tier = selectTier(compartment.importance, now - compartment.createdAt)
+export function tierText(compartment: Compartment, positionalAge: number): { tier: CompartmentTier; text: string } {
+  const tier = selectTier(compartment.importance, positionalAge)
   return { tier, text: compartment.tiers[tier] }
 }
 
-/** The header line identifying a compartment in a rendered baseline. */
-export function compartmentHeader(compartment: Compartment, now: number): string {
-  const { tier } = tierText(compartment, now)
-  const minutes = Math.max(0, Math.round((now - compartment.createdAt) / 60_000))
-  return `§C${compartment.compartmentId}§ [${tier}, importance ${String(compartment.importance)}, ${String(minutes)}m ago]`
+/**
+ * The header line identifying a compartment in a rendered baseline.
+ *
+ * Deliberately carries NO relative time: a `12m ago` suffix re-renders a
+ * different byte every minute, the `block === block` guard in
+ * `refreshBaseline` then never matches, and every execute pass rewrites the
+ * cached prefix (measured 2026-11-10: 35 soft refreshes against 10 publishes,
+ * `cacheRead 32,768` on a 303k-token prompt). Chronology is the recency
+ * signal; `renderBaseline` already orders m[0] oldest-first and m[1]
+ * newest-first.
+ */
+export function compartmentHeader(compartment: Compartment, positionalAge: number): string {
+  const { tier } = tierText(compartment, positionalAge)
+  return `§C${compartment.compartmentId}§ [${tier}, importance ${String(compartment.importance)}]`
 }
 
 /**
@@ -119,15 +138,15 @@ export function compartmentHeader(compartment: Compartment, now: number): string
  */
 export function renderCompartment(
   compartment: Compartment,
-  now: number,
+  positionalAge: number,
   mostCompressedTier?: CompartmentTier,
 ): string {
-  const natural = tierText(compartment, now)
+  const natural = tierText(compartment, positionalAge)
   const order: readonly CompartmentTier[] = ['p1', 'p2', 'p3', 'p4']
   const forced = mostCompressedTier !== undefined
     && order.indexOf(mostCompressedTier) > order.indexOf(natural.tier)
   const tier = forced ? (mostCompressedTier as CompartmentTier) : natural.tier
-  const lines = [`${compartmentHeader(compartment, now)}`, compartment.tiers[tier]]
+  const lines = [`${compartmentHeader(compartment, positionalAge)}`, compartment.tiers[tier]]
   if (compartment.facts.length > 0) {
     lines.push(`facts: ${compartment.facts.map(fact =>
       fact.category.length === 0 ? fact.content : `[${fact.category}] ${fact.content}`).join(' | ')}`)
@@ -317,6 +336,12 @@ export function renderMemoryUpdates(
  *   never truncated (it is the part that must not be lost).
  */
 export function renderBaseline(input: {
+  /**
+   * VESTIGIAL — the renderer is clock-free by construction (it is what makes
+   * `same inputs → same bytes` true). Kept only so existing call sites and
+   * goldens keep their shape; nothing here reads it. Remove with the next
+   * breaking change.
+   */
   readonly now: number
   /** Compartments created at or before the last hard rebuild. */
   readonly baseline: readonly Compartment[]
@@ -391,17 +416,21 @@ export function renderBaseline(input: {
   }
   if (input.baseline.length > 0) {
     const ordered = [...input.baseline].sort((left, right) => left.createdAt - right.createdAt)
+    // Positional age counts compartments, not minutes: 0 is the newest row on
+    // the wire, which is the last delta row, not the last baseline row.
+    const newest = ordered.length + input.delta.length - 1
     const rendered: string[] = []
     let used = 0
-    for (const compartment of ordered) {
-      const full = renderCompartment(compartment, input.now)
+    for (const [index, compartment] of ordered.entries()) {
+      const age = newest - index
+      const full = renderCompartment(compartment, age)
       const fullCost = estimateTokens(full)
       if (used + fullCost <= input.budgetTokens) {
         rendered.push(full)
         used += fullCost
         continue
       }
-      const compressed = renderCompartment(compartment, input.now, 'p4')
+      const compressed = renderCompartment(compartment, age, 'p4')
       const compressedCost = estimateTokens(compressed)
       if (used + compressedCost <= input.budgetTokens) {
         rendered.push(compressed)
@@ -434,7 +463,7 @@ export function renderBaseline(input: {
     const ordered = [...input.delta].sort((left, right) => right.createdAt - left.createdAt)
     sections.push([
       '<compartment-delta>',
-      ...ordered.map(compartment => renderCompartment(compartment, input.now)),
+      ...ordered.map((compartment, index) => renderCompartment(compartment, index)),
       '</compartment-delta>',
     ].join('\n'))
   }
@@ -564,19 +593,473 @@ export function describeJsonImbalance(text: string): string {
  * on any contract violation — the run then fails closed (no compartment row,
  * no mutation) rather than storing a half-digest.
  */
+/**
+ * Re-escape a model's JSON without changing its meaning, for the two shapes
+ * that break strict `JSON.parse` in practice:
+ *
+ *  - a raw control character inside a string (models write multi-line digests
+ *    with real newlines/tabs instead of `\n`/`\t`);
+ *  - a backslash that starts no valid escape (a Windows path, or a literal `\`
+ *    in prose: `C:\temp`, `\§`).
+ *
+ * Nothing is invented and nothing is dropped except CR and other control
+ * characters below 0x20, which cannot appear in a JSON string anyway. A
+ * *truncated* object is NOT repaired here on purpose: a half-digest silently
+ * admitted would put a lie in the baseline, so it must keep failing loudly.
+ *
+ * Live example this exists for (2026-11-10 16:49:17): a 105k-token span
+ * chunked 3 ways came back `finishReason=stop` with 6,131 characters and
+ * `invalid JSON (position 1132, line 3 column 1116)` — a long single line, i.e.
+ * a string with raw newlines in it.
+ */
+export function repairHistorianJson(text: string): { text: string; notes: readonly string[] } {
+  const open = text.indexOf('{')
+  if (open === -1) return { text, notes: [] }
+  const validEscapes = '"\\/bfnrtu'
+  const notes = new Set<string>()
+  let out = ''
+  let inString = false
+  let escaped = false
+  for (let index = open; index < text.length; index += 1) {
+    const char = text[index] as string
+    if (inString) {
+      if (escaped) {
+        if (!validEscapes.includes(char)) {
+          out += '\\'
+          notes.add('bad-escape')
+        }
+        out += char
+        escaped = false
+        continue
+      }
+      if (char === '\\') {
+        out += char
+        escaped = true
+        continue
+      }
+      if (char === '"') {
+        out += char
+        inString = false
+        continue
+      }
+      if (char === '\n') {
+        out += '\\n'
+        notes.add('raw-newline')
+        continue
+      }
+      if (char === '\t') {
+        out += '\\t'
+        notes.add('raw-tab')
+        continue
+      }
+      if (char === '\r') {
+        notes.add('raw-cr')
+        continue
+      }
+      if (char < ' ') {
+        out += ' '
+        notes.add('control-char')
+        continue
+      }
+      out += char
+      continue
+    }
+    if (char === '"') inString = true
+    out += char
+  }
+  return { text: out, notes: [...notes] }
+}
+
+/** The five fact categories the historian may emit (MC's FACT_CATEGORIES). */
+const FACT_CATEGORIES = ['PROJECT_RULES', 'ARCHITECTURE', 'CONSTRAINTS', 'CONFIG_VALUES', 'NAMING'] as const
+
+/** One scanned tag: its name, its attributes, and the text between the tags. */
+interface TagBlock {
+  readonly name: string
+  readonly attrs: Readonly<Record<string, string>>
+  readonly inner: string
+}
+
+/**
+ * Split a leading tag into its name and attributes, tolerating a raw `>` inside
+ * a quoted attribute value (golden case 3: "raw `>` inside a quoted attribute
+ * value keeps the compartment").
+ */
+function splitTag(raw: string): { name: string; attrs: Record<string, string>; selfClosed: boolean } | undefined {
+  const inner = raw.slice(1, raw.endsWith('/') ? -1 : undefined).trim()
+  const match = inner.match(/^([A-Za-z_][\w.-]*)([\s\S]*)$/)
+  if (match === null) return undefined
+  const name = match[1] as string
+  const attrs: Record<string, string> = {}
+  const rest = match[2] ?? ''
+  const attrPattern = /([A-Za-z_][\w.:-]*)\s*=\s*"([^"]*)"/g
+  let found: RegExpExecArray | null
+  while ((found = attrPattern.exec(rest)) !== null) attrs[found[1] as string] = found[2] as string
+  return { name, attrs, selfClosed: raw.trimEnd().endsWith('/>') }
+}
+
+/** End index of the tag that opens at `start` (`>` outside a quoted value). */
+function tagEnd(text: string, start: number): number {
+  let quoted = false
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index]
+    if (char === '"') quoted = !quoted
+    else if (char === '>' && !quoted) return index
+  }
+  return -1
+}
+
+/**
+ * Every `<name …>…</name>` block, LENIENT about the close tag: a missing
+ * `</name>` runs to the next opening tag of the same name, or to the end of the
+ * text (golden case 0: "mismatched and missing tier closes stay lenient").
+ */
+export function scanTagBlocks(text: string, name: string): TagBlock[] {
+  const blocks: TagBlock[] = []
+  const opener = new RegExp(`<\\s*${name}(?=[\\s/>])`, 'gi')
+  let cursor = 0
+  for (;;) {
+    opener.lastIndex = cursor
+    const found = opener.exec(text)
+    if (found === null) return blocks
+    const openEnd = tagEnd(text, found.index)
+    if (openEnd === -1) return blocks
+    const split = splitTag(text.slice(found.index, openEnd + 1))
+    if (split === undefined) {
+      cursor = openEnd + 1
+      continue
+    }
+    const bodyStart = openEnd + 1
+    let bodyEnd = text.length
+    if (!split.selfClosed) {
+      const closer = new RegExp(`<\\s*/\\s*${name}\\s*>`, 'i')
+      const rest = text.slice(bodyStart)
+      const closeMatch = rest.match(closer)
+      const nextOpen = rest.slice(1).search(new RegExp(`<\\s*${name}(?=[\\s/>])`, 'i'))
+      if (closeMatch !== null && closeMatch.index !== undefined) bodyEnd = bodyStart + closeMatch.index
+      else if (nextOpen !== -1) bodyEnd = bodyStart + 1 + nextOpen
+    }
+    blocks.push({
+      name: split.name,
+      attrs: split.attrs,
+      inner: split.selfClosed ? '' : text.slice(bodyStart, bodyEnd),
+    })
+    cursor = bodyEnd + 1
+    if (cursor >= text.length) return blocks
+  }
+}
+
+/** Text content of one named child, or '' when the child is absent/self-closed. */
+function childText(block: TagBlock, child: string): string {
+  const inner = scanTagBlocks(block.inner, child)
+  return inner.length === 0 ? '' : decodeEntities(inner[0]!.inner.trim())
+}
+
+/**
+ * XML entities, decoded exactly ONCE (golden case 2: "xml entities decode
+ * exactly once"). Order matters — `&amp;` last, so `&amp;lt;` becomes `&lt;`
+ * and not `<`: a digest that talks about `&lt;` in code must not turn into a
+ * real tag two layers down.
+ */
+export function decodeEntities(text: string): string {
+  return text
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&')
+}
+
+/** Bullets and blank lines stripped — the facts lane is line-of-text per row. */
+function linesOf(raw: string): string[] {
+  return raw
+    .split('\n')
+    .map(line => line.replace(/^\s*[*\-•]\s*/, '').trim())
+    .filter(line => line.length > 0)
+    .map(decodeEntities)
+}
+
+/** True when the text is shaped like Magic Context's tag envelope. */
+export function hasHistorianEnvelope(text: string): boolean {
+  return /<\s*output[\s>]/i.test(text) || /<\s*compartment[\s/>]/i.test(text)
+}
+
+/**
+ * Parse Magic Context's TAG ENVELOPE into the draft this adapter stores.
+ *
+ * Upstream never asks its historian for JSON. `testdata/historian-parse-golden.json`
+ * (8 cases) is the contract:
+ *
+ * ```text
+ * <output>
+ * <compartments>
+ * <compartment start="1" end="2" title="Setup" episode_type="infra" importance="40">
+ * <p1>did setup</p1><p2>…</p2><p3>…</p3><p4/>
+ * </compartment>
+ * </compartments>
+ * <facts><PROJECT_RULES>* Keep goldens deterministic.</PROJECT_RULES></facts>
+ * <events><causal_incident at_compartment="1"><summary>Setup broke.</summary></causal_incident></events>
+ * <meta><unprocessed_from>3</unprocessed_from></meta>
+ * </output>
+ * ```
+ *
+ * Why this exists at all: a 6k-character JSON object is one unescaped quote away
+ * from being unparseable as a whole, and the live failure on 2026-11-10
+ * (`invalid JSON (position 1132, line 3 column 1116)`, 105k-token span) threw
+ * away a digest the model HAD produced. Field boundaries made of tags survive a
+ * missing close tag; boundaries made of commas do not.
+ *
+ * Only the first `<compartment>` is used: one call produces one compartment in
+ * this adapter (chunking is ours, not the model's).
+ */
+/**
+ * Where a compartment body really ends.
+ *
+ * Upstream treats a close tag as markup only at depth 0 — a paragraph that
+ * writes `</compartment>` while a `<p1>` is still open is TEXT (golden case 5).
+ * Without depth tracking the first quoted `</compartment>` amputates the block,
+ * and the rest of the block then leaks into the facts/events scan as a second
+ * body — which is exactly how one event turns into two.
+ */
+function compartmentCloseAt(text: string, from: number): number {
+  const re = /<\s*(\/?)\s*(p[1-4]|compartment)(?=[\s/>])/gi
+  re.lastIndex = from
+  let inTier: string | null = null
+  let match: RegExpExecArray | null
+  while ((match = re.exec(text)) !== null) {
+    const closing = match[1] === '/'
+    const name = (match[2] ?? '').toLowerCase()
+    if (name === 'compartment') {
+      // A close only counts when no paragraph is open; inside one it is the
+      // text the paragraph is quoting (golden case 5).
+      if (closing && inTier === null) return match.index
+      continue
+    }
+    if (closing) {
+      // Any tier close ends the open paragraph, even a mismatched one
+      // (golden case 1: `<p1>first</p2>`).
+      inTier = null
+      continue
+    }
+    // Tiers are siblings: a second opener while one is open is quoted text,
+    // not nesting (golden case 4: `Discussed <p2> tags vs <pre>`).
+    // A self-closed tier (`<p4/>`) never opens a paragraph.
+    if (inTier === null && text[match.index + match[0].length] !== '/') inTier = name
+  }
+  return text.length
+}
+
+/** Every compartment block, with bodies cut by {@link compartmentCloseAt}. */
+function scanCompartments(text: string): TagBlock[] {
+  const blocks: TagBlock[] = []
+  const opener = /<\s*compartment(?=[\s/>])/gi
+  let match: RegExpExecArray | null
+  while ((match = opener.exec(text)) !== null) {
+    const start = match.index
+    const head = tagEnd(text, start)
+    if (head === -1) break
+    const split = splitTag(text.slice(start, head + 1))
+    const bodyStart = head + 1
+    if (split === undefined) {
+      // Unterminated tag: nothing further can be read reliably.
+      break
+    }
+    if (split.selfClosed) {
+      blocks.push({ name: 'compartment', attrs: split.attrs, inner: '' })
+      opener.lastIndex = bodyStart
+      continue
+    }
+    const bodyEnd = compartmentCloseAt(text, bodyStart)
+    blocks.push({ name: 'compartment', attrs: split.attrs, inner: text.slice(bodyStart, bodyEnd) })
+    const afterClose = text.indexOf('>', bodyEnd)
+    opener.lastIndex = afterClose === -1 ? text.length : afterClose + 1
+  }
+  return blocks
+}
+
+/**
+ * The compartment to read out of an envelope.
+ *
+ * This adapter asks for one compartment per call, so when several arrive the
+ * choice only has to be defensible: the one with the smallest `start` anchor
+ * (golden case 7 — compartments are allowed to arrive out of order).
+ */
+function pickCompartment(text: string): TagBlock {
+  const blocks = scanCompartments(text)
+  if (blocks.length === 0) {
+    throw new HistorianOutputError('no <compartment> block found in the response')
+  }
+  let best = blocks[0] as TagBlock
+  let bestStart = Number(best.attrs.start)
+  for (const block of blocks.slice(1)) {
+    const start = Number(block.attrs.start)
+    if (Number.isFinite(start) && (!Number.isFinite(bestStart) || start < bestStart)) {
+      best = block
+      bestStart = start
+    }
+  }
+  return best
+}
+
+export function parseHistorianEnvelope(text: string): CompartmentDraft {
+  const first = pickCompartment(text)
+  const body = first.inner
+  const tidy = (raw: string): string => decodeEntities(raw).replace(/\s+/g, ' ').trim()
+  /**
+   * One tier body. The rule that reconciles every shape in the golden file is
+   * "ask what the FIRST close tag of any tier is":
+   *
+   *  - it closes this tier: the paragraph owns everything up to the LAST close
+   *    of this tier, because a quoted `</p1>` and the real close look identical
+   *    (golden case 4) and greedy beats position;
+   *  - it closes a sibling: the body stops at whichever comes first, a sibling
+   *    opener (`<p1>first<p2>second`) or that mismatched close (golden case 1).
+   */
+  const tierOf = (name: string): string => {
+    // A self-closed `<p3/>` inside another paragraph is a MENTION, not this
+    // tier's opening (golden case 4 writes one inside p2).
+    let opener: RegExpExecArray | null = null
+    const openAll = new RegExp(`<\\s*${name}(?=[\\s/>])[^>]*>`, 'gi')
+    for (let hit = openAll.exec(body); hit !== null; hit = openAll.exec(body)) {
+      if (hit[0].endsWith('/>')) continue
+      opener = hit
+      break
+    }
+    const start = opener === null ? 0 : (opener.index + opener[0].length)
+    const rest = body.slice(start)
+    const firstClose = rest.match(/<\s*\/\s*(p[1-4])\s*>/i)
+    if (firstClose !== null && (firstClose[1] ?? '').toLowerCase() === name.toLowerCase()) {
+      const same = [...rest.matchAll(new RegExp(`<\\s*/\\s*${name}\\s*>`, 'gi'))].pop()
+      return tidy(rest.slice(0, same?.index ?? rest.length))
+    }
+    const nextOpen = rest.search(/<\s*p[1-4](?=[\s/>])/i)
+    const limit = Math.min(
+      nextOpen === -1 ? rest.length : nextOpen,
+      firstClose?.index ?? rest.length,
+    )
+    return tidy(rest.slice(0, limit))
+  }
+
+  const rawImportance = Number(first.attrs.importance)
+  const importance = Number.isFinite(rawImportance) && rawImportance > 0
+    ? Math.min(100, Math.max(0, Math.round(rawImportance)))
+    : 50
+  // Side channels live OUTSIDE the compartment body. A paragraph that QUOTES
+  // `<facts>` or `<user_observations>` (golden case 5) must not manufacture
+  // fifteen facts out of one sentence.
+  const sideText = first.inner.length === 0 ? text : text.split(first.inner).join('\n')
+  const factsBlock = scanTagBlocks(sideText, 'facts')[0]
+  const facts: Array<{ category: string; content: string }> = []
+  const pushFacts = (category: string, raw: string): void => {
+    // No blanket tag stripping here: a fact line may QUOTE a tag
+    // (`Real fact mentioning </compartment> as text.`, golden case 5) and
+    // stripping would silently eat the quote.
+    for (const line of linesOf(raw)) facts.push({ category, content: line })
+  }
+  if (factsBlock !== undefined) {
+    for (const name of FACT_CATEGORIES) {
+      for (const block of scanTagBlocks(factsBlock.inner, name)) {
+        pushFacts(name, block.inner.replace(new RegExp('<\\s*/?\\s*' + name + '\\s*>', 'gi'), ' '))
+      }
+    }
+    // A model that ignores the category rule and writes prose under <facts>
+    // still gets its lines kept — under the catch-all category, never dropped.
+    if (facts.length === 0) {
+      for (const line of linesOf(factsBlock.inner.replace(/<[^>]*>/g, ' '))) {
+        facts.push({ category: 'CONSTRAINTS', content: line })
+      }
+    }
+  } else {
+    // Legacy shape (golden case 6): bare category blocks outside <facts>.
+    for (const name of FACT_CATEGORIES) {
+      for (const block of scanTagBlocks(sideText, name)) pushFacts(name, block.inner)
+    }
+  }
+  const events: string[] = []
+  const eventsBlock = scanTagBlocks(sideText, 'events')[0]
+  if (eventsBlock !== undefined) {
+    // Every TOP-LEVEL element under <events> is one event slot; `<summary>`
+    // and `<evidence>` are its fields (golden case 5: a nested `<evidence>`
+    // must not become an event of its own).
+    const names: string[] = []
+    let depth = 0
+    for (const found of eventsBlock.inner.matchAll(/<\s*(\/?)\s*([A-Za-z_][\w-]*)(?=[\s/>])/g)) {
+      const closing = found[1] === '/'
+      const name = found[2] as string
+      if (closing) {
+        depth = Math.max(0, depth - 1)
+        continue
+      }
+      if (depth === 0 && name !== 'events') names.push(name)
+      const selfClosed = eventsBlock.inner[found.index + found[0].length] === '/'
+      if (!selfClosed) depth += 1
+    }
+    // Depth counting cannot tell a nested element from a close tag quoted
+    // inside a summary (`Real event about </p1> text`), so drop any candidate
+    // whose blocks live INSIDE another candidate's block.
+    const collected = new Map<string, TagBlock[]>()
+    for (const kind of new Set(names)) collected.set(kind, scanTagBlocks(eventsBlock.inner, kind))
+    const isNested = (kind: string): boolean =>
+      [...collected.entries()].some(([other, blocks]) =>
+        other !== kind && blocks.some(block => new RegExp('<\\s*' + kind + '(?=[\\s/>])').test(block.inner)))
+    for (const kind of collected.keys()) {
+      if (isNested(kind)) continue
+      for (const block of collected.get(kind) ?? []) {
+        const summary = childText(block, 'summary')
+        const text = summary.length > 0
+          ? summary.replace(/\s+/g, ' ')
+          : linesOf(block.inner.replace(/<[^>]*>/g, ' ')).join(' ')
+        if (text.length > 0) events.push(kind + ': ' + text)
+      }
+    }
+  }
+  const content = tierOf('p1') || tierOf('p2') || tierOf('p4')
+  // WP5 lane: statements about the PERSON, not the project. The prompt asks for
+  // them under `<user_observations>`, and `historian.ts` writes them to the
+  // candidate pool from `draft.userObservations` — if this block is ever dropped
+  // from the envelope, profile collection goes quiet with no error anywhere.
+  const observationsBlock = scanTagBlocks(sideText, 'user_observations')[0]
+  const userObservations = observationsBlock === undefined
+    ? []
+    : linesOf(observationsBlock.inner.replace(/<[^>]*>/g, ' '))
+  const draft = {
+    tiers: {
+      p1: tierOf('p1') || content,
+      p2: tierOf('p2') || content,
+      p3: tierOf('p3') || content,
+      p4: tierOf('p4') || content,
+    },
+    importance,
+    facts,
+    events,
+    ...userObservations.length === 0 ? {} : { userObservations },
+  }
+  if (draft.tiers.p1.length === 0) {
+    throw new HistorianOutputError('the <compartment> block carries no tier text')
+  }
+  return draft
+}
+
 export function parseHistorianOutput(text: string): CompartmentDraft {
+  // The envelope first when the response looks like one: upstream asks for that
+  // shape, and such a response has no JSON object at all — the JSON path would
+  // only report "no JSON object found" and lose a digest the model produced.
+  if (hasHistorianEnvelope(text)) return parseHistorianEnvelope(text)
   const open = text.indexOf('{')
   const close = text.lastIndexOf('}')
   if (open === -1 || close <= open) {
     throw new HistorianOutputError('no JSON object found in the response')
   }
+  const slice = text.slice(open, close + 1)
+  const repaired = repairHistorianJson(slice)
   let parsed: unknown
   try {
-    parsed = JSON.parse(text.slice(open, close + 1))
+    parsed = JSON.parse(repaired.text)
   } catch (error) {
-    const imbalance = describeJsonImbalance(text.slice(open, close + 1))
+    const imbalance = describeJsonImbalance(repaired.text)
+    const note = repaired.notes.length === 0 ? '' : `, repaired ${repaired.notes.join('+')}`
     throw new HistorianOutputError(
-      `invalid JSON (${errText(error)})${imbalance === '' ? '' : ` [${imbalance}]`}`,
+      `invalid JSON (${errText(error)})${imbalance === '' ? '' : ` [${imbalance}]`}${note}`,
     )
   }
   if (parsed === null || typeof parsed !== 'object') {

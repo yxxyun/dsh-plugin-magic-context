@@ -241,6 +241,19 @@ export interface AdapterStores {
   /** Pending (not yet landed) drop tag numbers, oldest first. */
   listPendingDrops(sessionId: string): number[]
   markDropLanded(sessionId: string, tagNumber: number, landedEventSeq: number): void
+  /**
+   * Retire a queued drop whose target no longer exists on the surface (the
+   * message was compacted into a compartment, or the tag row was pruned by
+   * retention). Until this existed such a row sat pending forever: every
+   * execute pass retried a tag that could never reappear, and the dashboard's
+   * "待落地回收" only ever grew.
+   *
+   * Stored as `landed_event_seq = -1` — the pending query is
+   * `landed_event_seq IS NULL`, so a retired row leaves the queue without a
+   * schema change, and `queueDrop`'s upsert still re-queues it if that tag
+   * ever comes back.
+   */
+  retireDrop(sessionId: string, tagNumber: number): void
   /** Store one validated historian digest for a covered span. */
   allocateCompartment(
     sessionId: string,
@@ -995,6 +1008,15 @@ export function openStores(dataDir: string): AdapterStores {
     db.prepare(
       'UPDATE pending_drops SET landed_event_seq = ? WHERE session_id = ? AND tag_number = ?',
     ).run(landedEventSeq, sessionId, tagNumber)
+  }
+
+  /** Sentinel for {@link retireDrop}: "left the queue without landing". */
+  const DROP_RETIRED = -1
+
+  const retireDrop = (sessionId: string, tagNumber: number): void => {
+    db.prepare(
+      'UPDATE pending_drops SET landed_event_seq = ? WHERE session_id = ? AND tag_number = ? AND landed_event_seq IS NULL',
+    ).run(DROP_RETIRED, sessionId, tagNumber)
   }
 
   interface CompartmentRow {
@@ -1765,6 +1787,7 @@ export function openStores(dataDir: string): AdapterStores {
     queueDrop,
     listPendingDrops,
     markDropLanded,
+    retireDrop,
     allocateCompartment,
     listCompartments,
     listUnlandedCompartments,

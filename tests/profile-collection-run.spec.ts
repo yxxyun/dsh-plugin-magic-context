@@ -213,9 +213,9 @@ describe('user-observation production toggle', () => {
       expect(compartment).toBeDefined()
       expect(llm.calls).toHaveLength(1)
       expect(llm.calls[0]!.text).toContain('<user_observation_extraction>disabled</user_observation_extraction>')
-      expect(llm.calls[0]!.text).toContain('return "userObservations": []')
-      // The JSON contract itself is untouched.
-      expect(llm.calls[0]!.text).toContain('"userObservations": ["..."]')
+      expect(llm.calls[0]!.text).toContain('leave <user_observations></user_observations> EMPTY')
+      // The envelope contract itself is untouched.
+      expect(llm.calls[0]!.text).toContain('<compartment importance="0">')
     })
   })
 

@@ -146,12 +146,26 @@ export interface ManagementPassInput {
 
 export interface ManagementPassResult {
   readonly landedDrops: readonly number[]
+  /**
+   * Queued drops retired because their target left the surface (compacted away
+   * or never mapped). They are NOT reclaim: the text was already folded into a
+   * compartment, so counting them as landed tokens would inflate the proof.
+   */
+  readonly retiredDrops: readonly number[]
   readonly published: readonly number[]
   readonly forceDropped: number
   /** Stranded tool/results swept off the wire this pass (the iron-rule repair). */
   readonly wireRepaired: number
   readonly baselineUpdated: boolean
-  readonly historianStarted: boolean
+  /**
+   * A historian run was REQUESTED this pass (fire-and-forget), not that one
+   * started: the promise is detached, so a crash between the request and the
+   * first chunk leaves this true and `historian` journal rows absent. Named
+   * `historianStarted` until 2026-11-10, which read as the stronger claim and
+   * made "5 requests / 0 runs" look like a bug in the wrong place. Reports
+   * accept both spellings.
+   */
+  readonly historianRequested: boolean
   /**
    * Net reclaim proof: the estimate of the whole current surface before and
    * after this pass. Without it a review can only show that reclaim ACTIONS
@@ -489,6 +503,11 @@ function refreshBaseline(
     ? [...(profile?.lines ?? []), ...(profile?.newLines ?? [])]
     : profile?.lines ?? []
   const profileDeltaLines = hard ? [] : profile?.newLines ?? []
+  // The renderer is clock-free by construction (`compartments.ts`: tiers and
+  // headers are positional, never wall-clock — upstream `m0_compose.rs:1-9`,
+  // "same inputs → same bytes … never read here from a live clock"), so this
+  // call is byte-stable on its own. `frozenAt` still matters: it is what
+  // `splitBaselineSets` freezes m[0] against, and a SOFT pass must not move it.
   const block = renderBaseline({
     now,
     baseline: sets.baseline,
@@ -628,15 +647,18 @@ function repairWirePairing(input: ManagementPassInput): number {
  */
 export function runManagementPass(input: ManagementPassInput): ManagementPassResult {
   const landedDrops: number[] = []
+  /** Queued drops whose target left the surface — retired, never landed. */
+  const retiredDrops: number[] = []
   let wireRepaired = 0
   const tokensBefore = surfaceTokens(input.session)
   const result: ManagementPassResult = {
     landedDrops,
+    retiredDrops: [],
     published: [],
     forceDropped: 0,
     wireRepaired: 0,
     baselineUpdated: false,
-    historianStarted: false,
+    historianRequested: false,
     tokensBefore,
     tokensAfter: tokensBefore,
     factsPromoted: 0,
@@ -654,7 +676,16 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
     const textBySeq = new Map(enumerateSurfaceNodes(input.session).map(node => [node.seq, node.text]))
     for (const tag of input.stores.listPendingDrops(input.sessionId)) {
       const node = toolNodes.find(candidate => candidate.tagNumber === tag)
-      if (node === undefined) continue
+      if (node === undefined) {
+        // Target gone. A queued drop can only land on a live tool result; the
+        // node is absent when its message was folded into a compartment (the
+        // surface carries `[compacted §Cn§]` instead) or when the call id no
+        // longer maps to a tag. Every pass retried it forever otherwise, and
+        // the dashboard's pending count could only grow.
+        input.stores.retireDrop(input.sessionId, tag)
+        retiredDrops.push(tag)
+        continue
+      }
       if (node.isPlaceholder) {
         input.stores.markDropLanded(input.sessionId, tag, node.seq)
         continue
@@ -662,6 +693,15 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
       const landedSeq = replaceToolResultContent(input.session, node.seq, dropPlaceholderContent(tag))
       input.stores.markDropLanded(input.sessionId, tag, landedSeq)
       landedDrops.push(tag)
+    }
+    if (retiredDrops.length > 0) {
+      input.journal?.info(
+        'drop-retired',
+        `retired ${String(retiredDrops.length)} drop(s) whose target left the surface: `
+          + retiredDrops.map(tag => `§${String(tag)}§`).join(', '),
+        { tags: retiredDrops, count: retiredDrops.length, reason: 'target-gone' },
+        input.sessionId,
+      )
     }
     if (landedDrops.length > 0) {
       input.journal?.info(
@@ -735,7 +775,7 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
     const baselineUpdated = refreshBaseline(input, afterPublish)
 
     // 5. Fire the historian out of band; it only writes a store row.
-    let historianStarted = false
+    let historianRequested = false
     if (input.historian !== undefined) {
       const deps: HistorianDeps = {
         stores: input.stores,
@@ -770,7 +810,7 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
           errorName: error instanceof Error ? error.name : typeof error,
         }, input.sessionId)
       })
-      historianStarted = true
+      historianRequested = true
     }
 
     input.logger.info(
@@ -782,11 +822,12 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
     )
     return {
       ...result,
+      retiredDrops,
       published,
       forceDropped,
       wireRepaired,
       baselineUpdated,
-      historianStarted,
+      historianRequested,
       tokensAfter: surfaceTokens(input.session),
       factsPromoted,
       factsSeenAgain,
@@ -807,6 +848,9 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
       pressure: input.pressure,
       trigger: input.pass.reason,
     }, input.sessionId)
-    return result
+    // The drops scanned before the fault are real: report what actually
+    // happened instead of the defaults, or a fail-open pass reads as "nothing
+    // landed, nothing retired" while the wire shows the opposite.
+    return { ...result, retiredDrops, landedDrops }
   }
 }

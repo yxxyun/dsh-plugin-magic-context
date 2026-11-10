@@ -1052,6 +1052,7 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
     memoryScoringEnabled: liveBoolean(config.memory?.scoring?.enabled, true),
     policy: {
       executeThreshold: policy.executeThreshold,
+      executeThresholdTokens: policy.executeThresholdTokens,
       forceThreshold: policy.forceThreshold,
       assumedContextWindow: policy.assumedContextWindow,
       ttlMs: policy.ttlMs,
@@ -1173,6 +1174,12 @@ export const Config = z.object({
   policy: z.object({
     /** Usage percent (0-100) at which the execute band opens. */
     executeThreshold: z.number().min(0).max(100).default(65).volatile(),
+    /**
+     * Absolute-tokens variant of `executeThreshold` (MC
+     * `execute_threshold_tokens`): > 0 overrides the percentage for the current
+     * window, clamped to 90% of it. 0 = disabled.
+     */
+    executeThresholdTokens: z.number().min(0).default(0).volatile(),
     /** Usage percent (0-100) at which reclaim becomes unconditional. */
     forceThreshold: z.number().min(0).max(100).default(85).volatile(),
     /**

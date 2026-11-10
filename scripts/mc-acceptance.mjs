@@ -138,7 +138,7 @@ if (dsh) {
   // 判据本体在 scripts/baseline-stability.mjs（纯函数，正负样本见 tests/baseline-stability.spec.ts）：
   // 2026-10-15 实证补了两类豁免——跨 hard/soft 不可比（两种 mode 组装不同 block），
   // 落地的 drop 是有意重写（闭区间，落地与 rebuild 常同秒）——并把画像段纳入同载荷比对。
-  const { pairs, violations } = findByteInstabilities({
+  const { pairs, violations, explained } = findByteInstabilities({
     baselines,
     recalls: recalls.map((r) => ({ sid: r.sid, at: r.at, newRows: Number(r.d.newRows) })),
     drops: dropLandings,
@@ -146,10 +146,14 @@ if (dsh) {
   const unstable = violations
     .map((v) => `${String(v.sessionId).slice(0, 8)} ${hhmmss(v.fromAt)}→${hhmmss(v.toAt)} ${v.fromBytes}≠${v.toBytes}`)
     .slice(0, 3);
+  // 把豁免拆开展示：全被 recall 豁免的窗口不是"绿"，而是"判据在这段时间里没有观测力"。
+  const breakdown = `${String(pairs)} 对相邻事件 = ${String(explained.mode)} 跨 mode + `
+    + `${String(explained.drop)} drop 落地 + ${String(explained.recall)} 新记忆增量 + `
+    + `${String(pairs - explained.mode - explained.drop - explained.recall)} 干净对`;
   add(violations.length === 0 ? 'PASS' : 'FAIL', 'delta.byteStable',
     violations.length === 0
-      ? `同 mode 同载荷（m[0] digest + 变更游标 + 分区计数 + 画像段一致，期间无新记忆、无 drop 落地）的 baseline 字节完全一致（检查 ${pairs} 对相邻事件）`
-      : `${violations.length} 处缓存前缀不稳定: ${unstable.join(' | ')}`);
+      ? `同 mode 同载荷（m[0] digest + 变更游标 + 分区计数 + 画像段一致，期间无新记忆、无 drop 落地）的 baseline 字节完全一致（${breakdown}）`
+      : `${violations.length} 处缓存前缀不稳定: ${unstable.join(' | ')}（${breakdown}）`);
 
   // ─────────────────────────────────────────────────────── 6. historian：start 必须有终止事件
   const hist = dsh.prepare(`SELECT id, at, session_id, data FROM journal WHERE kind='historian' AND at > ? ORDER BY id ASC`).all(SINCE)

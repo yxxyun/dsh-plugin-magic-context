@@ -722,7 +722,7 @@ function computeMetrics(rows) {
       totalLanded: 0,
       totalPublished: 0,
       forceDropped: 0,
-      historianStarted: 0,
+      historianRequested: 0,
       baselineSeen: {},
       // Net-reclaim proof (pass.data.tokensBefore/tokensAfter/tokensDelta).
       reclaimSamples: 0,
@@ -863,7 +863,10 @@ switch (row.kind) {
         }
         const fd = toNum(d.forceDropped)
         if (fd !== null) m.pass.forceDropped += fd
-        if (d.historianStarted === true) m.pass.historianStarted += 1
+        // `historianStarted` is the pre-2026-11-10 spelling of the same flag;
+        // older journals carry it, and the row has always meant "a run was
+        // REQUESTED", never "a run reached its first chunk".
+        if (d.historianRequested === true || d.historianStarted === true) m.pass.historianRequested += 1
         if (typeof d.baseline === 'string' || typeof d.baseline === 'number') bump(m.pass.baselineSeen, String(d.baseline))
         break
       }
@@ -1703,7 +1706,7 @@ function renderText(payload) {
       `    pass 记账   : usage input ${fmtInt(p.usage.input)} / cacheRead ${fmtInt(p.usage.cacheRead)}`
       + ` / cacheWrite ${fmtInt(p.usage.cacheWrite)}；landed ${fmtInt(p.totalLanded)} 项，`
       + `published ${fmtInt(p.totalPublished)} 项，forceDropped ${fmtInt(p.forceDropped)}，`
-      + `historianStarted ${fmtInt(p.historianStarted)} 次`,
+      + `historianRequested ${fmtInt(p.historianRequested)} 次`,
     )
     if (p.reclaimSamples > 0) {
       const average = Math.round(p.tokensDeltaTotal / p.reclaimSamples)

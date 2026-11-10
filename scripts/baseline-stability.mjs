@@ -11,7 +11,11 @@
  *     （management-pass.ts:630）。跨 mode 比字节等于比两种渲染，不是比"同载荷稳定"。
  *     2026-10-15 16:00:00→18:00:01（35231≠31410，reason=route-changed，载荷四段全等）
  *     就是这一形态 —— 它让 gate 红了一个窗口期。
- *  2. 期间有 `newRows>0` 的 memory-recall：载荷本身被新记忆改写。
+ *  2. 期间 memory-recall 的行数**真的变了**（增量，不是存量）：载荷比对含
+ *     `memories.digest` 与 `profile.digest`，记忆内容变了本就到不了违规分支；recall 能解释的
+ *     只有 m[1] 增量区的增长——它改变 block 总长（`bytes`）却不动任何冻结字段。判据是
+ *     recall 自己行数的**变化量**。2026-11-10 修正：旧规则用 `newRows > 0`（存量，长会话里恒
+ *     36），于是任何一对相邻 baseline 都能被"解释"，真实库跑出 43 条 / 39 对 / 0 违规的假绿。
  *  3. 期间有 `drop-landed`：落地 drop 是记录在案的、有意的前缀重写。窗口必须是
  *     **闭区间 [prev.at, b.at]** —— 落地与 HARD rebuild 常在同一秒（2026-10-15
  *     16:00:00 九条 drop 与 baseline 同秒），开区间会漏掉这条解释。
@@ -34,7 +38,9 @@ export function sameBaselinePayload(a, b) {
  * @param {{ baselines: readonly BaselineRow[], recalls?: readonly RecallRow[], drops?: readonly DropRow[] }} input
  *   `baselines` in time order; `recalls` carry the `newRows` count of a memory-recall
  *   row; `drops` are `drop-landed` journal rows (both session-scoped).
- * @returns {{ pairs: number, violations: readonly Violation[] }} pairs = 相邻对总数（判据覆盖面）
+ * @returns {{ pairs: number, violations: readonly Violation[], explained: { mode: number, recall: number, drop: number } }}
+ *   `pairs` = 相邻对总数（判据覆盖面）; `explained` = 每类豁免各解释了多少对。
+ *   三者的和小于 `pairs` 时，剩下的就是**载荷字节一致、mode 相同**的干净对。
  */
 export function findByteInstabilities(input) {
   const baselines = input.baselines ?? []
@@ -47,7 +53,48 @@ export function findByteInstabilities(input) {
     bySession.get(row.sid).push(row)
   }
 
+  // Recalls per session, in time order, so the exemption can be decided on the
+  // INCREMENT instead of on the stock.
+  const recallsBySession = new Map()
+  for (const recall of recalls) {
+    if (!recallsBySession.has(recall.sid)) recallsBySession.set(recall.sid, [])
+    recallsBySession.get(recall.sid).push(recall)
+  }
+  for (const list of recallsBySession.values()) list.sort((left, right) => left.at - right.at)
+
+  /**
+   * Does a memory-recall explain a byte change across (fromAt, toAt]?
+   *
+   * The old rule was `newRows > 0` for any recall inside the window, and it was
+   * a blind spot: `newRows` is a STOCK (how many memory rows the recall saw,
+   * ~36 in every long session), so in any long session there is always a recall
+   * with newRows > 0 between two adjacent baselines — every pair got exempted
+   * and the gate could never fire (43 baselines / 39 pairs / 0 violations on
+   * the live store, 2026-11-10).
+   *
+   * The payload comparison already rules out a memory change (it includes
+   * `memories.digest` and `profile.digest`), so the only thing a recall can
+   * legitimately explain is growth in the m[1] delta region, which changes the
+   * total block length without touching any frozen field. That shows up as a
+   * change in the recall's own row count — the increment, not the stock.
+   */
+  const recallExplains = (sid, fromAt, toAt) => {
+    const list = recallsBySession.get(sid) ?? []
+    let inside
+    let before
+    for (const recall of list) {
+      if (recall.at <= fromAt) before = recall
+      else if (recall.at <= toAt) inside = recall
+    }
+    if (inside === undefined || Number(inside.newRows) <= 0) return false
+    // First recall we ever see for this session: no stock to compare against,
+    // so a non-zero count is the best available evidence.
+    if (before === undefined) return true
+    return Number(inside.newRows) !== Number(before.newRows)
+  }
+
   const violations = []
+  const explained = { mode: 0, recall: 0, drop: 0 }
   let pairs = 0
   for (const [sid, list] of bySession) {
     let prev
@@ -55,16 +102,19 @@ export function findByteInstabilities(input) {
       if (prev !== undefined) {
         pairs += 1
         const sameMode = (prev.d?.mode ?? null) === (row.d?.mode ?? null)
-        const recalled = recalls.some(r => r.sid === sid && Number(r.newRows) > 0 && r.at > prev.at && r.at <= row.at)
+        const recalled = recallExplains(sid, prev.at, row.at)
         const landed = drops.some(d => d.sid === sid && d.at >= prev.at && d.at <= row.at)
         const fromBytes = Number(prev.d?.bytes)
         const toBytes = Number(row.d?.bytes)
-        if (sameMode && !recalled && !landed && sameBaselinePayload(prev.d, row.d) && fromBytes !== toBytes) {
+        if (!sameMode) explained.mode += 1
+        else if (landed) explained.drop += 1
+        else if (recalled) explained.recall += 1
+        else if (sameBaselinePayload(prev.d, row.d) && fromBytes !== toBytes) {
           violations.push({ sessionId: sid, fromAt: prev.at, toAt: row.at, fromBytes, toBytes, mode: row.d?.mode ?? null })
         }
       }
       prev = row
     }
   }
-  return { pairs, violations }
+  return { pairs, violations, explained }
 }

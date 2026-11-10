@@ -204,6 +204,11 @@ window.__ModuleLoader__.load({
         hint: 'Adoption percentage at which the execute band opens (0-100).',
       },
       {
+        path: ['policy', 'executeThresholdTokens'], kind: 'number', label: 'Execute threshold (tokens)',
+        hint: 'Absolute-token variant: when > 0 it overrides the percentage for the current window '
+          + '(clamped to 90%). Use it on large windows, where 30% of 1M means "compact at 300k". 0 = off.',
+      },
+      {
         path: ['policy', 'forceThreshold'], kind: 'number', label: 'Force threshold (%)',
         hint: 'Adoption percentage at which reclaim becomes unconditional (0-100).',
       },
@@ -212,8 +217,9 @@ window.__ModuleLoader__.load({
         hint: 'Window used for scheduling when the routed model discloses none.',
       },
       {
-        path: ['policy', 'ttlMs'], kind: 'number', label: 'Reclaim TTL (ms)',
-        hint: 'How long a reclaimed compartment stays reversible.',
+        path: ['policy', 'ttlMs'], kind: 'number', label: 'Idle execute band (ms)',
+        hint: 'Idle gap after which a pass may run. A permission, not a rebuild: a pass with nothing '
+          + 'to reclaim re-renders identical bytes. 0 = off.',
       },
       {
         path: ['policy', 'protectedToolResults'], kind: 'number', label: 'Protected tool results',

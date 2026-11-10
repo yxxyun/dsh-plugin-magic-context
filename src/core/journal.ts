@@ -31,6 +31,11 @@ export type JournalKind =
   | 'session-first-seen'
   | 'pass'
   | 'drop-landed'
+  /** A queued drop retired without landing: its target left the surface
+   *  (compacted into a compartment, or the call id no longer maps to a tag).
+   *  Kept separate from `drop-landed` because it reclaims no tokens — counting
+   *  it as a landing would inflate the reclaim proof (2026-11-10). */
+  | 'drop-retired'
   | 'compartment-published'
   | 'compartment-recomp'
   /** RETIRED 2026-10-16 (the publish guard is gone); kept so readers/reports

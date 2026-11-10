@@ -98,3 +98,70 @@ describe('findByteInstabilities', () => {
     expect(violations).toEqual([])
   })
 })
+
+/**
+ * 2026-11-10 修正的假绿：`recalled` 曾经判 `newRows > 0`，而 `newRows` 是**存量**
+ * （一次 recall 看见多少行记忆，长会话里恒 ~36）。于是任何一对相邻 baseline 之间都存在
+ * 一条 `newRows > 0` 的 recall → 每一对都被"解释"→ 真实库 43 条 baseline / 39 对 /
+ * 0 违规。判据改成看**增量**：载荷比对已含 `memories.digest`，记忆内容变了本就到不了
+ * 违规分支，recall 能解释的只有 m[1] 增量区的增长（改 block 总长、不动任何冻结字段）。
+ */
+describe('findByteInstabilities — recall 豁免看增量，不看存量', () => {
+  const recallRow = (at: number, newRows: number) => ({ sid: SID, at, newRows })
+
+  it('恒定的存量行数不再豁免（假绿的根因）', () => {
+    const { pairs, violations, explained } = run(
+      [baseline(1, T0, 30_000), baseline(2, T0 + HOUR, 29_500)],
+      [recallRow(T0 - 10 * HOUR, 36), recallRow(T0 + HOUR / 2, 36)],
+    )
+    expect(pairs).toBe(1)
+    expect(explained.recall).toBe(0)
+    expect(violations).toHaveLength(1)
+  })
+
+  it('行数真的涨了才豁免', () => {
+    const { violations, explained } = run(
+      [baseline(1, T0, 30_000), baseline(2, T0 + HOUR, 30_400)],
+      [recallRow(T0 - 10 * HOUR, 36), recallRow(T0 + HOUR / 2, 39)],
+    )
+    expect(explained.recall).toBe(1)
+    expect(violations).toHaveLength(0)
+  })
+
+  it('会话里第一次见到的 recall，只要非零就算证据', () => {
+    const { violations, explained } = run(
+      [baseline(1, T0, 30_000), baseline(2, T0 + HOUR, 30_400)],
+      [recallRow(T0 + HOUR / 2, 12)],
+    )
+    expect(explained.recall).toBe(1)
+    expect(violations).toHaveLength(0)
+  })
+
+  it('窗口外的 recall 不算（它解释不了这一段）', () => {
+    const { violations, explained } = run(
+      [baseline(1, T0, 30_000), baseline(2, T0 + HOUR, 29_500)],
+      [recallRow(T0 - 5 * HOUR, 30), recallRow(T0 - 2 * HOUR, 36)],
+    )
+    expect(explained.recall).toBe(0)
+    expect(violations).toHaveLength(1)
+  })
+
+  it('豁免拆账：三类计数之和不超过对数', () => {
+    const rows = [
+      baseline(1, T0, 30_000),
+      baseline(2, T0 + HOUR, 30_100, { mode: 'hard' }),
+      baseline(3, T0 + 2 * HOUR, 30_100),
+      baseline(4, T0 + 3 * HOUR, 30_100),
+    ]
+    const { pairs, violations, explained } = run(
+      rows,
+      [recallRow(T0 - 10 * HOUR, 36), recallRow(T0 + 2.5 * HOUR, 38)],
+      [{ sid: SID, at: T0 + 3 * HOUR }],
+    )
+    expect(pairs).toBe(3)
+    expect(explained.mode).toBe(2) // soft→hard 与 hard→soft
+    expect(explained.drop).toBe(1) // 同一秒落地的 drop
+    expect(explained.recall).toBe(0)
+    expect(violations).toHaveLength(0)
+  })
+})

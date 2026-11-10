@@ -28,7 +28,8 @@ const PHASE_BASE = [
   'tests/client-hover-tooltip.spec.ts',
   // An expired provider cache is not a rebuild reason (MC v0.49.44). Pins the
   // decision so the idle-clock branch cannot drift back in silently.
-  'tests/cache-ttl-no-rebuild.spec.ts',
+  'tests/idle-band.spec.ts',
+  'tests/historian-envelope.spec.ts',
   // The reclaim lane's accounting: `drop-landed` estimates from the text it
   // removed (the map used to be built after the replace and read the placeholder,
   // so every drop recorded 0 tokens), and the dashboard reports tags landed
@@ -138,6 +139,7 @@ const PHASE_D = [
   'tests/report-hits.spec.ts',
   'tests/historian-pairing.spec.ts',
   'tests/baseline-stability.spec.ts',
+  'tests/baseline-clock-freeze.spec.ts',
   'tests/report-dilution.spec.ts',
 ]
 

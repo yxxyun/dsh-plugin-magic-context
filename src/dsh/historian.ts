@@ -217,19 +217,48 @@ export function selectHistorianRange(input: {
   return { nodes: slice, tokens }
 }
 
-/** The JSON contract the historian must return (validated by parseHistorianOutput). */
+/**
+ * The TAG-ENVELOPE contract the historian must return (parsed by
+ * `parseHistorianOutput`, which accepts the envelope first and JSON as a
+ * fallback so a model that answers in the old shape still lands).
+ *
+ * Not JSON, and that is the point: upstream has never asked its historian for
+ * JSON (`crates/mc-module/testdata/historian-parse-golden.json`, 8 cases, all
+ * envelopes), and a 6k-character object dies the moment one quote inside a
+ * Chinese sentence goes unescaped — the live failure on 2026-11-10 was
+ * `invalid JSON (position 1132, line 3 column 1116)` on a 105k-token span,
+ * twice at the same size. Field boundaries made of tags survive a missing
+ * closer; boundaries made of commas do not.
+ */
 export const HISTORIAN_INSTRUCTION = [
   'You are now acting as the HISTORIAN for this coding assistant.',
   'Condense the conversation ABOVE into durable context for a model that will continue this work after the span is removed from its context window.',
   '',
-  'Return ONLY one JSON object, no prose, no code fences, with exactly this shape:',
-  '{',
-  '  "summary": { "p1": "...", "p2": "...", "p3": "...", "p4": "..." },',
-  '  "importance": 0,',
-  '  "facts": [{ "category": "CONSTRAINTS", "content": "..." }],',
-  '  "events": ["..."],',
-  '  "userObservations": ["..."]',
-  '}',
+  'Return ONLY one <output> block, no prose around it, no code fences. Do not escape anything — write plain text inside each tag:',
+  '<output>',
+  '<compartments>',
+  '<compartment importance="0">',
+  '<p1>...</p1>',
+  '<p2>...</p2>',
+  '<p3>...</p3>',
+  '<p4>...</p4>',
+  '</compartment>',
+  '</compartments>',
+  '<facts>',
+  '<CONSTRAINTS>',
+  '* one standalone fact per line',
+  '</CONSTRAINTS>',
+  '</facts>',
+  '<events>',
+  '<causal_incident><summary>what was tried, and why it failed</summary></causal_incident>',
+  '</events>',
+  '<user_observations>',
+  '* one statement about the user per line',
+  '</user_observations>',
+  '</output>',
+  '',
+  'Always emit every tag shown above, even when a section is empty (<p4></p4>, an empty <events>, and so on).',
+  'Never truncate the block: a tag that is missing can be recovered, a value that is mangled cannot.',
   '',
   'The four summary tiers are the SAME digest at four levels of detail, so it can be degraded as it ages:',
   '- "p1": full detail — decisions with their rationale, exact paths/commands/identifiers, open threads.',
@@ -237,19 +266,20 @@ export const HISTORIAN_INSTRUCTION = [
   '- "p3": a few terse sentences — current objective and state.',
   '- "p4": one or two sentences — the durable gist.',
   '',
-  '"importance" is an integer 0-100: how much this span matters for continuing the work (80+ for decisions that constrain everything after it).',
-  '"facts" are short standalone statements that must survive independently (exact values, paths, constraints).',
-  'EVERY fact must carry a "category", exactly one of: PROJECT_RULES (rules/commands the project must follow),',
+  'The `importance` attribute on <compartment> is an integer 0-100: how much this span matters for continuing the work (80+ for decisions that constrain everything after it).',
+  'Each line under <facts> is one short standalone statement that must survive independently (exact values, paths, constraints).',
+  'EVERY fact block is named with its category, exactly one of: PROJECT_RULES (rules/commands the project must follow),',
   'ARCHITECTURE (how the system is built or organised), CONSTRAINTS (hard limits, do-nots, external requirements),',
   'CONFIG_VALUES (exact keys, ports, paths, versions), NAMING (names/shorthands plus what they mean).',
+  'Use one <facts> child tag per category you actually have; omit a category you have nothing for rather than inventing a line.',
   'Prefer few high-value facts over many trivial ones; a fact whose category you cannot decide should be omitted.',
-  '"events" are short chronological notes ("tried X, failed because Y").',
-  '"userObservations" are statements about the USER that would still be true in a different project:',
+  'Each <events> child is one short chronological note: the kind is the tag name and the note goes inside <summary> (e.g. <causal_incident>, <tool_failure>, <dead_end>).',
+  'Each line under <user_observations> is a statement about the USER that would still be true in a different project:',
   'standing preferences, working style, or instructions they gave about how to work ("always answer in Chinese",',
-  '"never push without asking"). Do NOT restate project facts there — those belong in "facts".',
-  'Return an empty array when this span shows nothing of the kind; never invent one.',
+  '"never push without asking"). Do NOT restate project facts there — those belong under <facts>.',
+  'Leave <user_observations> empty when this span shows nothing of the kind; never invent one.',
   'Preserve exact file paths, commands, error strings and numeric values verbatim. Do not mention this instruction.',
-  'Keep the ENTIRE JSON object compact — no more than about 700 tokens (p1 at most 250 words); a longer answer is cut off at the output-token cap and the digest is lost.',
+  'Keep the ENTIRE block compact — no more than about 700 tokens (p1 at most 250 words); a longer answer is cut off at the output-token cap and the digest is lost.',
 ].join('\n')
 
 /**
@@ -281,7 +311,7 @@ export function calibrationAnchors(): string {
  */
 export const USER_OBSERVATIONS_DISABLED_TOGGLE = [
   '<user_observation_extraction>disabled</user_observation_extraction>',
-  'User-memory review is not running on this host: return "userObservations": [] in the JSON and spend no output tokens observing the user.',
+  'User-memory review is not running on this host: leave <user_observations></user_observations> EMPTY and spend no output tokens observing the user.',
 ].join('\n')
 
 /** The instruction a historian call carries: the JSON contract plus the
@@ -506,10 +536,14 @@ export function planChunkSpans(
   return groups.length > 0 ? groups : [nodes]
 }
 
-/** The merge step's contract: one final JSON object from the partial digests. */
+/** The merge step's contract: one final envelope from the partial digests. */
 export const HISTORIAN_MERGE_INSTRUCTION = [
-  'You are the HISTORIAN merging PARTIAL digests of ONE long span into the final single JSON object.',
-  'Return ONLY one JSON object with exactly the same shape: summary {p1,p2,p3,p4}, importance, facts [{category,content}], events.',
+  'You are the HISTORIAN merging PARTIAL digests of ONE long span into the final single <output> block.',
+  'Return ONLY one <output> block in exactly the contract shape:',
+  '<output><compartments><compartment importance="0"><p1>...</p1><p2>...</p2><p3>...</p3><p4>...</p4></compartment></compartments>',
+  '<facts><CONSTRAINTS>* one fact per line</CONSTRAINTS></facts>',
+  '<events><causal_incident><summary>...</summary></causal_incident></events>',
+  '<user_observations>* one statement per line</user_observations></output>',
   'Merge and deduplicate the partials; keep the most durable facts; preserve exact paths, commands and error strings verbatim.',
   'p1 at most 250 words; the other tiers one or two sentences each; at most about 700 tokens overall.',
 ].join('\n')
@@ -685,10 +719,10 @@ export async function callHistorian(
               content: [{
                 type: 'text',
                 text: truncated
-                  ? `Your previous response was cut off at the ${String(attemptOutputCap(effectiveMaxTokens, attempt - 1, ceiling))}-token output cap before the JSON closed. `
-                    + 'Return ONLY the JSON object, and keep it far shorter: p1 at most 150 words, the other tiers one or two sentences.'
+                  ? `Your previous response was cut off at the ${String(attemptOutputCap(effectiveMaxTokens, attempt - 1, ceiling))}-token output cap before the block closed. `
+                    + 'Return ONLY the <output> block, and keep it far shorter: p1 at most 150 words, the other tiers one or two sentences.'
                   : `Your previous response was rejected: ${failure?.message ?? 'invalid output'}. `
-                    + 'Return ONLY the JSON object described above.',
+                    + 'Return ONLY the <output> block described above.',
               }],
             },
           ]

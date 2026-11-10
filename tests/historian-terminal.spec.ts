@@ -658,7 +658,7 @@ describe('historian terminal events (real agent loop)', () => {
       const passRows = reader.listJournal({ kinds: ['pass'], sessionId: agent.session.id, limit: 20 })
         .filter(row => row.data?.decision === 'execute')
       expect(passRows.length).toBeGreaterThan(0)
-      expect(passRows.some(row => row.data?.historianStarted === true)).toBe(true)
+      expect(passRows.some(row => row.data?.historianRequested === true || row.data?.historianStarted === true)).toBe(true)
     } finally {
       reader.close()
       try {

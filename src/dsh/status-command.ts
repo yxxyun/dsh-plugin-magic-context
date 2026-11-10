@@ -98,10 +98,18 @@ export function registerCtxStatusCommand(ctx: Context, deps: StatusDeps): void {
           : `epoch ${String(baseline.epoch)}, node ${String(baseline.nodeSeq ?? '?')}, `
             + `frozen ${new Date(baseline.frozenAt).toISOString()}`
             + `${baseline.memoriesDigest === undefined ? '' : ', memories injected'}`}`,
-        `- policy: execute ≥ ${String(policy.executeThreshold)}%, force ≥ ${String(policy.forceThreshold)}%, `
-          // `ttl` is a diagnostic since v0.49.44, never a trigger: the label
-          // says so, otherwise the line reads like a second execute band.
-          + `ttl ${String(Math.round(policy.ttlMs / 1000))}s (diagnostic only), protect newest ${String(policy.protectedToolResults)} `
+        `- policy: execute ≥ ${String(policy.executeThreshold)}%, `
+          // The token variant OVERRIDES the percentage for the current window
+          // (MC `execute_threshold_tokens`); print whichever one is in force.
+          + (policy.executeThresholdTokens > 0
+            ? `execute-tokens ${String(policy.executeThresholdTokens)} tok (overrides the %), `
+            : '')
+          + `force ≥ ${String(policy.forceThreshold)}%, `
+          // `ttl` is the idle execute band (MC `ttl_execute_fired`): a
+          // permission, never a rebuild reason — a pass with nothing to reclaim
+          // re-renders byte-identical bytes. 0 = off.
+          + `idle band ${policy.ttlMs > 0 ? `${String(Math.round(policy.ttlMs / 1000))}s` : 'off'}, `
+          + `protect newest ${String(policy.protectedToolResults)} `
           + `(+${String(policy.historianProtectedNodes)} from the historian), `
           + `assumed window ${String(policy.assumedContextWindow)} tokens`,
         journalLine,

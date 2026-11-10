@@ -73,7 +73,7 @@ describe('a management pass that throws fails open AND journals why', () => {
     expect(result.published).toEqual([])
     expect(result.landedDrops).toEqual([])
     expect(result.baselineUpdated).toBe(false)
-    expect(result.historianStarted).toBe(false)
+    expect(result.historianRequested).toBe(false)
     expect(silentLogger.warnings.some(w => w.includes('management pass failed (continuing)'))).toBe(true)
 
     // Diagnosable: exactly one terminal journal row, with the why attached.
