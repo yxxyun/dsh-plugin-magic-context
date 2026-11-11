@@ -48,6 +48,19 @@ export function normalizedMemoryHash(content: string): string {
   return createHash('md5').update(normalizeMemoryContent(content), 'utf8').digest('hex')
 }
 
+/**
+ * Content identity for remembered verify SKIPS (`skip` = "cannot judge from the
+ * text alone"). Deliberately sha256 over the EXACT content rather than the dedup
+ * md5: a skip must expire the moment the text changes in any way (a `stale`
+ * rewrite, a human edit, a re-promotion), and the dedup key normalizes
+ * whitespace/case, which would let a cosmetic edit look like the same row. The
+ * digest is truncated to 32 hex chars — this is an equality token, not a
+ * security boundary.
+ */
+export function memoryContentHash(content: string): string {
+  return createHash('sha256').update(content, 'utf8').digest('hex').slice(0, 32)
+}
+
 export interface MemoryFact {
   readonly category: string
   readonly content: string
@@ -413,6 +426,23 @@ export interface MemoryWriter {
     entries: ReadonlyArray<{ readonly id: number; readonly importance: number }>,
     classifiedAt: number,
   ): number
+  /**
+   * Maintenance: remember that the verifier could NOT judge these rows
+   * (`skip`). Metadata only (`metadata_json.verify_skip = {hash, at}`) — the
+   * status stays `unverified`, because a skip is inconclusive, not a verdict.
+   *
+   * The row keeps its place in the unverified pool; {@link verifySkipHashes}
+   * lets the sweep step over it instead of asking the model the same question on
+   * every tick. Fail-soft like the other maintenance writes.
+   */
+  recordVerifySkip(input: {
+    readonly identity: string
+    readonly id: number
+    readonly contentHash: string
+    readonly at: number
+  }): void
+  /** Remembered skip hashes for the given rows (content-hash keyed). */
+  verifySkipHashes(identity: string, ids: readonly number[]): ReadonlyMap<number, string>
   close(): void
 }
 
@@ -672,6 +702,42 @@ function mergeArchiveMetadata(raw: string | null, reason: string): string {
 }
 
 /** Parse a `merged_from` JSON array of ids, tolerating NULL/malformed values. */
+/**
+ * Merge a remembered verify skip into `metadata_json` (`{verify_skip:{hash,at}}`),
+ * exactly like {@link mergeArchiveMetadata}: a malformed object is replaced by a
+ * fresh one rather than propagated. A skip is bookkeeping, so it must never
+ * break the row it annotates.
+ */
+function mergeVerifySkipMetadata(raw: string | null, contentHash: string, at: number): string {
+  let base: Record<string, unknown> = {}
+  if (raw !== null) {
+    try {
+      const parsed: unknown = JSON.parse(raw)
+      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        base = parsed as Record<string, unknown>
+      }
+    } catch {
+      // A malformed object is discarded, not propagated.
+    }
+  }
+  return JSON.stringify({ ...base, verify_skip: { hash: contentHash, at } })
+}
+
+/** The remembered skip hash in `metadata_json`, when one is well-formed. */
+function parseVerifySkipHash(raw: string | null): string | undefined {
+  if (raw === null) return undefined
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+    const skip = (parsed as { verify_skip?: unknown }).verify_skip
+    if (typeof skip !== 'object' || skip === null || Array.isArray(skip)) return undefined
+    const hash = (skip as { hash?: unknown }).hash
+    return typeof hash === 'string' && hash.length > 0 ? hash : undefined
+  } catch {
+    return undefined
+  }
+}
+
 function parseMergedFrom(raw: string | null): number[] {
   if (raw === null) return []
   try {
@@ -737,6 +803,8 @@ export function openMemoryWriter(options: MemoryWriterOptions): MemoryWriter {
       listExpired: () => [],
       markVerified: () => 0,
       classifyMemories: () => 0,
+      recordVerifySkip: () => undefined,
+      verifySkipHashes: () => new Map<number, string>(),
       recordRetrieval: () => noTelemetry,
       close: () => undefined,
     }
@@ -1647,6 +1715,42 @@ export function openMemoryWriter(options: MemoryWriterOptions): MemoryWriter {
           options.logger.warn(`magic-context memory: classifyMemories failed: ${errText(error)}`)
           return 0
         }
+      },
+      recordVerifySkip: ({ identity, id, contentHash, at }) => {
+        try {
+          if (corpusFenced) return
+          if (!Number.isInteger(id) || id <= 0 || contentHash.length === 0) return
+          runImmediate<{ ok: true }>(() => {
+            const row = db.prepare(
+              'SELECT metadata_json FROM memories WHERE project_path = ? AND id = ?',
+            ).get(identity, id) as { metadata_json?: string | null } | undefined
+            // Foreign/vanished row: nothing to annotate, and no error worth a log.
+            if (row === undefined) return { ok: true }
+            db.prepare('UPDATE memories SET metadata_json = ? WHERE project_path = ? AND id = ?')
+              .run(mergeVerifySkipMetadata(row.metadata_json ?? null, contentHash, at), identity, id)
+            return { ok: true }
+          })
+        } catch (error) {
+          options.logger.warn(`magic-context memory: recordVerifySkip failed: ${errText(error)}`)
+        }
+      },
+      verifySkipHashes: (identity, ids) => {
+        const remembered = new Map<number, string>()
+        if (ids.length === 0) return remembered
+        try {
+          const placeholders = ids.map(() => '?').join(',')
+          const rows = db.prepare(
+            `SELECT id, metadata_json FROM memories WHERE project_path = ? AND id IN (${placeholders})`,
+          ).all(identity, ...ids) as Array<{ id: number; metadata_json?: string | null }>
+          for (const row of rows) {
+            const hash = parseVerifySkipHash(row.metadata_json ?? null)
+            if (hash !== undefined) remembered.set(Number(row.id), hash)
+          }
+        } catch (error) {
+          // Fail-open: an unreadable annotation must not stop the sweep.
+          options.logger.warn(`magic-context memory: verifySkipHashes failed: ${errText(error)}`)
+        }
+        return remembered
       },
       close: () => db.close(),
     }

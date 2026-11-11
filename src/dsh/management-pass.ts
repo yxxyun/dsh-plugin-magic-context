@@ -61,6 +61,18 @@ export interface ManagementPassInput {
   readonly logger: ManagementPassLogger
   readonly pass: Extract<PassDecision, { kind: 'execute' }>
   readonly pressure: number | undefined
+  /**
+   * The reading behind `pressure` predates a change to the injected surface (a
+   * compartment was stored, or the baseline was refreshed). It is still the best
+   * size signal the decision has — the host reports nothing newer — but it must
+   * not drive a SECOND forced reclaim: the wire it measured no longer exists, so
+   * dropping again spends content the agent may still need.
+   *
+   * Upstream MC fixed the same class in v0.49.49 (`usagePredatesHistoryChange`);
+   * our version only guards the force band — the deadlock half of that fix does
+   * not apply, because the adapter never refuses to send.
+   */
+  readonly pressureStale?: boolean
   /** Route + window facts for the historian's auxiliary call. */
   readonly route?: { provider: string; model: string }
   readonly contextWindow?: number
@@ -733,7 +745,23 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
     // 3. Force-band reclaim (before publishing, so a compartment range that
     //    lost its content to a drop still replaces the same nodes).
     let forceDropped = 0
-    if (input.pressure !== undefined && input.pressure >= input.policy.forceThreshold) {
+    if (input.pressureStale === true && input.pressure !== undefined && input.pressure >= input.policy.forceThreshold) {
+      // The reading says "over the force band" but it was recorded before the
+      // surface changed: reclaiming again would drop against a prompt that no
+      // longer exists (upstream MC v0.49.49 half of issue 828). Reclaim is
+      // irreversible, so it waits for a reading that describes the current wire.
+      input.journal?.info(
+        'emergency-reclaim',
+        `force band: skipped — the ${input.pressure.toFixed(1)}% reading predates a surface change; no reclaim against a stale measurement`,
+        {
+          dropped: 0,
+          reason: 'stale-reading',
+          tier: 'skipped-stale-reading',
+          pressure: input.pressure,
+        },
+        input.sessionId,
+      )
+    } else if (input.pressure !== undefined && input.pressure >= input.policy.forceThreshold) {
       const generationBefore = input.session.surface.replaceGeneration
       // #731: pass the whole-surface estimate so the drop lane can refuse a
       // reclaim that cannot fit the request even at zero tool results.

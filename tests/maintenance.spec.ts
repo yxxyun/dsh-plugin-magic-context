@@ -541,3 +541,103 @@ describe('classifyMemories — metadata-only scoring slice', () => {
     }
   })
 })
+/**
+ * Two failures that used to be silent (2026-11-11, upstream adapter v0.11.2 /
+ * MC v0.49.50 audit):
+ *
+ *  - a `skip` verdict left no trace, so the same rows were re-asked on every
+ *    tick — with a pool of unverified rows that is a permanent loop that still
+ *    pays for an LLM call each time;
+ *  - an LLM stream that never settles hung the tick forever, which (before the
+ *    schedule moved onto its own timer) also stopped every later tick.
+ */
+describe('maintenance tick — remembered skips and the call budget', () => {
+  const hangingLlm = (): { stream(): AsyncIterable<unknown> } => ({
+    stream() {
+      // Never yields, never returns, never observes the abort — the seam the
+      // budget exists for.
+      return (async function* () {
+        await new Promise<never>(() => {})
+      })()
+    },
+  })
+
+  it('does not re-ask a remembered skip, and re-opens it when the content changes', async () => {
+    const path = createDb()
+    const unclear = seedRow(path, { category: 'NAMING', content: 'judgement call', verificationStatus: 'unverified' } as SeedRow)
+    const writer = openMemoryWriter({ dbPath: path, logger: silentLogger, now: () => T0 })
+    try {
+      const first = await runMaintenanceTick({
+        writer,
+        identity: OWN,
+        sessionId: 'mc-maintenance',
+        journal: fakeJournal(),
+        llm: fakeLlm(verdictReply([{ id: unclear, verdict: 'skip' }])) as never,
+        route: ROUTE,
+        now: () => T0,
+      })
+      expect(first).toMatchObject({ verifyRan: true, verified: 0 })
+      // The skip is banked as metadata; the status stays unverified (inconclusive).
+      expect(writer.verifySkipHashes(OWN, [unclear]).size).toBe(1)
+      expect(rowSnapshot(path, unclear).verificationStatus).toBe('unverified')
+
+      // Second tick: the remembered row is stepped over instead of re-asked.
+      const secondJournal = fakeJournal()
+      const second = await runMaintenanceTick({
+        writer,
+        identity: OWN,
+        sessionId: 'mc-maintenance',
+        journal: secondJournal,
+        llm: fakeLlm(verdictReply([{ id: unclear, verdict: 'verified' }])) as never,
+        route: ROUTE,
+        now: () => T0,
+      })
+      expect(second.verifyRan).toBe(false)
+      expect(secondJournal.entries.at(-1)?.summary).toContain('nothing to verify')
+      expect(secondJournal.entries.at(-1)?.data?.rememberedSkips).toBe(1)
+      expect(rowSnapshot(path, unclear).verifiedAt).toBeNull()
+
+      // An edit changes the content hash, so the row is eligible again.
+      writer.updateMemory({ identity: OWN, id: unclear, content: 'judgement call, revised' } as never)
+      const third = await runMaintenanceTick({
+        writer,
+        identity: OWN,
+        sessionId: 'mc-maintenance',
+        journal: fakeJournal(),
+        llm: fakeLlm(verdictReply([{ id: unclear, verdict: 'verified' }])) as never,
+        route: ROUTE,
+        now: () => T0 + 1,
+      })
+      expect(third).toMatchObject({ verifyRan: true, verified: 1 })
+    } finally {
+      writer.close()
+    }
+  })
+
+  it('fails the tick inside its budget when the stream never settles', async () => {
+    const path = createDb()
+    seedRow(path, { category: 'ARCHITECTURE', content: 'needs a verdict' } as SeedRow)
+    const writer = openMemoryWriter({ dbPath: path, logger: silentLogger, now: () => T0 })
+    const journal = fakeJournal()
+    try {
+      const startedAt = Date.now()
+      const outcome = await runMaintenanceTick({
+        writer,
+        identity: OWN,
+        sessionId: 'mc-maintenance',
+        journal,
+        llm: hangingLlm() as never,
+        route: ROUTE,
+        now: () => T0,
+        verifyTimeoutMs: 40,
+      })
+      // The budget, not the (infinite) stream, decides when the tick ends.
+      expect(Date.now() - startedAt).toBeLessThan(2_000)
+      expect(outcome).toMatchObject({ verifyRan: false, reason: 'llm-failed' })
+      const warn = journal.entries.find(entry => entry.level === 'warn')
+      expect(warn?.summary).toContain('deadline')
+    } finally {
+      writer.close()
+    }
+  })
+})

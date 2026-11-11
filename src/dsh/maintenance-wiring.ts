@@ -95,10 +95,12 @@ export function wireMaintenance(input: {
   let profileReviewLast: ProfileReviewOutcome | undefined
   let vectorBackfillLast: VectorBackfillOutcome | undefined
   let maintenanceBusy = false
+  let maintenanceBusySince: number | undefined
   const runMaintenance = async (): Promise<void> => {
     if (maintenanceBusy || isDisposed() || stores.closed || journal === undefined) return
     if (liveBoolean(config.maintenance?.enabled, true) === false) return
     maintenanceBusy = true
+    maintenanceBusySince = Date.now()
     try {
       // Process memory, once per tick (2026-10-15). Upstream MC 0.49.1 (#681)
       // leaked in exactly this shape — each completed pass kept the previous pass
@@ -239,6 +241,7 @@ export function wireMaintenance(input: {
       journal.error('maintenance', `maintenance tick failed: ${errText(error)}`)
     } finally {
       maintenanceBusy = false
+      maintenanceBusySince = undefined
     }
   }
   // One live ticker per adapter store, process-wide. A remount that arrives
@@ -258,15 +261,40 @@ export function wireMaintenance(input: {
     if (maintenanceTimer !== undefined) clearInterval(maintenanceTimer)
     clearTimeout(maintenanceFirst)
   }
+  // The schedule is installed by its OWN timer, not from the first tick `finally`
+  // (2026-11-11, upstream adapter v0.11.2). The old shape meant that one tick
+  // which never resolved also never installed the schedule, so TTL expiry,
+  // verification, profile review and the vector lane all stopped for the life of
+  // the process, silently (the panel only ever showed "never ran"). The tick LLM
+  // calls now carry wall-clock budgets (core/llm-deadline.ts), and the schedule
+  // itself no longer depends on any single tick returning. Cadence is unchanged:
+  // first tick at 60s, then one per `intervalMs`. A tick that still outlives its
+  // own interval is a bug, and is journaled below instead of hiding.
+  const intervalMs = Math.max(60_000, liveNumber(config.maintenance?.intervalMs, 1_800_000))
+  let stallWarned = false
+  const installInterval = (): void => {
+    if (stopped || maintenanceTimer !== undefined) return
+    maintenanceTimer = setInterval(() => {
+      if (maintenanceBusy) {
+        if (!stallWarned && maintenanceBusySince !== undefined && Date.now() - maintenanceBusySince > intervalMs) {
+          stallWarned = true
+          journal?.warn(
+            'maintenance',
+            `maintenance tick has been running for over ${String(Math.round((Date.now() - maintenanceBusySince) / 60_000))}m — later ticks hold off until it returns`,
+            { stalledMs: Date.now() - maintenanceBusySince },
+          )
+        }
+        return
+      }
+      stallWarned = false
+      void runMaintenance()
+    }, intervalMs)
+    ;(maintenanceTimer as unknown as { unref?: () => void }).unref?.()
+  }
   const maintenanceFirst = setTimeout(() => {
-    void runMaintenance().finally(() => {
-      if (stopped) return
-      maintenanceTimer = setInterval(
-        () => { void runMaintenance() },
-        Math.max(60_000, liveNumber(config.maintenance?.intervalMs, 1_800_000)),
-      )
-      ;(maintenanceTimer as unknown as { unref?: () => void }).unref?.()
-    })
+    // Install first: the schedule must survive a tick that never settles.
+    installInterval()
+    void runMaintenance()
   }, 60_000)
   ;(maintenanceFirst as unknown as { unref?: () => void }).unref?.()
   maintenanceTickers.set(stores.dbPath, stopTicker)

@@ -237,6 +237,21 @@ export interface AdapterStores {
   listUsage(sessionId: string): UsageRecord[]
   /** Newest usage row by seq, or undefined before the first response. */
   latestUsage(sessionId: string): UsageRecord | undefined
+  /**
+   * Newest timestamp at which something changed the INJECTED surface for this
+   * session — a compartment landing, or the m[0] baseline being refreshed.
+   *
+   * Used for one thing: a usage reading recorded before this instant describes a
+   * prompt that no longer exists. It is still the best size signal the pass
+   * decision has, but the force band must not reclaim against it (reclaim is
+   * irreversible, and it would drop against a larger wire). Upstream MC fixed
+   * the same class in v0.49.49 (`usagePredatesHistoryChange`).
+   *
+   * The drop lane is deliberately NOT included: a landed drop is the agent's own
+   * `ctx_reduce` mark, and treating it as a surface change here would exempt the
+   * pass that just landed it from ever reclaiming again.
+   */
+  latestHistoryChangeAt(sessionId: string): number | undefined
   queueDrop(sessionId: string, tagNumber: number, now: number): void
   /** Pending (not yet landed) drop tag numbers, oldest first. */
   listPendingDrops(sessionId: string): number[]
@@ -988,6 +1003,21 @@ export function openStores(dataDir: string): AdapterStores {
       cacheReadTokens: row.cache_read_tokens ?? undefined,
       cacheWriteTokens: row.cache_write_tokens ?? undefined,
       recordedAt: row.recorded_at,
+    }
+  }
+
+  const latestHistoryChangeAt = (sessionId: string): number | undefined => {
+    try {
+      const row = db.prepare(
+        'SELECT MAX(t) AS t FROM ('
+          + 'SELECT MAX(created_at) AS t FROM compartments WHERE session_id = ?'
+          + ' UNION ALL SELECT MAX(updated_at) AS t FROM baseline_state WHERE session_id = ?)',
+      ).get(sessionId, sessionId) as { t?: number | null } | undefined
+      const value = row?.t
+      return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+    } catch {
+      // A freshness probe must never fail the turn that asked for it.
+      return undefined
     }
   }
 
@@ -1784,6 +1814,7 @@ export function openStores(dataDir: string): AdapterStores {
     recordUsage,
     listUsage,
     latestUsage,
+    latestHistoryChangeAt,
     queueDrop,
     listPendingDrops,
     markDropLanded,
