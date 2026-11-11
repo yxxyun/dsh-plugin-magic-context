@@ -26,7 +26,7 @@ import type { Journal } from '../core/journal.ts'
 import type { PressurePolicy } from '../core/policy.ts'
 import type { AdapterStores } from '../core/stores.ts'
 import { errText } from '../core/types.ts'
-import { callHistorian, type HistorianLlm } from './historian.ts'
+import { callHistorian, historianInFlight, type HistorianLlm } from './historian.ts'
 import {
   pickManualSpan,
   writeManualCheckpoint,
@@ -172,6 +172,7 @@ export async function registerMagicCompactionEngine(
         runManagementPass({
           session,
           sessionId,
+          ...historianInFlight(sessionId) === undefined ? {} : { historianBusy: true },
           stores: deps.stores,
           policy: policyNow(),
           logger: deps.logger,

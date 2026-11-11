@@ -64,6 +64,12 @@ export interface ManagementPassInput {
   /** Route + window facts for the historian's auxiliary call. */
   readonly route?: { provider: string; model: string }
   readonly contextWindow?: number
+  /**
+   * A historian run is already in flight for this session. Nothing will publish
+   * on this pass, so the baseline refresh waits for the digest instead of paying
+   * for a second rewrite of the same prefix 20–30 s early.
+   */
+  readonly historianBusy?: boolean
   /** The historian's seam; omitted disables historian firing (tests, hosts). */
   readonly historian?: { readonly llm: HistorianLlm; readonly now?: () => number; readonly route?: { provider: string; model: string } }
   /** Validation-period activity journal (optional). */
@@ -769,33 +775,60 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
     }
 
     // 2 + 4: publish compartments, then refresh the baseline over the result.
+    //
+    // While a historian run is in flight, nothing publishes this pass, so the
+    // only pending change is memory churn (promoted rows, queued updates). Those
+    // used to be rendered immediately, which cost a second full-price rewrite
+    // 20–30 s before the digest landed and rewrote the same prefix again
+    // (measured 2026-11-11 12:08:58 + 12:09:26: 534 k tokens to reclaim 92 k).
+    // Deferring the refresh until something actually publishes folds both into
+    // one rewrite; the digest is bounded by `historianTimeoutMs`, so the
+    // deferral cannot outlive it.
     const nodes = enumerateSurfaceNodes(input.session)
     const { ids: published, factsPromoted, factsSeenAgain } = publishCompartments(input)
     const afterPublish = published.length === 0 ? nodes : enumerateSurfaceNodes(input.session)
-    const baselineUpdated = refreshBaseline(input, afterPublish)
+    const deferForHistorian = input.historianBusy === true && published.length === 0
+    const baselineUpdated = deferForHistorian ? false : refreshBaseline(input, afterPublish)
+    if (deferForHistorian) {
+      input.journal?.info(
+        'baseline',
+        'baseline refresh deferred: historian in flight, nothing published yet (one rewrite instead of two)',
+        { phase: 'deferred-historian-in-flight', pressure: input.pressure, trigger: input.pass.reason },
+        input.sessionId,
+      )
+    }
 
     // 5. Fire the historian out of band; it only writes a store row.
     //
-    // Admission: an IDLE pass opens the band as a permission to land queued
-    // work (drops, an already-stored compartment) — it is not an order to open
-    // a NEW digest. Measured on 2026-11-11: the idle band started digests at
-    // 18–23 % of a 1 M window, and publishing them rewrote 190–220 k of cached
-    // prefix to reclaim 55–79 k — one full-price step each, i.e. net negative.
-    // Below the force band a rewrite only pays for itself when the window is
-    // actually under pressure, so that is where routine digests start
-    // (upstream gates routine summarisation on the force band,
-    // `hasRunnableCompartmentWindow`; `idle_ttl_fired` is evidence the cache is
-    // gone, never a rebuild reason).
+    // Admission is about WHO PAYS for the rewrite, not about pressure alone.
+    // Publishing a compartment replaces the cached prefix, so the real cost of a
+    // routine digest is one full-price step (~200–350 k) whenever the provider's
+    // prompt cache is still alive. Measured 2026-11-11: every publish whose
+    // previous step was 1–16 s old was followed by 0–14 % reuse, while every
+    // publish preceded by 427–1703 s of idle was followed by 12–27 % — the cache
+    // was already gone, so that rewrite was free.
+    //
+    // So the two free/paid windows decide:
+    //   · idle band (`cache-ttl-idle`): it only fired because `ttlMs` elapsed,
+    //     i.e. the cache has already expired — this is the CHEAPEST moment to
+    //     rewrite, so a digest is exactly what should start here;
+    //   · an active pass: the cache is alive, so a routine digest waits for the
+    //     force band, where reclaiming is no longer optional.
+    // (An earlier revision of this gate blocked idle digests instead — it read
+    // the idle-gap cache loss as publish cost and pushed every digest into the
+    // paid window. Reverted by measurement, not by taste.)
     let historianRequested = false
     const idlePoke = input.pass.reason === 'cache-ttl-idle'
-    const belowForceBand = input.pressure !== undefined && input.pressure < input.policy.forceThreshold
-    if (input.historian !== undefined && idlePoke && belowForceBand) {
+    const activeBelowForce = !idlePoke
+      && input.pressure !== undefined
+      && input.pressure < input.policy.forceThreshold
+    if (input.historian !== undefined && activeBelowForce) {
       input.journal?.info(
         'historian',
-        `historian not started: idle pass at ${input.pressure?.toFixed(1) ?? '?'}% is below the `
-          + `${String(input.policy.forceThreshold)}% force band (landing queued work only)`,
+        `historian not started: active pass at ${input.pressure?.toFixed(1) ?? '?'}% is below the `
+          + `${String(input.policy.forceThreshold)}% force band (the cache is alive; waiting for a free window)`,
         {
-          phase: 'idle-below-force',
+          phase: 'active-below-force',
           pressure: input.pressure,
           forceThreshold: input.policy.forceThreshold,
           trigger: input.pass.reason,
@@ -803,6 +836,7 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
         input.sessionId,
       )
     } else if (input.historian !== undefined) {
+
       const deps: HistorianDeps = {
         stores: input.stores,
         policy: input.policy,

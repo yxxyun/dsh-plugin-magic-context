@@ -95,7 +95,7 @@ async function boot(options: {
       : { memory: { dbPath: options.memoryDbPath, project: options.project ?? 'git:demo' } },
     policy: {
       executeThreshold: 50,
-      forceThreshold: 90,
+      forceThreshold: 50, // digest admission: the force band gates routine runs (see management-pass step 5)
       protectedToolResults: 0,
       // Nothing protected, a one-token floor: the eligible span exists from the
       // second step on (a real budget would wait for 5k tokens).

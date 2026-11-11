@@ -608,7 +608,7 @@ describe('historian terminal events (real agent loop)', () => {
       historian: { provider: 'rejecting', model: 'rejecting' },
       policy: {
         executeThreshold: 50,
-        forceThreshold: 90,
+        forceThreshold: 50, // digest admission: the force band gates routine runs (see management-pass step 5)
         protectedToolResults: 0,
         historianProtectedNodes: 0,
         historianMinNodes: 2,

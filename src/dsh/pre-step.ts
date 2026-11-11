@@ -32,6 +32,7 @@ import {
   wireStrandedResults,
 } from './seams.ts'
 import { runManagementPass } from './management-pass.ts'
+import { historianInFlight } from './historian.ts'
 import { syncMachineDomain } from '../core/machine-domain.ts'
 import type { HistorianLlm } from './historian.ts'
 import {
@@ -472,6 +473,7 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
         const generationRoute = liveRoute(config.historian?.provider, config.historian?.model)
         const outcome = runManagementPass({
           session: payload.agent.session,
+          ...historianInFlight(sessionId) === undefined ? {} : { historianBusy: true },
           sessionId,
           stores,
           policy,
