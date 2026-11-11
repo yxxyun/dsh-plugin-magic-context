@@ -9,7 +9,7 @@ This document records the **effective-behavior contract** between the DSH adapte
 
 | Item | Value |
 |---|---|
-| Magic Context | **v0.49.30** (`v0.49.30-0-g47bcd71a2`, released 2026-10-29; the alignment core is unchanged since v0.46.0 — inject-compartments/storage-memory/workspaces/search/emergency-drop/agents all 0 commits) |
+| Magic Context | **v0.49.50** (`80a3504d9`, swept 2026-11-11; the alignment core is still unchanged — `crates/` has **zero** commits between v0.49.48 and v0.49.50 beyond Cargo.toml version bumps, so every entry below keeps its verdict). The tags since v0.46.0 moved only `packages/`: host adapters, dashboard, cli, CI |
 | MC store contract | shape inherited at the v95 cutover, **own lineage since 2026-10-13** (`src/core/memory-bridge.ts:45`; `MEMORY_SCHEMA_MAX_VERSION = 95`) |
 | DeepSeek Harness | **Desktop 0.2.1-rc.1** (host paths below are relative to the DSH checkout) |
 | Adapter | `dsh-plugin-magic-context` 0.9.0, own store **schema v10** (`src/core/stores.ts`) |
@@ -21,6 +21,26 @@ upgrade; this file says **where we differ**. Three verdicts are used below:
 - **host-imposed** — the DSH surface cannot express MC's mechanism; every entry
   cites the host file that constrains it;
 - **intentional** — decided and recorded; do not "fix" these on an upgrade.
+
+Sweep log: **2026-11-11, v0.49.48 → v0.49.50** (45 commits). Two host-side rules
+were checked against this adapter and neither needs a port:
+
+- **Force-band worth threshold (#886, `aa013de3b`).** Upstream now requires the
+  span it would summarise to be ≥ **2 % of the resolved usable window** before a
+  routine force-band historian run (`protected-tail-boundary.ts`,
+  `hasRunnableCompartmentWindow`), exempting manual wrapup/recomp, ≥95 % and
+  overflow recovery. This adapter is already **stricter**: `historianTriggerBudget`
+  wants `max(5k, min(50k, window × 5 %))` — 50k at a 1M window against upstream's
+  20k, 12.8k at 256k against 5.1k. Manual and region paths bypass it through
+  `forcedRange` (`src/dsh/historian.ts:987`), the same exemption set. One
+  deliberate difference: at ≥95 % pressure an automatic span below the 5 % floor
+  is still skipped here, and the overflow case is served by the drop lane (§A
+  emergency fit guard) rather than by an extra historian call.
+- **Cache lifetime from request breakpoints (v0.49.50).** `eeb2a6af9` and
+  `fdc878710` change `packages/plugin/scripts/analyze-cache-busts.ts` — the
+  diagnostic analyzer, not the band decision, so `ttlMs` semantics here are
+  untouched. The idea (derive the effective lifetime from what the request
+  declared instead of assuming 5 m) is recorded in §E.
 
 When a new upstream tag appears (re-clone cortexkit/magic-context as needed —
 `dsh-track` is retired, see `docs/dsh-plugin-upgrade-followup.md` §0), walk the
@@ -227,5 +247,9 @@ earlier "add promote-primers next" reading).
 - `project-drift` frequency — decides whether per-fact ownership or a DSH
   `session_projects` equivalent is worth building.
 - Physical TTL cleanup (rows archived, bytes still on disk) — awaits a ruling.
+- Cache lifetime is assumed (5 m default via `ttlMs`) rather than derived from the
+  request's declared breakpoints; upstream's analyzer derives it
+  (`analyze-cache-busts.ts`, v0.49.50). Report-accuracy item only — no band
+  behavior depends on it.
 - Storage-compat observations R3–R9 from the MC↔DSH audit (TTL asymmetry,
   owned-path equality, git-fault fallback, symlinked dirs, missing embeddings).
