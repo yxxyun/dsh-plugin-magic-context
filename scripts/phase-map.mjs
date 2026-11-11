@@ -29,6 +29,7 @@ const PHASE_BASE = [
   // An expired provider cache is not a rebuild reason (MC v0.49.44). Pins the
   // decision so the idle-clock branch cannot drift back in silently.
   'tests/idle-band.spec.ts',
+  'tests/historian-idle-admission.spec.ts',
   'tests/historian-envelope.spec.ts',
   // The reclaim lane's accounting: `drop-landed` estimates from the text it
   // removed (the map used to be built after the replace and read the placeholder,

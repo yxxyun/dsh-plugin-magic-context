@@ -775,8 +775,34 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
     const baselineUpdated = refreshBaseline(input, afterPublish)
 
     // 5. Fire the historian out of band; it only writes a store row.
+    //
+    // Admission: an IDLE pass opens the band as a permission to land queued
+    // work (drops, an already-stored compartment) — it is not an order to open
+    // a NEW digest. Measured on 2026-11-11: the idle band started digests at
+    // 18–23 % of a 1 M window, and publishing them rewrote 190–220 k of cached
+    // prefix to reclaim 55–79 k — one full-price step each, i.e. net negative.
+    // Below the force band a rewrite only pays for itself when the window is
+    // actually under pressure, so that is where routine digests start
+    // (upstream gates routine summarisation on the force band,
+    // `hasRunnableCompartmentWindow`; `idle_ttl_fired` is evidence the cache is
+    // gone, never a rebuild reason).
     let historianRequested = false
-    if (input.historian !== undefined) {
+    const idlePoke = input.pass.reason === 'cache-ttl-idle'
+    const belowForceBand = input.pressure !== undefined && input.pressure < input.policy.forceThreshold
+    if (input.historian !== undefined && idlePoke && belowForceBand) {
+      input.journal?.info(
+        'historian',
+        `historian not started: idle pass at ${input.pressure?.toFixed(1) ?? '?'}% is below the `
+          + `${String(input.policy.forceThreshold)}% force band (landing queued work only)`,
+        {
+          phase: 'idle-below-force',
+          pressure: input.pressure,
+          forceThreshold: input.policy.forceThreshold,
+          trigger: input.pass.reason,
+        },
+        input.sessionId,
+      )
+    } else if (input.historian !== undefined) {
       const deps: HistorianDeps = {
         stores: input.stores,
         policy: input.policy,
