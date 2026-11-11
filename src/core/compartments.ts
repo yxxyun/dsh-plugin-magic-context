@@ -118,17 +118,28 @@ export function tierText(compartment: Compartment, positionalAge: number): { tie
 /**
  * The header line identifying a compartment in a rendered baseline.
  *
- * Deliberately carries NO relative time: a `12m ago` suffix re-renders a
- * different byte every minute, the `block === block` guard in
- * `refreshBaseline` then never matches, and every execute pass rewrites the
- * cached prefix (measured 2026-11-10: 35 soft refreshes against 10 publishes,
- * `cacheRead 32,768` on a 303k-token prompt). Chronology is the recency
- * signal; `renderBaseline` already orders m[0] oldest-first and m[1]
- * newest-first.
+ * Carries NO relative time and NO tier. Both were cache bugs:
+ *
+ * - A `12m ago` suffix re-renders a different byte every minute, so the
+ *   `block === block` guard in `refreshBaseline` never matched and every
+ *   execute pass rewrote the cached prefix (measured 2026-11-10: 35 soft
+ *   refreshes against 10 published compartments, `cacheRead 32,768` on a
+ *   303k-token prompt).
+ * - A `[p2, importance 84]` tier tag re-renders whenever the compartment's
+ *   POSITIONAL age crosses a band boundary (3/8/20), which happens every time
+ *   a new compartment lands in m[1]. That kept the same guard from matching on
+ *   the common path: measured 2026-11-11, soft refreshes carried a p10 cache
+ *   fidelity of 24.0% — worse than a HARD fold — and 12.8M tokens of re-billed
+ *   input, 3× the HARD cost.
+ *
+ * Upstream keeps the heading tier-free for exactly this reason
+ * (`decay-render.ts:63` `compartmentHeading`: `## start-end · title`); the
+ * tier only ever picks WHICH BODY renders. Chronology is the recency signal:
+ * `renderBaseline` orders m[0] oldest-first and m[1] newest-first, so position
+ * is already legible without spelling out the tier.
  */
-export function compartmentHeader(compartment: Compartment, positionalAge: number): string {
-  const { tier } = tierText(compartment, positionalAge)
-  return `§C${compartment.compartmentId}§ [${tier}, importance ${String(compartment.importance)}]`
+export function compartmentHeader(compartment: Compartment): string {
+  return `§C${compartment.compartmentId}§`
 }
 
 /**
@@ -146,7 +157,7 @@ export function renderCompartment(
   const forced = mostCompressedTier !== undefined
     && order.indexOf(mostCompressedTier) > order.indexOf(natural.tier)
   const tier = forced ? (mostCompressedTier as CompartmentTier) : natural.tier
-  const lines = [`${compartmentHeader(compartment, positionalAge)}`, compartment.tiers[tier]]
+  const lines = [`${compartmentHeader(compartment)}`, compartment.tiers[tier]]
   if (compartment.facts.length > 0) {
     lines.push(`facts: ${compartment.facts.map(fact =>
       fact.category.length === 0 ? fact.content : `[${fact.category}] ${fact.content}`).join(' | ')}`)
@@ -416,9 +427,23 @@ export function renderBaseline(input: {
   }
   if (input.baseline.length > 0) {
     const ordered = [...input.baseline].sort((left, right) => left.createdAt - right.createdAt)
-    // Positional age counts compartments, not minutes: 0 is the newest row on
-    // the wire, which is the last delta row, not the last baseline row.
-    const newest = ordered.length + input.delta.length - 1
+    // Positional age is measured INSIDE m[0] only.
+    //
+    // It used to be `ordered.length + input.delta.length - 1`, so the newest
+    // wire row (the last delta row) scored age 0 and every m[0] row shifted one
+    // step older each time a compartment landed in m[1]. With tier deciding the
+    // rendered body, that re-rendered m[0] on the common path — the "SOFT pass
+    // must never re-tier" invariant upstream states at ARCHITECTURE.md:96.
+    // Measured 2026-11-11: soft refreshes had a p10 fidelity of 24.0% and cost
+    // 12.8M re-billed input tokens.
+    //
+    // m[1] rows do not participate in this loop at all (they render in their
+    // own `<compartment-delta>` section at P1, matching upstream
+    // `inject-compartments.ts:3050`), so counting them here only made m[0]'s
+    // bytes accelerate toward older tiers without buying any fidelity where it
+    // mattered. Decay within m[0] still ages correctly: the block is frozen at
+    // a HARD fold, and the rows ahead of it stay put.
+    const newest = ordered.length - 1
     const rendered: string[] = []
     let used = 0
     for (const [index, compartment] of ordered.entries()) {
@@ -461,9 +486,15 @@ export function renderBaseline(input: {
   }
   if (input.delta.length > 0) {
     const ordered = [...input.delta].sort((left, right) => right.createdAt - left.createdAt)
+    // m[1] rows always render at P1 (age 0), matching upstream
+    // `inject-compartments.ts:3050` `renderCompartmentAtTier(compartment, 1)`.
+    // They are the newest work by definition — the delta only holds rows that
+    // landed after the m[0] freeze — so decaying them by their position inside
+    // the delta would summarise the freshest history harder than the frozen
+    // baseline behind it.
     sections.push([
       '<compartment-delta>',
-      ...ordered.map((compartment, index) => renderCompartment(compartment, index)),
+      ...ordered.map(compartment => renderCompartment(compartment, 0)),
       '</compartment-delta>',
     ].join('\n'))
   }

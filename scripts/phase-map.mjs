@@ -22,6 +22,10 @@
 const PHASE_BASE = [
   'tests/phase-map.spec.ts',
   'tests/client-pure.spec.ts',
+  // The SOFT-refresh cache invariant: m[0] must not change a byte when
+  // compartments land in m[1], and the heading carries no tier/time. Baseline:
+  // it pins the upstream rule (ARCHITECTURE.md:96) the local renderer broke.
+  'tests/soft-refresh-invariant.spec.ts',
   // The dock pill's hover contract: portal out of the composer dock, a finite
   // bubble width, and one pointer handler family (the duplicate mouse pair made
   // the whole window flicker). Baseline: it pins shipped behaviour, not new work.
