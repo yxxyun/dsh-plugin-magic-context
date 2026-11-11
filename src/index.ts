@@ -238,7 +238,16 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
   // The bundle's presence in `dsh.profile.bundles` IS the consent: after
   // `dsh plugin add` the features must work with no profile hand-editing.
   // Read once, inside the lane, so a disabled adapter can never half-open.
-  const lane = openMemoryLane(ctx, config, stores)
+  // Union of the two opt-outs: the options-page scalar (`memoryEnabled`) and the
+  // patch-level `memory.enabled`. Off from either side closes the lane, and the
+  // lane is what both the bridge and `ctx_memory` hang off, so one false can
+  // never produce a half-open adapter.
+  const memoryDisabledByConfig =
+    config.memoryEnabled === false || config.memory?.enabled === false
+  const laneConfig = memoryDisabledByConfig
+    ? { ...config, memory: { ...(config.memory ?? {}), enabled: false } }
+    : config
+  const lane = openMemoryLane(ctx, laneConfig, stores)
   const { memoryRecall, memoryWriter, profileWriter, memorySearch, describeMemoryWrite } = lane
   const { memorySettings } = lane
 
@@ -1117,6 +1126,23 @@ export { policyOf } from './dsh/volatile.ts'
  * Memory stays opt-in by configuration; its thresholds are edited in the patch.
  */
 export const Config = z.object({
+  /**
+   * Options-page master switch for the memory lane (`ctx_memory`, the injected
+   * memory block, writer/promotion).
+   *
+   * A SCALAR on purpose: declaring the `memory` object would materialise it into
+   * every profile, and its mere presence opens the shared-store bridge. A
+   * boolean carries no such side effect.
+   *
+   * NON-volatile on purpose: the lane opens once at mount (`openMemoryLane`), so
+   * the switch must remount the fiber to take effect — a volatile commit would
+   * save and change nothing until a restart (the trap the compaction-engine
+   * switch hit, 2026-10-10).
+   *
+   * Either spelling opts out; the patch-level `memory.enabled:false` still wins
+   * for profiles configured before this switch existed.
+   */
+  memoryEnabled: z.boolean().default(true),
   historianEnabled: z.boolean().default(true).volatile(),
   registerCompactionEngine: z.boolean().default(false).volatile(),
   /** One notice entry in the session stream per action-bearing pass (see session-notice.ts). */
