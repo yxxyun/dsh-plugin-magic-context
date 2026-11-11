@@ -111,17 +111,23 @@ describe('executeThresholdTokens overrides the percentage for the window', () =>
 
   it('is clamped to 90% of the window (MAX_EXECUTE_THRESHOLD_PERCENTAGE)', () => {
     // 2M tokens on a 1M window is 200%; upstream clamps rather than trusting it.
-    // The clamp only bites when the configured percentage is looser than 90%,
-    // because the stricter of the two always wins.
     const loose: PressurePolicy = { ...DEFAULT_POLICY, executeThreshold: 95, executeThresholdTokens: 2_000_000 }
     expect(withTokenThreshold(loose, 1_000_000).executeThreshold).toBe(90)
   })
 
-  it('never raises the threshold above the configured percentage', () => {
-    // 700k of 1M = 70%, stricter than the configured 30%: the percentage wins,
-    // so a stale token value can never DELAY compaction past what the operator set.
-    const base: PressurePolicy = { ...DEFAULT_POLICY, executeThreshold: 30, executeThresholdTokens: 700_000 }
-    expect(withTokenThreshold(base, 1_000_000)).toBe(base)
+  it('raises the threshold too, so a large window can hold its band', () => {
+    // 450k of 1M = 45% against a configured 30%: this is the case the override
+    // exists for. Before 2026-11-11 the adapter returned the policy unchanged
+    // here ("the stricter of the two always wins"), which made the upstream
+    // escape hatch unusable on a 1M window — where 30% = 300k and a long
+    // session sits above it, so every second pass was an execute.
+    const base: PressurePolicy = { ...DEFAULT_POLICY, executeThreshold: 30, executeThresholdTokens: 450_000 }
+    expect(withTokenThreshold(base, 1_000_000).executeThreshold).toBeCloseTo(45, 5)
+  })
+
+  it('a token value that resolves to the configured percentage is a no-op', () => {
+    const same: PressurePolicy = { ...DEFAULT_POLICY, executeThreshold: 30, executeThresholdTokens: 300_000 }
+    expect(withTokenThreshold(same, 1_000_000)).toBe(same)
   })
 
   it('0 or an unknown window leaves the policy untouched', () => {

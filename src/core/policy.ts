@@ -206,19 +206,29 @@ export const MAX_EXECUTE_THRESHOLD_PERCENTAGE = 90
 /**
  * Resolve the effective execute threshold for one route's window.
  *
- * MC's `execute_threshold_tokens` (CONFIGURATION.md:296) overrides the
- * percentage per model, clamped to 90% of the window; this adapter takes a
- * single number instead of MC's per-model map (documented divergence: one
- * route per session is the common case here). A threshold that would land at
- * or above the configured percentage is not applied — the percentage stays the
- * stricter of the two, so a stale token value can never *delay* compaction
- * past what the percentage already allowed.
+ * MC's `execute_threshold_tokens` (CONFIGURATION.md:296, `scheduler.rs:483-508`)
+ * is an absolute per-model token count that OVERRIDES the percentage in both
+ * directions; the only guard is the 90%-of-window clamp. This adapter took a
+ * single number instead of MC's per-model map (documented divergence: one route
+ * per session is the common case here) but also refused to let it *raise* the
+ * threshold, so a stale token value could never delay compaction.
+ *
+ * That safety read was wrong for the case that needs the override most. On a
+ * 1 M window, `executeThreshold: 30` is 300 k and a long session lives above it,
+ * so every second pass is an execute: measured 2026-11-11, 21 execute passes in
+ * four hours at an average pressure of 30.6 %, each one able to publish a
+ * compartment that rewrites the whole cached prefix. The fix upstream ships for
+ * exactly this (`execute_threshold_tokens` per model) was unreachable here
+ * because 450 k of a 1 M window is 45 % ≥ 30 %, i.e. "not applied".
+ *
+ * So: override, both directions, clamped at 90 % — the same contract as
+ * upstream, and the operator keeps their percentages untouched.
  */
 export function withTokenThreshold(policy: PressurePolicy, windowTokens: number | undefined): PressurePolicy {
   const tokens = policy.executeThresholdTokens
   if (!(tokens > 0) || windowTokens === undefined || !(windowTokens > 0)) return policy
   const percent = Math.min(MAX_EXECUTE_THRESHOLD_PERCENTAGE, (tokens / windowTokens) * 100)
-  if (percent >= policy.executeThreshold) return policy
+  if (percent === policy.executeThreshold) return policy
   return { ...policy, executeThreshold: percent }
 }
 
