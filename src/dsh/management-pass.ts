@@ -469,8 +469,12 @@ function refreshBaseline(
         ? true
         : previous.profileM0Digest !== profile.digest
   )
-  const hard = previous === undefined || routeChanged || memoriesChanged || epochChanged || cursorUpgrade || profileChanged
-  // Freeze targets for a HARD fold. Falling back to the previous values keeps a
+  // The idle-TTL rebuild (policy.ttlRebuild): the band fired because `ttlMs`
+  // elapsed, i.e. the provider cache is already gone, so re-rendering here
+  // costs nothing that is not already lost and folds m[1] back into m[0] for
+  // the requests that follow. Off ⇒ the pass only lands queued work.
+  const ttlFold = input.policy.ttlRebuild === true && input.pass.reason === 'cache-ttl-idle'
+  const hard = ttlFold || previous === undefined || routeChanged || memoriesChanged || epochChanged || cursorUpgrade || profileChanged  // Freeze targets for a HARD fold. Falling back to the previous values keeps a
   // pass that has no mutation lane (bridge unavailable) from rewinding them.
   const frozenCursor = updates?.cursor ?? previous?.maxMemoryMutationId
   const frozenEpochFingerprint = updates?.projectEpochFingerprint ?? previous?.projectEpochFingerprint

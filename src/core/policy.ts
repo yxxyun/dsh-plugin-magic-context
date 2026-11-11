@@ -55,7 +55,20 @@ export interface PressurePolicy {
    * nothing either; raise it if a route's cache really does die fast.
    */
   readonly ttlMs: number
-  /** Newest tool-result tags the reclaim never touches (MC protected tail, count-based MVP). */
+  /**
+   * Idle expiry also REBUILDS the m[0] baseline (the pre-2026-11-10 shape),
+   * instead of only opening the band to land queued work.
+   *
+   * Recorded divergence from MC v0.49.44 (audited against upstream adapter
+   * v0.11.2, 2026-11-11): MC removed its TTL branch because a rebuild there
+   * discards signed thinking blocks and folds m[0] earlier than pressure asks.
+   * Neither cost exists in DSH — there is no signed-thinking prefix, no m[0]
+   * tier fold — and DSH has no manual flush command, so this branch is the
+   * adapter only "free bust" lever: the moment the provider cache is already
+   * gone is the cheapest moment to re-render, land drops and fold m[1].
+   * `false` restores the band-only shape (land queued work, mutate no bytes).
+   */
+  readonly ttlRebuild: boolean  /** Newest tool-result tags the reclaim never touches (MC protected tail, count-based MVP). */
   readonly protectedToolResults: number
   /** Newest surface nodes the historian never digests (MC's protected tail). */
   readonly historianProtectedNodes: number
@@ -95,6 +108,7 @@ export const DEFAULT_POLICY: PressurePolicy = {
   forceThreshold: 85,
   assumedContextWindow: 256_000,
   ttlMs: 5 * 60_000,
+  ttlRebuild: true,
   protectedToolResults: 8,
   historianProtectedNodes: 8,
   historianMinNodes: 3,

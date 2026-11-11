@@ -1056,6 +1056,7 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
       forceThreshold: policy.forceThreshold,
       assumedContextWindow: policy.assumedContextWindow,
       ttlMs: policy.ttlMs,
+      ttlRebuild: policy.ttlRebuild,
       protectedToolResults: policy.protectedToolResults,
       historianProtectedNodes: policy.historianProtectedNodes,
       historianMinNodes: policy.historianMinNodes,
@@ -1189,7 +1190,12 @@ export const Config = z.object({
      */
     assumedContextWindow: z.number().min(1).default(256_000).volatile(),
     ttlMs: z.number().default(300_000).volatile(),
-    protectedToolResults: z.number().default(8).volatile(),
+    /**
+     * Idle expiry rebuilds m[0] (the pre-v0.49.44 shape), not just opens the
+     * band. On in DSH on purpose: the provider cache is already dead at that
+     * moment, and DSH has no manual flush command — see `PressurePolicy.ttlRebuild`.
+     */
+    ttlRebuild: z.boolean().default(true).volatile(),    protectedToolResults: z.number().default(8).volatile(),
     historianProtectedNodes: z.number().default(8).volatile(),
     historianMinNodes: z.number().default(3).volatile(),
     /** Wall-clock budget for one historian run; a spent budget journals `failed`.

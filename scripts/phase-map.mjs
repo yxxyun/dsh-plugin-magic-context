@@ -79,6 +79,7 @@ const PHASE_BASE = [
   'tests/poc.spec.ts',
   'tests/pressure-staleness.spec.ts',
   'tests/llm-deadline.spec.ts',
+  'tests/ttl-rebuild.spec.ts',
   'tests/probe.spec.ts',
   'tests/project-drift.spec.ts',
   'tests/publish-guard.spec.ts',
