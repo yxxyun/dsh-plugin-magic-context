@@ -259,7 +259,7 @@ window.__ModuleLoader__.load({
         hint: 'Token budget reserved for the m[0]/m[1] baseline.',
       },
       {
-        path: ['memoryEnabled'], kind: 'boolean', label: 'Memory lane enabled',
+        path: ['memoryEnabled'], kind: 'boolean', fallback: true, label: 'Memory lane enabled',
         hint: 'Master switch for the recall lane: ctx_memory, the injected memory block, and promotion. '
           + 'Saving remounts the adapter, so the change applies without a restart. A patch-level '
           + 'memory.enabled: false also forces it off.',
@@ -276,7 +276,7 @@ window.__ModuleLoader__.load({
         path: ['journal', 'retentionDays'], kind: 'number', label: 'Journal retention (days)',
         hint: 'How long journal rows are kept. Re-prunes once the value changes (minimum 1 day).',
       },
-      { path: ['historianEnabled'], kind: 'boolean', label: 'Historian enabled', hint: 'Run the out-of-band historian.' },
+      { path: ['historianEnabled'], kind: 'boolean', fallback: true, label: 'Historian enabled', hint: 'Run the out-of-band historian.' },
       {
         path: ['registerCompactionEngine'], kind: 'boolean', label: 'Register compaction engine',
         hint: 'Register the adapter as the compaction engine seam. Mounts or unmounts on the next agent step — disable the host compaction row first.',
@@ -593,7 +593,7 @@ window.__ModuleLoader__.load({
           const stored = hasPath(snapshot.user, spec.path)
           if (spec.kind === 'boolean') {
             const value = draft === undefined
-              ? asBool(sectionValue)
+              ? asBool(sectionValue === undefined ? spec.fallback : sectionValue)
               : (draft.clear ? asBool(baseValue) : draft.bool === true)
             return {
               value,
@@ -2380,6 +2380,26 @@ window.__ModuleLoader__.load({
         const scope = settingsCtx.configForms.get(CFG_NS)
         const Card = makeCard(scope, catalog)
         settingsCtx.effect(() => settingsCtx.configForms.whileServed([CFG_NS], () => {
+          // Three seats, one card, and the FIRST one is the point:
+          //
+          //  * `settings.section` — the plugin's own page in Settings, listed by
+          //    label beside 常规 / 模型 / 子智能体. This is how a third-party
+          //    plugin exposes its own settings surface (`billion-context`
+          //    registers exactly this pair: `settings.section` with id/order/
+          //    label, plus `plugins.bundle.config` keyed by package name).
+          //  * `plugins.bundle.config` — the same form on the installed bundle's
+          //    own page (the host matches it by `openPkg.name`, so the key is the
+          //    package name).
+          //
+          // Neither seat is the built-in plugin list: that list renders
+          // `plugins.row.config`, whose semantics are a loader row's page.
+          const offSection = ctx.slots.inject('settings.section', () => ctx.slots.register({
+            name: 'settings.section',
+            id: CFG_NS,
+            order: 100,
+            label: () => t('title'),
+            locale: LOCALE_NS,
+          }, Card))
           const offBundle = ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
             name: 'plugins.bundle.config',
             key: PKG_NAME,
@@ -2387,6 +2407,7 @@ window.__ModuleLoader__.load({
             locale: LOCALE_NS,
           }, Card))
           return () => {
+            offSection()
             offBundle()
           }
         }), 'magic-context: settings card')
