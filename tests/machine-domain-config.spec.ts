@@ -54,6 +54,30 @@ describe('machineDomainConfigOf', () => {
       .toBe(false)
   })
 
+  it('reads the declared scalar, which is what the settings form writes', () => {
+    expect(machineDomainConfigOf({ machineDomainEnabled: true })).toEqual({ enabled: true })
+    expect(machineDomainConfigOf({ machineDomainEnabled: false })).toEqual({ enabled: false })
+  })
+
+  it('lets the scalar win over the hand-written object spelling', () => {
+    expect(machineDomainConfigOf({
+      machineDomainEnabled: true,
+      memory: { global: { machine: { enabled: false } } },
+    })).toEqual({ enabled: true })
+    expect(machineDomainConfigOf({
+      machineDomainEnabled: false,
+      memory: { global: { machine: { enabled: true } } },
+    })).toEqual({ enabled: false })
+  })
+
+  it('falls through to the object spelling while the scalar is absent', () => {
+    // The schema declares the scalar WITHOUT a default, so an untouched profile
+    // keeps working through `memory.global.machine.enabled`.
+    expect(machineDomainConfigOf({
+      memory: { global: { machine: { enabled: true } } },
+    })).toEqual({ enabled: true })
+  })
+
   it('passes excludeProjects through only when it is an array', () => {
     expect(machineDomainConfigOf({
       memory: { global: { machine: { enabled: true, excludeProjects: ['a', 'b'] } } },

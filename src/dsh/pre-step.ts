@@ -18,6 +18,7 @@ import type { AdapterStores } from '../core/stores.ts'
 import type { Journal } from '../core/journal.ts'
 import { decidePass, pressurePercent, pressureWindowTokens, withTokenThreshold, type PressurePolicy } from '../core/policy.ts'
 import { machineDomainConfigOf } from './machine-domain-config.ts'
+import { memoryLaneEnabled } from './live-flags.ts'
 import { PROFILE_M0_BUDGET_TOKENS, resolveIdentitySpec } from '../core/memory-bridge.ts'
 import type { MemoryFact } from '../core/memory-categories.ts'
 import { errText } from '../core/types.ts'
@@ -354,7 +355,10 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
             now: Date.now(),
           })
         }
-        const memories = memoryRecall?.recall({
+        // The live switch (volatile, form-writable) gates USE; the mount
+        // switch already decided whether the lane exists at all.
+        const memoryLive = memoryLaneEnabled(config)
+        const memories = !memoryLive || memoryRecall === undefined ? undefined : memoryRecall.recall({
           ...projectSpec === undefined ? {} : { project: projectSpec },
           domainProjects: config.memory?.domainProjects,
           shareCategories: config.memory?.shareCategories,

@@ -1143,6 +1143,29 @@ export const Config = z.object({
    * for profiles configured before this switch existed.
    */
   memoryEnabled: z.boolean().default(true),
+  /**
+   * Machine domain (cross-project sharing) for the memory lane.
+   *
+   * A scalar for the same reason `memoryEnabled` is one: declaring the
+   * `memory` object would materialise it into every profile. The hand-written
+   * spelling `memory.global.machine.enabled` still wins when present, so a
+   * profile edited before this switch existed keeps working.
+   *
+   * Volatile: the mount projection and the per-pass sync both read it through
+   * a live getter, so a settings-form edit applies on the next pass.
+   */
+  machineDomainEnabled: z.boolean().volatile(),
+  /**
+   * Volatile USE switch for the memory lane — the one the settings form can
+   * actually save. The Host refuses writes to non-volatile fields
+   * (`dsh-settings` write(): `Config field "X" is not volatile`), which is
+   * why the card could not persist `memoryEnabled` at all (2026-11-12).
+   *
+   * `memoryEnabled` keeps its mount-time meaning (open the lane at all);
+   * this one gates recall/injection per pass, so flipping it applies on the
+   * next pass with no remount. See src/dsh/live-flags.ts.
+   */
+  memoryLive: z.boolean().default(true).volatile(),
   historianEnabled: z.boolean().default(true).volatile(),
   registerCompactionEngine: z.boolean().default(false).volatile(),
   /** One notice entry in the session stream per action-bearing pass (see session-notice.ts). */

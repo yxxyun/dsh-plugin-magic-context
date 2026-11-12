@@ -130,6 +130,8 @@ const PHASE_C = [
   'tests/machine-domain.spec.ts',
   // The machine domain switch has one reading (2026-11-12).
   'tests/machine-domain-config.spec.ts',
+  // The two memory-lane switches and what the form may write (2026-11-12).
+  'tests/live-flags.spec.ts',
   // "publishing is a copy, not a mirror": the audit of published domain rows
   // against the memories they were promoted from (2026-10-16).
   'tests/domain-reconcile.spec.ts',

@@ -259,10 +259,14 @@ window.__ModuleLoader__.load({
         hint: 'Token budget reserved for the m[0]/m[1] baseline.',
       },
       {
-        path: ['memoryEnabled'], kind: 'boolean', fallback: true, label: 'Memory lane enabled',
-        hint: 'Master switch for the recall lane: ctx_memory, the injected memory block, and promotion. '
-          + 'Saving remounts the adapter, so the change applies without a restart. A patch-level '
-          + 'memory.enabled: false also forces it off.',
+        // The VOLATILE half of the lane switch: the Host refuses writes to
+        // non-volatile fields (dsh-settings write(): "Config field "X" is not
+        // volatile"), so the mount-time `memoryEnabled` stays in the patch and
+        // this switch gates use (injection) and applies on the next pass.
+        path: ['memoryLive'], kind: 'boolean', fallback: true, label: 'Memory lane enabled',
+        hint: 'Gate the recall lane per pass: with this off, no memory block is recalled or injected '
+          + 'on the next pass, and no restart is needed. The mount-time switch (memoryEnabled in the '
+          + 'patch) decides whether the lane opens at all — that one needs a reload.',
       },
       {
         path: ['policy', 'memoryBudgetTokens'], kind: 'number', label: 'Memory budget tokens',
@@ -277,6 +281,12 @@ window.__ModuleLoader__.load({
         hint: 'How long journal rows are kept. Re-prunes once the value changes (minimum 1 day).',
       },
       { path: ['historianEnabled'], kind: 'boolean', fallback: true, label: 'Historian enabled', hint: 'Run the out-of-band historian.' },
+      {
+        path: ['machineDomainEnabled'], kind: 'boolean', fallback: false,
+        label: 'Machine domain (cross-project sharing)',
+        hint: 'Share ARCHITECTURE / CONFIG_VALUES / CONSTRAINTS with the other projects on this machine. '
+          + 'Off by default; the hand-written memory.global.machine.enabled still works, but this switch wins.',
+      },
       {
         path: ['registerCompactionEngine'], kind: 'boolean', label: 'Register compaction engine',
         hint: 'Register the adapter as the compaction engine seam. Mounts or unmounts on the next agent step — disable the host compaction row first.',
@@ -546,6 +556,7 @@ window.__ModuleLoader__.load({
         const drafts = useRef(new Map())
         const [saving, setSaving] = useState(false)
         const [failed, setFailed] = useState(false)
+        const [failureText, setFailureText] = useState('')
         const catalogState = useModelCatalog(catalog)
 
         useEffect(() => scope.subscribe(() => setRevision((value) => value + 1)), [scope])
@@ -581,6 +592,7 @@ window.__ModuleLoader__.load({
           if (staged.size === 0 && !failed) return
           staged.clear()
           setFailed(false)
+          setFailureText('')
           setRevision((value) => value + 1)
         }
 
@@ -813,16 +825,48 @@ window.__ModuleLoader__.load({
           if (blocked || ops.length === 0) return
           setSaving(true)
           setFailed(false)
-          Promise.resolve(scope.mutate(ops, snapshot.revision)).then((accepted) => {
-            if (accepted) staged.clear()
-            setSaving(false)
-            setFailed(!accepted)
-            setRevision((value) => value + 1)
-          }, () => {
-            setSaving(false)
-            setFailed(true)
-            setRevision((value) => value + 1)
-          })
+          setFailureText('')
+          // One retry, with the revision the Host is actually on. The mutation is
+          // revision-fenced, and a card that has been open across a plugin remount
+          // (every reload today moves the revision) would otherwise have every
+          // save refused with the same stale number — the operator sees only
+          // "the Host did not accept the save" and cannot tell why.
+          const attempt = (revision, mayRetry) => {
+            Promise.resolve(scope.mutate(ops, revision)).then((accepted) => {
+              if (accepted) {
+                staged.clear()
+                setSaving(false)
+                setFailed(false)
+                setRevision((value) => value + 1)
+                return
+              }
+              if (mayRetry) {
+                const fresh = scope.getSnapshot()
+                if (fresh !== undefined && fresh.revision !== revision) {
+                  attempt(fresh.revision, false)
+                  return
+                }
+              }
+              setSaving(false)
+              setFailed(true)
+              setRevision((value) => value + 1)
+            }, (error) => {
+              if (mayRetry) {
+                const fresh = scope.getSnapshot()
+                if (fresh !== undefined && fresh.revision !== revision) {
+                  attempt(fresh.revision, false)
+                  return
+                }
+              }
+              // Keep the Host's own words: the generic banner alone says nothing
+              // about WHICH rule refused the write (schema, remount, revision).
+              setFailureText(error instanceof Error ? error.message : String(error ?? ''))
+              setSaving(false)
+              setFailed(true)
+              setRevision((value) => value + 1)
+            })
+          }
+          attempt(snapshot.revision, true)
         }
 
         const shell = {
@@ -877,7 +921,7 @@ window.__ModuleLoader__.load({
               onClick: save,
             }, shell.saving ? FORM_LABELS.saving : FORM_LABELS.save),
             failed ? el('span', { key: 'failed', style: { color: 'var(--dsw-alias-label-error, #c33)', fontSize: 12 } },
-              FORM_LABELS.saveFailed) : null,
+              failureText === '' ? FORM_LABELS.saveFailed : FORM_LABELS.saveFailed + ' ' + failureText) : null,
           ])
         }
 
