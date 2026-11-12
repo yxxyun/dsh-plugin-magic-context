@@ -25,10 +25,21 @@
  *     into pointer events itself. Nothing here is a credential or a message
  *     body: only the trimmed telemetry the Host route already exposes.
  *
- *  2. The Plugins page settings card for the row's `magic-context-dsh` settings
- *     namespace (`ctx.configForms`). It writes through the shared settings form,
- *     i.e. `remote.settings.mutate` → config editor → the profile's
- *     `cordis.patch.yml` override row. This half never touches a file.
+ *  2. The settings card for the `magic-context-dsh` settings namespace
+ *     (`ctx.configForms`), mounted on the INSTALLED BUNDLE'S OWN PAGE. It writes
+ *     through the shared settings form, i.e. `remote.settings.mutate` → config
+ *     editor → the profile's `cordis.patch.yml` override row. This half never
+ *     touches a file.
+ *
+ *     Seat choice (2026-11-12, operator report): the Plugins page reads three
+ *     ledgers — `plugins.item` (official plugins listed beside the official
+ *     bundles), `plugins.bundle.config` (bundles with a form on their own page)
+ *     and `plugins.row.config` (loader rows with a page of their own, which the
+ *     page renders under 内置插件配置 / "Built-in plugin settings"). Registering
+ *     `plugins.row.config` put this third-party plugin's whole option set in the
+ *     BUILT-IN list, next to 子智能体 / 网页搜索 / 终端 — the wrong home. The
+ *     bundle ledger is keyed by package name and renders on the plugin's own
+ *     page, which is where an installed plugin's settings belong.
  *
  * Only modules from the shell's static module table are required (`react`,
  * `@deepseek-ai/dsh-client-ui-primitives`); every other collaborator arrives as
@@ -55,9 +66,11 @@ window.__ModuleLoader__.load({
 
     /** Loader row id of the Host half; also the settings namespace. */
     const CFG_NS = 'magic-context-dsh'
-    /** Package name; the `plugins.row.config` key is `<package name>#<row id>`. */
+    /**
+     * Package name. It is also the `plugins.bundle.config` key: the Plugins page
+     * keys that ledger by the installed bundle's package name (2026-11-12).
+     */
     const PKG_NAME = 'dsh-plugin-magic-context'
-    const ROW_CONFIG_KEY = PKG_NAME + '#' + CFG_NS
     /** Host telemetry routes (loopback only, no auth — telemetry only). */
     const SUMMARY_URL = '/mc-telemetry/summary'
     const EVENTS_URL = '/mc-telemetry/events'
@@ -2367,22 +2380,14 @@ window.__ModuleLoader__.load({
         const scope = settingsCtx.configForms.get(CFG_NS)
         const Card = makeCard(scope, catalog)
         settingsCtx.effect(() => settingsCtx.configForms.whileServed([CFG_NS], () => {
-          const offItem = ctx.slots.inject('plugins.item', () => ctx.slots.register({
-            name: 'plugins.item',
-            id: CFG_NS,
-            order: 20,
-            label: () => t('title'),
-            locale: LOCALE_NS,
-          }, Card))
-          const offRow = ctx.slots.inject('plugins.row.config', () => ctx.slots.register({
-            name: 'plugins.row.config',
-            key: ROW_CONFIG_KEY,
+          const offBundle = ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
+            name: 'plugins.bundle.config',
+            key: PKG_NAME,
             order: 20,
             locale: LOCALE_NS,
           }, Card))
           return () => {
-            offItem()
-            offRow()
+            offBundle()
           }
         }), 'magic-context: settings card')
       })
