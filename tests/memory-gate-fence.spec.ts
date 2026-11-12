@@ -406,6 +406,8 @@ async function bootPlugin(options: {
   dataDir: string
   /** Omitted = the profile config has no `memory` key at all. */
   memory?: Record<string, unknown>
+  /** The options-page scalar; omitted = the shipped default (off is explicit). */
+  memoryEnabled?: boolean
 }): Promise<Context> {
   const ctx = new Context()
   await ctx.plugin(LlmRuntime)
@@ -419,6 +421,7 @@ async function bootPlugin(options: {
     dataDir: options.dataDir,
     registerCompactionEngine: false,
     ...options.memory === undefined ? {} : { memory: options.memory },
+    ...options.memoryEnabled === undefined ? {} : { memoryEnabled: options.memoryEnabled },
   } as never)
   disposers.push(async () => {
     try {
@@ -469,6 +472,31 @@ describe('the memory.enabled gate (task-9 ①)', () => {
     expect(meta(dataDir, 'memory_bridge')).toContain('ok schema v')
     expect(meta(dataDir, 'memory_write')).toContain('read-write')
     expect(existsSync(join(dataDir, 'memories.db'))).toBe(true)
+  })
+
+  it('honours the options-page switch memoryEnabled:false with no memory key present', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'mc-gate-switch-'))
+    tempDirs.push(dataDir)
+    const ctx = await bootPlugin({ dataDir, memoryEnabled: false })
+
+    // The declared scalar must reach the same mount-time gate the patch-level
+    // `memory.enabled` uses: no ctx_memory, no bridge, and the corpus is never
+    // even created (a disabled lane opens nothing).
+    expect(toolNames(ctx)).not.toContain('ctx_memory')
+    expect(meta(dataDir, 'memory_bridge')).toBe('disabled-by-config')
+    expect(meta(dataDir, 'memory_write')).toBe('disabled-by-config')
+    expect(existsSync(join(dataDir, 'memories.db'))).toBe(false)
+  })
+
+  it('lets the patch-level memory.enabled:false win over memoryEnabled:true', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'mc-gate-switch-both-'))
+    tempDirs.push(dataDir)
+    const ctx = await bootPlugin({ dataDir, memoryEnabled: true, memory: { enabled: false } })
+
+    // Two spellings, one gate: the older profile-level opt-out must not be
+    // resurrected by the new scalar defaulting to true.
+    expect(toolNames(ctx)).not.toContain('ctx_memory')
+    expect(meta(dataDir, 'memory_bridge')).toBe('disabled-by-config')
   })
 
   it('honours an explicit memory.enabled:false and names the reason', async () => {

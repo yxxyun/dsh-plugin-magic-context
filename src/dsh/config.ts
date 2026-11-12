@@ -11,6 +11,15 @@ export interface MagicContextDshConfig {
   dataDir?: string
   /** Master switch; false keeps the plugin loaded but fully inert. */
   enabled?: boolean
+  /**
+   * Options-page master switch for the memory lane (declared in the exported
+   * Config as a non-volatile scalar, so a form commit remounts the fiber and the
+   * mount-time lane gate re-evaluates).
+   *
+   * Off from either spelling closes the lane: this scalar, or the patch-level
+   * `memory.enabled: false` that predates it.
+   */
+  memoryEnabled?: boolean
   /** Register the ctx_reduce / ctx_expand agent tools (default true). */
   registerTools?: boolean
   /** Register the /ctx-status command (default true). */

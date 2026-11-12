@@ -246,6 +246,12 @@ window.__ModuleLoader__.load({
         hint: 'Token budget reserved for the m[0]/m[1] baseline.',
       },
       {
+        path: ['memoryEnabled'], kind: 'boolean', label: 'Memory lane enabled',
+        hint: 'Master switch for the recall lane: ctx_memory, the injected memory block, and promotion. '
+          + 'Saving remounts the adapter, so the change applies without a restart. A patch-level '
+          + 'memory.enabled: false also forces it off.',
+      },
+      {
         path: ['policy', 'memoryBudgetTokens'], kind: 'number', label: 'Memory budget tokens',
         hint: 'Token budget the recalled-memory block may spend.',
       },
