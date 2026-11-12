@@ -17,6 +17,7 @@ import type { AdapterStores } from '../core/stores.ts'
 import type { Journal } from '../core/journal.ts'
 import { errText } from '../core/types.ts'
 import type { PressurePolicy } from '../core/policy.ts'
+import { machineDomainConfigOf } from './machine-domain-config.ts'
 import { openMemoryBridge, DEFAULT_SHARE_CATEGORIES, resolveIdentitySpec, type ActivePeerDomain } from '../core/memory-bridge.ts'
 import { openMemoryWriter, type MemoryWriter } from '../core/memory-write.ts'
 import { ensureOwnCorpusStore } from '../core/corpus-store.ts'
@@ -168,12 +169,11 @@ export function openMemoryLane(
     try {
       syncMachineDomain(stores, {
         identities: [],
-        config: {
-          enabled: liveBoolean(config.memory?.global?.machine?.enabled, true),
-          ...config.memory?.global?.machine?.excludeProjects === undefined
-            ? {}
-            : { excludeProjects: config.memory.global.machine.excludeProjects },
-        },
+        // ONE reading of the switch, default OFF — the pre-step sync uses the
+        // same helper, so mount and execute pass can never disagree again
+        // (2026-11-12: they did, and the domain row was created enabled here
+        // and disabled there on every pass).
+        config: machineDomainConfigOf(config),
         now: Date.now(),
       })
     } catch {

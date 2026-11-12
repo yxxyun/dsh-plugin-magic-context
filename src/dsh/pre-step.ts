@@ -17,6 +17,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { AdapterStores } from '../core/stores.ts'
 import type { Journal } from '../core/journal.ts'
 import { decidePass, pressurePercent, pressureWindowTokens, withTokenThreshold, type PressurePolicy } from '../core/policy.ts'
+import { machineDomainConfigOf } from './machine-domain-config.ts'
 import { PROFILE_M0_BUDGET_TOKENS, resolveIdentitySpec } from '../core/memory-bridge.ts'
 import type { MemoryFact } from '../core/memory-categories.ts'
 import { errText } from '../core/types.ts'
@@ -349,14 +350,7 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
         if (memoryRecall !== undefined) {
           syncMachineDomain(stores, {
             identities: [...seenIdentities],
-            config: {
-              ...config.memory?.global?.machine?.enabled === undefined
-                ? {}
-                : { enabled: liveBoolean(config.memory?.global?.machine?.enabled, true) },
-              ...config.memory?.global?.machine?.excludeProjects === undefined
-                ? {}
-                : { excludeProjects: config.memory.global.machine.excludeProjects },
-            },
+            config: machineDomainConfigOf(config),
             now: Date.now(),
           })
         }
