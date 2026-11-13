@@ -23,7 +23,7 @@ import { openMemoryWriter, type MemoryWriter } from '../core/memory-write.ts'
 import { ensureOwnCorpusStore } from '../core/corpus-store.ts'
 import { syncMachineDomain } from '../core/machine-domain.ts'
 import { openProfileWriter, type ProfileWriter } from '../core/profile-write.ts'
-import { planBackfill } from '../core/vector-lane.ts'
+import { coldStartModelId, planBackfill } from '../core/vector-lane.ts'
 import { runVectorBackfill, type VectorBackfillOutcome } from '../core/vector-backfill.ts'
 import { openMemorySearch, type MemorySearch, type MemorySearchHit } from '../core/memory-search.ts'
 import { cosineSimilarity, defaultEmbeddingCacheDir, openLocalEmbedder } from '../core/embedding-local.ts'
@@ -272,23 +272,41 @@ export function openMemoryLane(
   let laneJournal: Journal | undefined
   const resolveSharedSpace = (): Promise<{ modelId: string | null }> => {
     if (memorySearch === undefined || embedder === undefined) return Promise.resolve({ modelId: null })
+    // The gate's outcome used to be observable ONLY through ctx.logger,
+    // which does not reach the journal — so whether the semantic lane is
+    // live, degraded or dead was unknowable from the store. Every exit is
+    // journaled now: `vector-lane` answers the question permanently, and a
+    // silent permanent degradation (the failure this lane is most prone to)
+    // shows up as a repeated parity-fail/embed-failed.
+    const record = (
+      outcome: string,
+      modelId: string | null,
+      detail: Record<string, unknown> = {},
+    ): { modelId: string | null } => {
+      laneJournal?.info('vector-lane', `shared-space gate: ${outcome}`, { outcome, ...detail })
+      return { modelId }
+    }
+    // COLD START (2026-11-13), deliberately OUTSIDE the memo below. A store with
+    // no vectors has no dominant space, so the stored-vector parity proof is
+    // unsatisfiable, not failed — and the lane stayed shut for the life of the
+    // install (measured: 0 rows, `backfill-parity-unproven` every 30 minutes).
+    // The first writer decides the space; re-measured on EVERY call so that the
+    // moment a row exists the strict proof below takes over, even in this
+    // process. Memoizing a bootstrap decision is how a cold start becomes a
+    // permanent self-declared space the store never agreed to.
+    const dominantNow = memorySearch.dominantEmbeddingModel()
+    if (dominantNow === undefined) {
+      const bootstrap = coldStartModelId(undefined, embedder.modelId)
+      if (bootstrap !== undefined) {
+        return Promise.resolve(record('bootstrap-space', bootstrap, {
+          reason: 'no dominant embedding space — the first writer decides the space',
+          dims: embedder.dims,
+        }))
+      }
+    }
     if (sharedSpacePromise === undefined) {
       sharedSpacePromise = (async () => {
-        // The gate's outcome used to be observable ONLY through ctx.logger,
-        // which does not reach the journal — so whether the semantic lane is
-        // live, degraded or dead was unknowable from the store. Every exit is
-        // journaled once per process now: `vector-lane` answers the question
-        // permanently, and a silent permanent degradation (the failure this
-        // lane is most prone to) shows up as a repeated parity-fail/embed-failed.
-        const record = (
-          outcome: string,
-          modelId: string | null,
-          detail: Record<string, unknown> = {},
-        ): { modelId: string | null } => {
-          laneJournal?.info('vector-lane', `shared-space gate: ${outcome}`, { outcome, ...detail })
-          return { modelId }
-        }
-        const dominant = memorySearch.dominantEmbeddingModel()
+        const dominant = dominantNow
         if (dominant === undefined || dominant.dims !== embedder.dims) {
           return record('gate-closed', null, {
             reason: dominant === undefined ? 'no dominant embedding space' : 'dims mismatch',
@@ -344,7 +362,8 @@ export function openMemoryLane(
     const space = await resolveSharedSpace()
     return runVectorBackfill({
       plan: () => {
-        const plan = planBackfill(memoryRecall.dbPath, { limit })
+        // Cold start: seed the space with the identity the gate would write into.
+        const plan = planBackfill(memoryRecall.dbPath, { limit, ...space.modelId === null ? {} : { spaceWhenEmpty: space.modelId } })
         return plan === undefined
           ? undefined
           : { modelId: plan.modelId, candidates: plan.candidates, total: plan.total }

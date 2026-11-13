@@ -25,6 +25,17 @@
 - **实测代价**（2026-11-09 11:57 → 11-10 17:03，1726 步）：43 条 baseline 记录里 35 条是软刷新，而同一会话
   只发布了 10 个 compartment；`published=[] 且 tokensDelta=0` 的 8 连发 execute 各烧掉 27–30 万 token；
   一次空转 pass 之后的下一步 `cacheRead=32,768`、prompt=303k（只有系统提示存活）。
+- **向量 lane 冷启动：空库不再把自己永久锁死。** 语义检索此前从未在这个 profile 上跑起来过，
+  原因是判定链自锁：`vectorBackfill` 要求 shared-space parity 已证（`vector-backfill.ts:104`），
+  parity 又要求库里已有一条同空间向量（`memory-lane.ts` 的 `dominantEmbeddingModel() === undefined`
+  → `gate-closed`），而全新 corpus 的 `memory_embeddings` 本来就是空的。于是它不报错、不重试，
+  只每 30 分钟记一条 `backfill-parity-unproven`——从装机到被发现，`memory_embeddings` 一直 0 行,
+  模型资产也从未下载，`ctx_memory` 的语义半边静默退化成 FTS 字面匹配。
+  修法只开一扇窄门：库里**一条向量都没有**时由第一个写入者决定空间（`coldStartModelId`），
+  且该判断**不进 memo**，下一次调用即重新测量——一旦有行，立刻回到「必须复现库里的空间」的严格
+  parity 证明（实测 `bootstrap-space` 后 61 秒即 `parity-pass, parity: 1`）。有真实空间时
+  `coldStartModelId(MODEL_A, own)` 仍返回 `MODEL_A`，不会被调用方身份覆盖。
+  `tests/vector-lane.spec.ts` 新增 4 条用例钉住。
 - **historian 信封解析对齐上游 8 例 golden（7 例逐字一致，1 例仅空白）**：切信封当晚有 4 个用例读错 ——
   XML 实体不解码（`&lt;` 原样入库）、`<p1>` 正文里被引用的 `</p1>` 截断段落、正文里被引用的
   `</compartment>` 砍断整块（顺带把 1 条事实虚增成 15 条）、乱序 compartment 取错锚点。四种都是静默错误：
