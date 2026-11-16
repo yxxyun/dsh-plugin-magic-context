@@ -39,3 +39,6 @@ coverage/
 npm-debug.log*
 
 .idea/
+
+# 本轮修复的本地回滚件（不随代码走）
+*.bak-*

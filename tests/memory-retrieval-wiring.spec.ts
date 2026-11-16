@@ -140,7 +140,7 @@ describe('explicit retrieval is counted at the ctx_memory boundary (task-9 ②)'
     const writer = openMemoryWriter({ dbPath: path, logger: silentLogger, now: () => T0 })
     try {
       const tool = build({ writer, ids: [id] })
-      const result = await tool.execute({ action: 'list', query: 'explicit' }, RUN_CTX) as { lines?: string[] }
+      const result = await tool.execute({ action: 'list' }, RUN_CTX) as { lines?: string[] }
       expect(result.lines).toEqual(['[p1] a recalled memory'])
 
       const after = telemetry(path, id)

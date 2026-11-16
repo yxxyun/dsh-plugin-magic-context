@@ -379,6 +379,14 @@ describe('fail-open degradation', () => {
     expect(previewText(long).endsWith('…')).toBe(true)
     expect(previewText('short')).toBe('short')
     expect(formatSearchResults('q', []).startsWith('No results')).toBe(true)
+    // Upstream formatter (search.ts:2823-2857): a query whose only matches are
+    // already injected must say so, never read as "no such memory".
+    expect(formatSearchResults('q', [], []).startsWith('No results')).toBe(true)
+    const hidden = formatSearchResults('q', [], [7, 9])
+    expect(hidden).toContain('No hidden results found for "q"')
+    expect(hidden).toContain('2 matches found, all already visible in your project-memory block (ids 7, 9)')
+    const one = formatSearchResults('q', [], [4])
+    expect(one).toContain('1 match found, all already visible')
   })
 })
 
@@ -468,6 +476,49 @@ describe('visible-memory suppression and date bounds (MC search parity)', () => 
       })
       expect(suppressed.ok && suppressed.hits.map(hit => hit.id)).toEqual([freshId])
       expect(suppressed.ok && suppressed.suppressedVisible).toBe(1)
+    } finally {
+      lane.close()
+    }
+  })
+
+  it('treats a missing queryEmbedding/queryModelId as the FTS-only shape', async () => {
+    const path = createDb()
+    addFtsTable(path)
+    seed(path, OWN, 'deploys run from the release branch')
+    syncFts(path)
+    const lane = openMemorySearch({ dbPath: path, logger: silentLogger })
+    try {
+      // The contract says `Float32Array | null` / `string | null`, but a JS-side
+      // caller passes undefined and `undefined !== null` is TRUE: the vector lane
+      // used to guard itself open and bind undefined into SQLite, failing the
+      // whole search with "Provided value cannot be bound to SQLite parameter 1".
+      const both = await lane.search({
+        query: 'deploys',
+        space: space(),
+        now: T0 + 1000,
+      } as never)
+      expect(both.ok).toBe(true)
+      expect(both.ok && both.hits).toHaveLength(1)
+
+      const onlyEmbedding = await lane.search({
+        query: 'deploys',
+        space: space(),
+        now: T0 + 1000,
+        queryEmbedding: new Float32Array(384),
+      } as never)
+      expect(onlyEmbedding.ok).toBe(true)
+      expect(onlyEmbedding.ok && onlyEmbedding.hits).toHaveLength(1)
+
+      // The declared null shape keeps behaving the same way.
+      const declared = await lane.search({
+        query: 'deploys',
+        space: space(),
+        now: T0 + 1000,
+        queryEmbedding: null,
+        queryModelId: null,
+      })
+      expect(declared.ok).toBe(true)
+      expect(declared.ok && declared.hits).toHaveLength(1)
     } finally {
       lane.close()
     }
