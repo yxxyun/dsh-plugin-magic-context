@@ -184,13 +184,46 @@ describe('ctx_memory under the real host defineTool', () => {
     })
     cleanups.push(built.close)
 
-    const result = await built.tool.execute({ action: 'list', query: 'anything' }, fakeExec('D:/work/project'))
+    const result = await built.tool.execute({ action: 'list' }, fakeExec('D:/work/project'))
     expect(seen).toHaveLength(1)
     expect(seen[0]!.request.identity).toBe(IDENTITY)
     expect(seen[0]!.exec?.agent?.session.header?.cwd).toBe('D:/work/project')
     expect(built.tool.output.render({ action: 'list' }, result)).toEqual([
       { type: 'text', text: 'Project memories (1 shown):\n- [CONSTRAINTS] recall saw the session' },
     ])
+  })
+
+  it('refuses a query on list and points at search (upstream keeps list unfiltered)', async () => {
+    const path = makeMemoryDb()
+    let recalled = 0
+    const built = buildTool(path, () => {
+      recalled += 1
+      return { lines: ['- [CONSTRAINTS] something'], digest: 'digest' }
+    })
+    cleanups.push(built.close)
+
+    const refused = await built.tool.execute(
+      { action: 'list', query: 'ssh_upload' },
+      fakeExec('D:/work/project'),
+    ) as { outcome?: string; ok?: boolean }
+    // The host recall must never see a filtered list: the old code forwarded the
+    // query into a substring filter that ran after the injected-block budget had
+    // already truncated the pool, so a memory outside the budget was reported
+    // absent. Nothing is recalled for a refused call.
+    expect(recalled).toBe(0)
+    expect(refused.ok).toBe(false)
+    expect(refused.outcome).toContain('list does not take a query')
+    expect(refused.outcome).toContain('search with query="ssh_upload"')
+    expect(built.tool.output.render({ action: 'list' }, refused as never)).toEqual([
+      { type: 'text', text: refused.outcome as string },
+    ])
+
+    // A plain list still reaches the host unchanged.
+    await built.tool.execute({ action: 'list' }, fakeExec('D:/work/project'))
+    expect(recalled).toBe(1)
+    // Whitespace is not a query.
+    await built.tool.execute({ action: 'list', query: '   ' }, fakeExec('D:/work/project'))
+    expect(recalled).toBe(2)
   })
 
   it('passes a missing run context through as undefined and never throws on it', async () => {

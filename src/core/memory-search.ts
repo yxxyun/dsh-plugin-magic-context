@@ -97,6 +97,13 @@ export type MemorySearchOutcome =
     readonly semanticMatches: number
     /** A2: memory hits suppressed because the injected block already renders them. */
     readonly suppressedVisible: number
+    /**
+     * A2 (MC `suppressedVisibleMemoryIds`): the ids behind the count, so the
+     * rendered block can name them. Upstream never reports a bare count — an
+     * empty result whose matches are already injected must say so
+     * (search.ts:2794-2807), otherwise the caller reads it as "no such memory".
+     */
+    readonly suppressedVisibleIds: readonly number[]
   }
   | { readonly ok: false; readonly reason: string }
 
@@ -249,6 +256,15 @@ export function openMemorySearch(options: {
       if (trimmed.length === 0) {
         return { ok: false, reason: 'query is required' };
       }
+      // The contract declares both fields as `… | null`, but a JS-side caller —
+      // or a future call site that forgets one — passes `undefined`, and
+      // `undefined !== null` is TRUE. The vector lane then guarded itself open
+      // and bound `undefined` into SQLite, failing the ENTIRE search with
+      // "Provided value cannot be bound to SQLite parameter 1" (measured: both
+      // fields missing, and only `queryModelId` missing, both reproduce it).
+      // Normalize once here; every consumer below reads these locals.
+      const queryEmbedding = request.queryEmbedding ?? null;
+      const queryModelId = request.queryModelId ?? null;
       const limit = Math.max(
         1,
         Math.min(MAX_MEMORY_SEARCH_LIMIT, Math.floor(request.limit ?? DEFAULT_MEMORY_SEARCH_LIMIT)),
@@ -264,6 +280,7 @@ export function openMemorySearch(options: {
           ftsMatches: 0,
           semanticMatches: 0,
           suppressedVisible: 0,
+          suppressedVisibleIds: [],
         };
       }
       const { clause, params } = domainVisibilityPredicate(request.space);
@@ -293,6 +310,7 @@ export function openMemorySearch(options: {
           ftsMatches: hits.length,
           semanticMatches: 0,
           suppressedVisible: 0,
+          suppressedVisibleIds: [],
         };
       }
 
@@ -338,16 +356,16 @@ export function openMemorySearch(options: {
       );
       const stored = new Map<number, Float32Array>();
       const storedIds: number[] = [];
-      if (hasVectors && request.queryEmbedding !== null && request.queryModelId !== null) {
+      if (hasVectors && queryEmbedding !== null && queryModelId !== null) {
         const rows = db.prepare(
           `SELECT m.id AS id, m.category AS category, m.content AS content, m.created_at AS createdAt, e.embedding AS embedding`
           + ` FROM memory_embeddings e INNER JOIN memories m ON m.id = e.memory_id`
           + ` WHERE e.model_id = ? AND m.status IN ('active','permanent')`
           + ` AND (m.expires_at IS NULL OR m.expires_at > ?)${vectorVisibility.clause}`,
-        ).all(request.queryModelId, request.now, ...vectorVisibility.params) as unknown as Array<{
+        ).all(queryModelId, request.now, ...vectorVisibility.params) as unknown as Array<{
           id: number; category: string | null; content: string; createdAt: number; embedding: Buffer;
         }>;
-        const dims = request.queryEmbedding.length;
+        const dims = queryEmbedding.length;
         for (const row of rows) {
           if (row.embedding.length / 4 !== dims) continue;
           stored.set(row.id, new Float32Array(
@@ -361,7 +379,7 @@ export function openMemorySearch(options: {
       }
 
       const semanticScores = new Map<number, number>();
-      if (request.queryEmbedding !== null) {
+      if (queryEmbedding !== null) {
         const candidateIds = new Set<number>([
           ...ftsRows.map((row) => row.id),
           ...storedIds,
@@ -390,7 +408,7 @@ export function openMemorySearch(options: {
           if (vector === undefined) continue;
           semanticScores.set(
             id,
-            normalizeCosineScore(cosineSimilarity(request.queryEmbedding, vector)),
+            normalizeCosineScore(cosineSimilarity(queryEmbedding, vector)),
           );
         }
       }
@@ -400,7 +418,7 @@ export function openMemorySearch(options: {
         ftsRows.map((row, rank) => [row.id, 1 / (rank + 1)]),
       );
       const hits: MemorySearchHit[] = [];
-      let suppressedVisible = 0;
+      const suppressedVisibleIds: number[] = [];
       const candidateIds = new Set<number>([...semanticScores.keys(), ...ftsScores.keys()]);
       for (const id of candidateIds) {
         const meta = metaById.get(id);
@@ -412,7 +430,7 @@ export function openMemorySearch(options: {
         // text results (MC suppressedVisibleMemoryIds; worst case without it
         // is a redundant hit, never a correctness issue).
         if (request.visibleMemoryIds?.has(id) === true) {
-          suppressedVisible += 1;
+          suppressedVisibleIds.push(id);
           continue;
         }
         const semanticScore = semanticScores.get(id);
@@ -443,13 +461,15 @@ export function openMemorySearch(options: {
         return left.id - right.id;
       });
       const page = hits.slice(0, limit);
+      const sortedSuppressed = [...suppressedVisibleIds].sort((left, right) => left - right);
       return {
         ok: true,
         hits: page,
-        text: formatSearchResults(trimmed, page),
+        text: formatSearchResults(trimmed, page, sortedSuppressed),
         ftsMatches: ftsRows.length,
         semanticMatches: semanticScores.size,
-        suppressedVisible,
+        suppressedVisible: sortedSuppressed.length,
+        suppressedVisibleIds: sortedSuppressed,
       };
     };
     // B3 (MC single_store_reads): one deferred read transaction so the FTS
@@ -513,14 +533,44 @@ export function openMemorySearch(options: {
   };
 }
 
-/** MC formatSearchResults (search.ts:2390-2413) restricted to the memory lane;
+/** MC formatSearchDiagnosticLines (search.ts:2779-2817), memory half only: the
+ *  suppression sentence is emitted in BOTH shapes upstream distinguishes —
+ *  "N additional … suppressed" beside live hits, "N … found, all already
+ *  visible" when suppression is the whole answer. Without it an empty result
+ *  is indistinguishable from a memory that does not exist. */
+export function formatSearchDiagnosticLines(
+  hits: readonly MemorySearchHit[],
+  suppressedVisibleIds: readonly number[],
+): string[] {
+  if (suppressedVisibleIds.length === 0) return [];
+  const count = suppressedVisibleIds.length;
+  const noun = count === 1 ? 'match' : 'matches';
+  const ids = suppressedVisibleIds.join(', ');
+  const hasMemoryHit = hits.length > 0;
+  return [
+    hasMemoryHit
+      ? `Memories: ${String(count)} additional ${noun} suppressed because ${count === 1 ? 'it is' : 'they are'} already visible in your project-memory block (ids ${ids}).`
+      : `Memories: ${String(count)} ${noun} found, all already visible in your project-memory block (ids ${ids}).`,
+  ];
+}
+
+/** MC formatSearchResults (search.ts:2823-2857) restricted to the memory lane;
  *  per-hit line format is MC formatUnifiedSearchResult:2304-2311. */
-export function formatSearchResults(query: string, hits: readonly MemorySearchHit[]): string {
+export function formatSearchResults(
+  query: string,
+  hits: readonly MemorySearchHit[],
+  suppressedVisibleIds: readonly number[] = [],
+): string {
+  const diagnosticLines = formatSearchDiagnosticLines(hits, suppressedVisibleIds);
   if (hits.length === 0) {
+    if (diagnosticLines.length > 0) {
+      return `No hidden results found for "${query}".\n\n${diagnosticLines.join('\n')}`;
+    }
     return `No results found for "${query}" in project memories.`;
   }
   const body = hits.map((hit, index) =>
     `[${index + 1}] [memory] score=${hit.score.toFixed(2)} id=${hit.id} category=${hit.category} match=${hit.matchType}\n${hit.preview}`,
   );
-  return `Found ${hits.length} result${hits.length === 1 ? '' : 's'} for "${query}":\n\n${body.join('\n\n')}`;
+  const tail = diagnosticLines.length === 0 ? '' : `\n\n${diagnosticLines.join('\n')}`;
+  return `Found ${hits.length} result${hits.length === 1 ? '' : 's'} for "${query}":\n\n${body.join('\n\n')}${tail}`;
 }

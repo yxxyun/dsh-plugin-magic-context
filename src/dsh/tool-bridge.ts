@@ -390,8 +390,9 @@ export function defineCtxMemoryTool(deps: MemoryToolDeps): unknown {
     description:
       'Read and maintain the project memory store (shared with the other coding agents on this machine): '
         + 'durable facts, constraints, configuration values and naming rules. '
-        + 'Actions: list (optionally with query), search (hybrid keyword+semantic retrieval over the pool, '
-        + 'optionally bounded by from/to dates), '
+        + 'Actions: list (enumerate the memories your injected block already renders, hottest first), '
+        + 'search (hybrid keyword+semantic retrieval over the WHOLE pool, optionally bounded by from/to '
+        + 'dates — this is the only action that looks past the injected block), '
         + 'get (by id), write (new memory), update (rewrite one), '
         + 'archive (retire one, optionally superseded by another), merge (fold duplicates into one), '
         + 'review_global (present pending global-domain candidates — the work and global audiences — to the user as '
@@ -549,13 +550,28 @@ export function defineCtxMemoryTool(deps: MemoryToolDeps): unknown {
         // recall callback scopes by `config.memory.project ?? session cwd` has
         // no other way to see the session (index.ts), and `identity` is the
         // identity this tool already resolved for the same purpose. The two
-        // model-supplied fields are narrowed here: `args` is the validated
-        // argument record, and a `query`/`limit` of the wrong type must not
-        // reach the host's recall as a non-string / non-number.
-        const query = typeof args.query === 'string' ? args.query : undefined
+        // model-supplied field is narrowed here: `args` is the validated
+        // argument record, and a `limit` of the wrong type must not reach the
+        // host's recall as a non-number.
+        //
+        // `list` takes no query. Upstream keeps `list` internal to the dreamer
+        // (ctx-memory.ts:106-110 `DREAMER_ONLY_ACTIONS`) and never offers a
+        // filtered enumeration on the model-facing tool; text lookup is
+        // `search`. This adapter used to forward `query` into a substring
+        // filter that ran AFTER the injected-block budget had already truncated
+        // the pool (memory-bridge.ts:1040-1045), so it could only ever re-find
+        // rows the block already showed — a searched-for memory outside the
+        // budget was reported as absent. Refusing is the honest shape.
+        const query = typeof args.query === 'string' ? args.query.trim() : ''
+        if (query.length > 0) {
+          return finish({
+            outcome: `list does not take a query. Use search with query="${query}" — it covers the whole `
+              + 'project pool, while list only enumerates what the injected block already renders.',
+            ok: false,
+          })
+        }
         const limit = typeof args.limit === 'number' ? args.limit : undefined
         const result = recall({
-          ...query === undefined ? {} : { query },
           ...limit === undefined ? {} : { limit },
           ...identity === undefined ? {} : { identity },
         }, exec as MemoryToolRunContext)
