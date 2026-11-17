@@ -56,7 +56,7 @@ describe('the phase map', () => {
 
   it('gives every phase an identity and a blind list', () => {
     for (const phase of PHASES) {
-      expect(phase.id).toMatch(/^([0a-d])$/)
+      expect(phase.id).toMatch(/^([0a-e])$/)
       expect(phase.title.length).toBeGreaterThan(4)
       expect(phase.blind.length, `phase ${phase.id} must state what it does not cover`).toBeGreaterThan(0)
       expect(Array.isArray(phase.checks)).toBe(true)

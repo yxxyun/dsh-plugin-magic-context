@@ -28,6 +28,7 @@ import type { AdapterStores } from '../core/stores.ts'
 import type { Journal } from '../core/journal.ts'
 import { REFERENCE_ANCHORS } from '../core/reference-seeds.ts'
 import type { PressurePolicy } from '../core/policy.ts'
+import type { CompartmentLease } from '../core/compartment-lease.ts'
 import type { LlmSeamMessage } from '../core/types.ts'
 import { errText } from '../core/types.ts'
 import { spanRequestMessages, type SessionSeq, type SurfaceNode } from './seams.ts'
@@ -131,6 +132,13 @@ export interface HistorianDeps {
     readonly compartmentStart: number | null
     readonly compartmentEnd: number | null
   }) => { readonly inserted: number; readonly skipped: number } | void
+  /**
+   * Cross-process lease on the compartment state. The in-process `inFlight`
+   * map below already serialises passes within this process; this covers the
+   * second process (an HMR remount, or another session on the same machine).
+   * Absent = no cross-process guard, which is what a test harness wants.
+   */
+  readonly lease?: CompartmentLease
 }
 
 /** The eligible span the historian would digest. */
@@ -514,7 +522,7 @@ export function planChunkSpans(
   for (let index = 0; index < nodes.length; index += 1) {
     const node = nodes[index] as SurfaceNode
     current.push(node)
-    acc += Math.max(1, Math.ceil(node.text.length / 4))
+    acc += estimateTokens(node.text)
     if (acc < target || groups.length >= count - 1) continue
     // TOOL-PAIRING at the chunk edges, not only at the span edges the scan above
     // guards: a chunk must not OPEN on a tool result (its assistant tool-call
@@ -584,7 +592,7 @@ export async function callHistorian(
   }
   const trigger = input.trigger ?? 'automatic'
   const spanTokens = input.nodes.reduce(
-    (total, node) => total + Math.max(1, Math.ceil(node.text.length / 4)),
+    (total, node) => total + estimateTokens(node.text),
     0,
   )
   const clock = deps.now ?? Date.now
@@ -994,6 +1002,28 @@ async function runHistorianExclusive(
   const now = deps.now?.() ?? Date.now()
   const first = range.nodes[0] as SurfaceNode
   const last = range.nodes[range.nodes.length - 1] as SurfaceNode
+  // Cross-process mutual exclusion, taken after the cheap range/budget gates so
+  // an ineligible session never touches the lease row. A blocker means another
+  // process is digesting this session right now: returning undefined is the same
+  // outcome as "nothing to do this pass" — the other writer will publish, and
+  // this session's next pass sees the result.
+  if (deps.lease !== undefined) {
+    const acquired = deps.lease.acquire(input.sessionId)
+    if (acquired === null) {
+      const blocker = deps.lease.blocker(input.sessionId)
+      deps.journal?.info(
+        'historian',
+        `historian skipped: another process holds the compartment lease`
+          + `${blocker === null ? '' : ` (pid ${String(blocker.ownerPid ?? '?')}, expires ${new Date(blocker.expiresAt).toISOString()})`}`,
+        {
+          phase: 'lease-blocked',
+          ...blocker === null ? {} : { holderId: blocker.holderId, ownerPid: blocker.ownerPid, expiresAt: blocker.expiresAt },
+        },
+        input.sessionId,
+      )
+      return undefined
+    }
+  }
   try {
     const draft = await callHistorian(deps, {
       sessionId: input.sessionId,
@@ -1086,6 +1116,11 @@ async function runHistorianExclusive(
       kind: classifyFailure(error),
     })
     throw error
+  } finally {
+    // Release on every exit path: success, thrown failure, and the early returns
+    // above. A failed release is safe — the row expires on its TTL — so this can
+    // never turn a completed digest into a failed one.
+    deps.lease?.release(input.sessionId)
   }
 }
 

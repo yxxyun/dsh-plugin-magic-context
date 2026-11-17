@@ -3,6 +3,7 @@
  * same name, MVP scope): live pressure, the pass decision it implies, and
  * the tag/reclaim ledger.
  */
+import { overheadFor } from '../core/token-estimate.ts'
 import type { Context } from '@deepseek-ai/cordis'
 import { decidePass, pressurePercent, pressureWindowTokens } from '../core/policy.ts'
 import type { PressurePolicy } from '../core/policy.ts'
@@ -63,6 +64,36 @@ export function registerCtxStatusCommand(ctx: Context, deps: StatusDeps): void {
       const unlanded = deps.stores.listUnlandedCompartments(sessionId)
       const baseline = deps.stores.baselineState(sessionId)
       const coveredTokens = compartments.reduce((total, compartment) => total + compartment.coveredTokens, 0)
+      // Work metrics: growth vs. peak context held. `ratio` is the share of the
+      // session's peak input that was actual new work; a low ratio means the
+      // window is mostly a re-read the cache already pays for.
+      let workLine = 'unavailable (no usage recorded)'
+      try {
+        const work = deps.stores.workMetrics(sessionId)
+        const ratio = work.totalInputTokens === 0
+          ? undefined
+          : work.newWorkTokens / work.totalInputTokens
+        workLine = `${String(work.newWorkTokens)} new-work tok vs `
+          + `${String(work.totalInputTokens)} peak input tok`
+          + `${ratio === undefined ? '' : ` (${(ratio * 100).toFixed(1)}% new)`}`
+      } catch (error) {
+        workLine = `read failed (${error instanceof Error ? error.message : String(error)})`
+      }
+      // Fixed overhead for the route in force: the term the window maths used to
+      // omit. The route comes from the newest usage row, which is the same route
+      // the next request will take unless the user switches models.
+      let overheadLine: string
+      try {
+        const routeKey = latest === undefined ? undefined : `${latest.provider}/${latest.model}`
+        const overhead = overheadFor(routeKey)
+        const window = pressureWindow
+        const share = window > 0 ? (overhead / window) * 100 : undefined
+        overheadLine = `${String(overhead)} tok`
+          + `${routeKey === undefined ? ' (route unknown; using the measured floor)' : ` on ${routeKey}`}`
+          + `${share === undefined ? '' : ` = ${share.toFixed(1)}% of the window`}`
+      } catch (error) {
+        overheadLine = `read failed (${error instanceof Error ? error.message : String(error)})`
+      }
       // Journal health: the validation-period at-a-glance check (the full
       // review lives in scripts/mc-report.mjs).
       let journalLine = '- journal: unavailable'
@@ -89,6 +120,17 @@ export function registerCtxStatusCommand(ctx: Context, deps: StatusDeps): void {
             + `${String((latest.cacheReadTokens ?? 0) + (latest.cacheWriteTokens ?? 0))}, `
             + `at ${new Date(latest.recordedAt).toISOString()})`}`,
         `- pass: ${decision.kind} (${decision.reason})`,
+        // Work metrics separate growth from re-reading. A session whose
+        // totalInput dwarfs newWork is spending its window on a stable prefix,
+        // which is exactly when a rebuild cannot pay for itself.
+        `- work: ${workLine}`,
+        // The fixed part of every request: system prompt + tool definitions +
+        // envelope. Measured per route (first-step prompt minus the first user
+        // message), and absent from every persisted document — so no character
+        // estimate can see it, and a window that ignores it looks emptier than it
+        // is. Shown as its own line rather than folded into the pressure reading,
+        // because the reading itself comes from the provider and is already exact.
+        `- fixed overhead: ${overheadLine}`,
         `- tool outputs: ${String(tagged.length)} tagged, ${String(dropped.length)} dropped as placeholders`,
         `- reclaim queue: ${pending.length === 0 ? 'empty' : pending.map(tag => `§${String(tag)}§`).join(', ')}`,
         `- historian: ${String(compartments.length)} compartment(s), ~${String(coveredTokens)} tokens digested`

@@ -58,6 +58,8 @@ export interface ProfileCandidateRow {
   readonly compartmentStart: number | null
   readonly compartmentEnd: number | null
   readonly createdAt: number
+  /** Last time a review pass judged this row; undefined until it has been seen. */
+  readonly reviewedAt?: number | null
 }
 
 /** One promoted profile row, as the render lane reads it (WP7/WP8). */
@@ -79,6 +81,13 @@ export interface ProfileWriter {
   expireCandidates(cutoffMs: number): number
   /** Consumption: drop exactly these candidate ids. Returns how many were dropped. */
   deleteCandidates(ids: readonly number[]): number
+  /**
+   * Stamp the candidates a review pass looked at, so the next pass moves on.
+   *
+   * Without this a "keep" verdict is a no-op that also blocks progress: the row
+   * stays, and stays at the front of the queue.
+   */
+  markCandidatesReviewed(ids: readonly number[], at: number): number
   /** The promoted profile, oldest first — the same order the render lane uses. */
   listActiveProfiles(): readonly ProfileRow[]
   /**
@@ -145,13 +154,24 @@ const INSERT_CANDIDATE = `
   ) VALUES(?, ?, ?, ?, ?)
 `
 
+/**
+ * Oldest-UNSEEN first.
+ *
+ * `reviewed_at` exists because a candidate the model answers "keep" for is not
+ * consumed — it stays until another session corroborates it. Ordering by
+ * `created_at` alone means those rows never leave the head of the queue: with 141
+ * waiting and a 12-row batch, the same 12 were offered on every run and the rest
+ * were unreachable. `COALESCE(reviewed_at, 0)` puts never-reviewed rows first,
+ * then the longest-waiting ones, so each pass works through the pool.
+ */
 const SELECT_CANDIDATES = `
   SELECT id, content, session_id AS sessionId,
          source_compartment_start AS compartmentStart,
          source_compartment_end AS compartmentEnd,
-         created_at AS createdAt
+         created_at AS createdAt,
+         reviewed_at AS reviewedAt
     FROM user_memory_candidates
-   ORDER BY created_at ASC, id ASC
+   ORDER BY COALESCE(reviewed_at, 0) ASC, created_at ASC, id ASC
    LIMIT ?
 `
 
@@ -187,6 +207,7 @@ export function openProfileWriter(options: ProfileWriterOptions): ProfileWriter 
       countCandidates: () => 0,
       expireCandidates: () => 0,
       deleteCandidates: () => 0,
+      markCandidatesReviewed: () => 0,
       listActiveProfiles: () => [],
       retireProfile: () => false,
       promoteProfile: () => undefined,
@@ -234,6 +255,7 @@ export function openProfileWriter(options: ProfileWriterOptions): ProfileWriter 
   const selectCandidates = db.prepare(SELECT_CANDIDATES)
   const countCandidates = db.prepare('SELECT COUNT(*) AS c FROM user_memory_candidates')
   const deleteCandidate = db.prepare('DELETE FROM user_memory_candidates WHERE id = ?')
+  const markReviewed = db.prepare('UPDATE user_memory_candidates SET reviewed_at = ? WHERE id = ?')
   const expireCandidates = db.prepare('DELETE FROM user_memory_candidates WHERE created_at < ?')
   const insertProfile = db.prepare(INSERT_PROFILE)
   const selectProfiles = db.prepare(SELECT_PROFILES)
@@ -296,6 +318,22 @@ export function openProfileWriter(options: ProfileWriterOptions): ProfileWriter 
       } catch {
         return 0
       }
+    },
+    markCandidatesReviewed: (ids, at) => {
+      if (ids.length === 0) return 0
+      let marked = 0
+      try {
+        // One statement per row: the ids come from the caller's last read, so
+        // some may already be gone (a concurrent expire or promotion). Updating
+        // one at a time lets the rest land instead of aborting the batch.
+        for (const id of ids) {
+          const result = markReviewed.run(at, id)
+          if (Number(result.changes) > 0) marked += 1
+        }
+      } catch (error) {
+        options.logger.warn(`magic-context candidate review stamp failed: ${errText(error)}`)
+      }
+      return marked
     },
     expireCandidates: (cutoffMs) => {
       try {

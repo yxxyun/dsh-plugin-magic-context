@@ -193,6 +193,20 @@ export interface MagicContextDshConfig {
      */
     vectorBackfill?: boolean
     /**
+     * Index the current project's git history on each maintenance tick
+     * (default on). Gives `ctx_search` a `git_commit` source: "when did this
+     * change", "what did that commit do". Off leaves commit queries answering
+     * that this deployment has no commit index.
+     */
+    indexCommits?: boolean
+    /**
+     * Cluster the questions observed in this project and promote the ones that
+     * recur across days into primers (default on). A primer with no answer yet is
+     * still reported by `ctx_search` — "we keep asking this and never wrote it
+     * down" is the state promotion exists to surface.
+     */
+    promotePrimers?: boolean
+    /**
      * Rows per maintenance tick for the vector backfill (default 24). Bounds how
      * much of the shared store one pass touches; the remaining gap is picked up
      * by the next tick.
@@ -219,6 +233,71 @@ export interface MagicContextDshConfig {
     intervalMs?: number
     verifyProvider?: string
     verifyModel?: string
+    /**
+     * Evaluate parked smart notes' declarative surface conditions on each tick
+     * (default on). Off leaves every smart note parked forever, which is only
+     * useful for isolating the note lane while debugging something else.
+     */
+    smartNotes?: boolean
+  }
+  /**
+   * Background tasks (the Dreamer lane).
+   *
+   * Schedules themselves live in the database (`dream_schedule`), not here: they
+   * are per-project state with a runtime history, and a config key would fight
+   * the table every boot. This block only carries the knobs that are global and
+   * static.
+   */
+  dream?: {
+    /**
+     * How old an importance score must be before `classify-memories` re-ranks
+     * it, in ms. Default two weeks.
+     *
+     * Not a freshness preference: importance is a RANK inside the current pool,
+     * so a project whose memory count has moved a lot needs re-ranking sooner
+     * than one that has not. Shorter costs more model calls for a ranking nobody
+     * needed yet.
+     */
+    classifyStaleAfterMs?: number
+    /** Memories per classify call (default 16). Larger batches risk a truncated
+     *  manifest and cost more per failure; smaller ones pay more per row. */
+    classifyBatchSize?: number
+    /**
+     * Memories per verify call (default 8).
+     *
+     * Smaller than classify's batch on purpose: a verify prompt carries the
+     * memory text AND the filesystem evidence under it, so each row costs several
+     * times what a score row costs, and a verdict is a bigger claim to get wrong.
+     */
+    verifyBatchSize?: number
+    /**
+     * `curate` writes by default only when this is explicitly `false`.
+     *
+     * Absent means dry run. Merging archives a source row and installs a
+     * machine-written replacement; neither is recoverable by the task, so the
+     * safe state has to be the default rather than a warning.
+     */
+    curateDryRun?: boolean
+    /** Cosine below which a pair is never offered to the model (default 0.92). */
+    curateSimilarityFloor?: number
+    /** Pairs examined per curate run (default 6). */
+    curateMaxPairs?: number
+    /** How far back a retrospective reads the journal (default 7 days). */
+    retrospectiveWindowMs?: number
+    /**
+     * Extra directory trees `verify` may search for the files a memory cites.
+     *
+     * Exists because work in one project routinely touches another repository,
+     * and a memory written here then cites `src/core/guard.ts` that lives over
+     * there. Without these roots every such reference reads as missing, the row
+     * can never be verified, and it sits in the pool forever.
+     *
+     * Point these at PARENT directories of your checkouts (`C:/data/code`), not
+     * at each project: the list is then stable for months instead of needing an
+     * edit every time a repository is cloned. Avoid a parent so large that the
+     * index hits its file ceiling — 20k source files is the cap.
+     */
+    verifyExtraRoots?: string[]
   }
   /**
    * Host-supplied CompactionEngine base class (in-tree glue injects it; when

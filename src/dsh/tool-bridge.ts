@@ -24,8 +24,17 @@ import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { Journal } from '../core/journal.ts'
 import type { MemoryWriter } from '../core/memory-write.ts'
 import { parseTagRanges } from '../core/policy.ts'
-import type { AdapterStores } from '../core/stores.ts'
+import type { AdapterStores, NoteRow } from '../core/stores.ts'
 import { searchMessageHistory, type SessionQueryLike } from '../core/message-search.ts'
+import type { GitCommitHit as CommitSearchHit } from '../core/git-commit-search.ts'
+import type { PrimerHit } from '../core/primer-search.ts'
+import { parseSearchDateRange, SearchDateRangeError } from '../core/date-range.ts'
+import {
+  nextSurfaceCheckAt,
+  parseSurfaceCondition,
+  resolveInsideRoot,
+  SurfaceConditionError,
+} from '../core/surface-condition.ts'
 import { previewText } from '../core/memory-search.ts'
 import {
   enumerateSurfaceNodes,
@@ -360,6 +369,13 @@ export interface MemoryToolRecallRequest {
    * whose `recall` callback has no session access use this as the scope.
    */
   readonly identity?: string
+  /**
+   * Inclusive epoch-ms bounds. Upstream exposes these as `ctx_search`'s
+   * `from`/`to` (YYYY-MM-DD); the lanes already honoured them, only the tool
+   * parameter was missing.
+   */
+  readonly from?: number
+  readonly to?: number
 }
 
 /** The run-context surface `ctx_memory` reads (structural subset of ToolRunContext). */
@@ -732,16 +748,17 @@ export function defineCtxMemoryTool(deps: MemoryToolDeps): unknown {
  *
  * Why one tool instead of three: the agent's question is "did we already
  * establish this somewhere", and the answer's source is an implementation
- * detail of where it was stored. Upstream MC unifies five lanes; three of its
- * sources have no DSH analogue (`git_commit` has no commit index here,
- * `primer` and `improvement` are dreamer artifacts that were deliberately not
- * ported), and `facts` is excluded upstream too — the injected m[0] block
- * already renders it, so searching it returns what the model is reading.
+ * detail of where it was stored. Upstream MC unifies five lanes and this adapter
+ * now answers all five — `memory`, `message`, `git_commit` (commit history,
+ * `core/git-commit-*`), `primer` (recurring-question Q&A, `core/primer-*`), and
+ * `note`. `improvement` remains a dreamer artifact that is deliberately not
+ * ported, and `facts` is excluded upstream too — the injected m[0] block already
+ * renders it, so searching it returns what the model is reading.
  *
  * Failure discipline: every lane is independent and reports its own state. A
  * disabled session index (the host ships `openAt: never`) must not fail the
- * whole call — memory and notes still answer, with one line saying history was
- * not searched and why.
+ * whole call — memory, commits and notes still answer, with one line saying
+ * history was not searched and why.
  */
 export interface SearchToolDeps {
   readonly defineTool: ToolBridgeDeps['defineTool']
@@ -759,9 +776,29 @@ export interface SearchToolDeps {
    * value captured at mount.
    */
   readonly sessionQueryOf?: (exec?: MemoryToolRunContext) => SessionQueryLike | undefined
+  /**
+   * Git commit search, when the lane is mounted. Absent = commits are not
+   * indexed, and the lane says so rather than pretending there are no matches.
+   */
+  readonly searchCommits?: (input: {
+    readonly projectPath: string
+    readonly query: string
+    readonly limit: number
+    readonly from?: number
+    readonly to?: number
+  }) => readonly CommitSearchHit[]
+  /**
+   * Primer search: "have we answered this before". Absent = no primer index in
+   * this deployment, which the lane reports rather than answering "never asked".
+   */
+  readonly searchPrimers?: (input: {
+    readonly projectPath: string
+    readonly query: string
+    readonly limit: number
+  }) => readonly PrimerHit[]
 }
 
-const SEARCH_SOURCES: readonly string[] = ['memory', 'message', 'note']
+const SEARCH_SOURCES: readonly string[] = ['memory', 'message', 'git_commit', 'primer', 'note']
 const DEFAULT_SEARCH_LIMIT = 8
 
 function normalizeSources(raw: unknown): readonly string[] {
@@ -793,19 +830,48 @@ export function defineCtxSearchTool(deps: SearchToolDeps): unknown {
   return defineTool<{
     readonly query: string
     readonly limit?: number
+    readonly from?: string
+    readonly to?: string
     readonly sources?: readonly string[]
   }>({
     name: 'ctx_search',
+    // Upstream's description is ~347 tokens and was written to a budget
+    // (prompt-surface-a1-golden.md:343). The local port had been shortened to
+    // ~126 tokens, which dropped the query-construction rule and every example
+    // — and an unguided model writes keyword stacks that retrieve badly, which
+    // is self-reinforcing: poor hits teach it not to search at all. Ported
+    // whole, with `git_commit` and `primer` now backed by real indexes
+    // (`core/git-commit-*`, `core/primer-*`); only `improvement` has no lane.
     description:
-      'Search across project memory, this session\'s earlier conversation (including turns the context '
-        + 'manager has since compacted or dropped), and pending notes. Use it when the answer may already '
-        + 'have been established earlier — a decision, a config value, a command that worked, a file you '
-        + 'touched — instead of re-deriving it or asking the user again. '
-        + 'sources accepts memory, message, note (default: all three). '
-        + 'History hits come back as event seqs: read them with ctx_expand or the session reader.',
+      'Search the archive — everything that ever happened in this project, not just what is on your desk. '
+        + 'Ask it whenever something feels familiar but is not in view, and before re-deriving anything '
+        + 'that may already be recorded here. '
+        + 'Retrieval matches meaning and exact words and fuses them, so phrase `query` as a natural-language '
+        + 'question that still carries the exact terms you expect in the answer (paths, symbols, config '
+        + 'keys, error strings); a bare keyword stack finds less. '
+        + '- "where is the opencode source code path?"  (a location you once knew) '
+        + '- "why did we choose SQLite over postgres?"  (a decision and its reasons) '
+        + '- "how does the dreamer lease work?"  (a mechanism discussed or implemented earlier) '
+        + '- Not: "upload client retry backoff config" '
+        + 'Results only contain what you CANNOT currently see — memories already in `<project-memory>` and '
+        + 'the live tail are filtered out. A query that is just memory ids (`#7234`, `12, 34`) resolves '
+        + 'them directly. '
+        + 'Sources (omit for all): '
+        + 'memory — rules, constraints, conventions; "what\'s our convention for X". '
+        + 'message — the raw conversation behind compacted history; "did we discuss this"; hits carry '
+        + 'event seqs for ctx_expand. '
+        + 'git_commit — the project\'s commit history; "when did this change", "what did that commit '
+        + 'do" (pair with message for regression hunts). '
+        + 'primer — reusable project Q&A distilled from questions asked repeatedly; "have we answered '
+        + 'this before". '
+        + 'note — parked follow-ups with their recorded text; "did we leave a follow-up". '
+        + 'Use from/to to restrict every source to an inclusive date range (YYYY-MM-DD, or a full ISO '
+        + 'datetime); a date-only `to` covers that whole day.',
     parameters: {
       query: { type: 'string', required: true },
       limit: { type: 'integer' },
+      from: { type: 'string' },
+      to: { type: 'string' },
       sources: { type: 'array', items: { type: 'string', enum: [...SEARCH_SOURCES] } },
     },
     output: {
@@ -832,6 +898,21 @@ export function defineCtxSearchTool(deps: SearchToolDeps): unknown {
       if (query.length === 0) {
         return { lines: [], empty: true, reason: 'ctx_search needs a query' }
       }
+      // An unparseable range is the caller's mistake, and returning it as a
+      // refusal (not "no results") keeps it from teaching the model that the
+      // corpus is empty for that period.
+      let range: { readonly from?: number; readonly to?: number }
+      try {
+        range = parseSearchDateRange(
+          typeof args.from === 'string' ? args.from : undefined,
+          typeof args.to === 'string' ? args.to : undefined,
+        )
+      } catch (error) {
+        if (error instanceof SearchDateRangeError) {
+          return { lines: [], empty: true, reason: error.message }
+        }
+        throw error
+      }
       const sources = normalizeSources(args.sources)
       const blocks: string[] = []
       const notes: string[] = []
@@ -852,6 +933,8 @@ export function defineCtxSearchTool(deps: SearchToolDeps): unknown {
             query,
             limit,
             identity,
+            ...range.from === undefined ? {} : { from: range.from },
+            ...range.to === undefined ? {} : { to: range.to },
             ...visible === undefined ? {} : { visibleMemoryIds: visible },
           })
           if (outcome.ok) {
@@ -881,6 +964,8 @@ export function defineCtxSearchTool(deps: SearchToolDeps): unknown {
           query,
           limit,
           ...live.size === 0 ? {} : { liveSeqs: live },
+          ...range.from === undefined ? {} : { from: range.from },
+          ...range.to === undefined ? {} : { to: range.to },
         })
         if (outcome.ok) {
           if (outcome.hits.length > 0) {
@@ -892,6 +977,61 @@ export function defineCtxSearchTool(deps: SearchToolDeps): unknown {
           notes.push('message history: the session index is disabled in this deployment (openAt: never)')
         } else {
           notes.push(`message: ${outcome.reason}`)
+        }
+      }
+
+      if (sources.includes('git_commit')) {
+        // Commit history answers "when did this change", which no other lane can:
+        // memory holds facts, history holds the conversation, and neither records
+        // the repository's own timeline.
+        const cwd = exec.agent?.session.header?.cwd
+        if (deps.searchCommits === undefined) {
+          notes.push('git_commit: this deployment has no commit index')
+        } else if (cwd === undefined) {
+          notes.push('git_commit: the session exposes no project directory')
+        } else {
+          const hits = deps.searchCommits({
+            projectPath: cwd,
+            query,
+            limit,
+            ...range.from === undefined ? {} : { from: range.from },
+            ...range.to === undefined ? {} : { to: range.to },
+          })
+          if (hits.length > 0) {
+            const rendered = hits.map((hit, index) =>
+              `[${String(index + 1)}] [git_commit] ${hit.shortSha} `
+              + `${new Date(hit.committedAtMs).toISOString().slice(0, 10)} `
+              + `score=${hit.score.toFixed(2)} ${hit.matchType}\n${previewText(hit.message)}`)
+            blocks.push(`Commit history (${String(hits.length)} hit${hits.length === 1 ? '' : 's'}):\n\n${rendered.join('\n\n')}`)
+          }
+        }
+      }
+
+      if (sources.includes('primer')) {
+        // Primers answer "have we answered this before" — a different question
+        // from the other lanes, and the only one whose absence is informative:
+        // a project with no primer for a recurring question is a project that
+        // keeps re-deriving the same answer.
+        const cwd = exec.agent?.session.header?.cwd
+        if (deps.searchPrimers === undefined) {
+          notes.push('primer: this deployment has no primer index')
+        } else if (cwd === undefined) {
+          notes.push('primer: the session exposes no project directory')
+        } else {
+          const hits = deps.searchPrimers({ projectPath: cwd, query, limit })
+          if (hits.length > 0) {
+            const rendered = hits.map((hit, index) => {
+              const answer = hit.answer.trim().length === 0
+                // An empty answer is a real state: the question recurs and nobody
+                // wrote it down. Saying so is more useful than hiding the hit.
+                ? '(asked repeatedly, no answer recorded yet)'
+                : previewText(hit.answer)
+              return `[${String(index + 1)}] [primer] id=#${String(hit.id)} `
+                + `support=${String(hit.totalSupport)} score=${hit.score.toFixed(2)} ${hit.matchType}\n`
+                + `Q: ${previewText(hit.question)}\nA: ${answer}`
+            })
+            blocks.push(`Primers (${String(hits.length)} hit${hits.length === 1 ? '' : 's'}):\n\n${rendered.join('\n\n')}`)
+          }
         }
       }
 
@@ -970,22 +1110,54 @@ export function defineCtxNoteTool(deps: NoteToolDeps): unknown {
     readonly action: string
     readonly content?: string
     readonly note_ids?: readonly number[]
+    readonly surface_condition?: string
+    readonly filter?: string
+    readonly limit?: number
+    readonly offset?: number
   }>({
     name: 'ctx_note',
     description:
       'Session notes are pending intentions: work you intend to return to, with its findings attached. '
-        + 'Write one when you park a thread mid-way and would lose its context. '
+        // The local port had kept only the negative half of upstream's guidance
+        // ("don't use notes for ...") and dropped the four positive triggers.
+        // A tool description made only of prohibitions teaches the model to
+        // avoid the tool: measured 2 calls in 56,090, one of them the smoke
+        // test that created the sole surviving note. Restored verbatim.
+        + 'Use notes for: '
+        + '- A finding to revisit when you return to the intended work. '
+        + '- A decision with its reasoning, when follow-up work remains. '
+        + '- A backlog item with evidence already found. '
+        + '- Something the user explicitly asks you to note. '
         + 'Do NOT use notes for: the next few steps (keep working), an active plan, a restart/crash '
         + 'cushion, or a plain record of how things stand that you do not intend to act on — that goes '
         + 'stale silently; a fact worth keeping is memory, the rest is nothing. '
         + 'Active work belongs in todos; if the detail already lives in a file, note the path instead '
         + 'of copying it; durable facts belong in ctx_memory. '
-        + 'Actions: write (content), read (optionally note_ids), update (note_ids exactly one + content), '
-        + 'dismiss (1..50 ids — a queue you never dismiss from stops being read).',
+        + 'The first line is the title (under 80 chars), followed by detail. '
+        + 'Actions: write (content), '
+        + 'read (one short row per note — `#id · age · title`, newest first; pass note_ids for full '
+        + 'bodies; filter all|active|pending|ready|dismissed selects a status, limit/offset page a long '
+        + 'queue), '
+        + 'update (note_ids exactly one + content), '
+        + 'dismiss (1..50 ids — retire a note when its work lands or is abandoned; a queue you never '
+        + 'dismiss from stops being read). '
+        // Smart notes: the declarative condition lane. Documented with the exact
+        // grammar because a condition that does not parse is rejected at write
+        // time, and the agent should not have to discover the set by trial.
+        + 'A note written with `surface_condition` is a SMART note: it stays parked and a maintenance '
+        + 'tick re-checks the condition, surfacing the note only when it holds. The condition is data, '
+        + 'not code — one of: file-exists(path), file-contains(path, text), git-head(sha-prefix), '
+        + 'git-tag-matches(regex), http-status(url, code), http-body-contains(url, text). Paths are '
+        + 'relative to the project root and may not escape it. Use this instead of asking the user to '
+        + 'remind you, when the thing you are waiting for is externally observable.',
     parameters: {
       action: { type: 'string', required: true, enum: ['write', 'read', 'update', 'dismiss'] },
       content: { type: 'string' },
       note_ids: { type: 'array', items: { type: 'integer' } },
+      surface_condition: { type: 'string' },
+      filter: { type: 'string', enum: ['all', 'active', 'pending', 'ready', 'dismissed'] },
+      limit: { type: 'integer' },
+      offset: { type: 'integer' },
     },
     output: {
       schema: { type: 'json' },
@@ -1028,13 +1200,47 @@ export function defineCtxNoteTool(deps: NoteToolDeps): unknown {
         const content = typeof args.content === 'string' ? args.content.trim() : ''
         if (content.length === 0) return finish({ reason: 'write needs content' })
         const anchor = deps.anchorOrdinalOf?.(exec)
+        // A smart note is parked until its condition holds. The condition is
+        // validated HERE, before the row exists: a malformed one must fail loudly
+        // at write time rather than park a note that can never wake.
+        const rawCondition = typeof args.surface_condition === 'string'
+          ? args.surface_condition.trim()
+          : ''
+        let smart: { source: string; nextCheckAt: number } | undefined
+        if (rawCondition.length > 0) {
+          if (cwd === undefined) {
+            return finish({ reason: 'a surface_condition needs a session with a project directory' })
+          }
+          try {
+            const parsed = parseSurfaceCondition(rawCondition)
+            // Paths are resolved now, not at check time: an escaping path is a
+            // write-time mistake and must not become a stored note.
+            for (const arg of parsed.kind.startsWith('file-') ? [parsed.args[0] as string] : []) {
+              resolveInsideRoot(cwd, arg)
+            }
+            smart = {
+              source: parsed.source,
+              nextCheckAt: nextSurfaceCheckAt(undefined, now),
+            }
+          } catch (error) {
+            if (error instanceof SurfaceConditionError) {
+              return finish({ reason: `surface_condition rejected: ${error.message}` })
+            }
+            throw error
+          }
+        }
         const row = deps.stores.createNote({
           content,
           ...sessionId === undefined ? {} : { sessionId },
           ...cwd === undefined ? {} : { projectPath: cwd },
           ...anchor === undefined ? {} : { anchorOrdinal: anchor },
+          ...smart === undefined ? {} : { surfaceCondition: smart.source, nextCheckAt: smart.nextCheckAt },
         }, now)
-        return finish({ outcome: `Saved note #${String(row.id)}.` })
+        return finish({
+          outcome: smart === undefined
+            ? `Saved note #${String(row.id)}.`
+            : `Saved smart note #${String(row.id)}, parked until: ${smart.source}`,
+        })
       }
 
       if (action === 'read') {
@@ -1052,12 +1258,45 @@ export function defineCtxNoteTool(deps: NoteToolDeps): unknown {
           }
           return finish({ lines })
         }
-        const rows = deps.stores.listNotes({
-          ...sessionId === undefined ? {} : { sessionId },
-          ...cwd === undefined ? {} : { projectPath: cwd },
-          status: 'open',
-          limit: NOTE_READ_LIMIT,
-        })
+        // `filter` here is upstream's note-read filter. `pending` and `ready`
+        // describe smart notes: a pending one is parked and not actionable, a
+        // ready one has woken and is exactly what the agent should read next.
+        const filter = typeof args.filter === 'string' ? args.filter : undefined
+        const status: 'open' | 'all' | NoteRow['status'] = (() => {
+          switch (filter) {
+            case 'all': return 'all'
+            case 'active': return 'active'
+            case 'dismissed': return 'dismissed'
+            case 'pending': return 'pending'
+            case 'ready': return 'ready'
+            // Default: live intentions plus anything that has woken. A ready
+            // smart note is the whole point of parking it, so hiding it from the
+            // default view would defeat the feature.
+            default: return 'open'
+          }
+        })()
+        const pageLimit = typeof args.limit === 'number' && Number.isInteger(args.limit)
+          ? Math.max(1, Math.min(100, args.limit))
+          : NOTE_READ_LIMIT
+        const pageOffset = typeof args.offset === 'number' && Number.isInteger(args.offset)
+          ? Math.max(0, args.offset)
+          : 0
+        const rows = status === 'all'
+          // 'all' spans dismissed rows too, which `listNotes` expresses as an
+          // absent status (no WHERE clause) rather than a status value.
+          ? deps.stores.listNotes({
+            ...sessionId === undefined ? {} : { sessionId },
+            ...cwd === undefined ? {} : { projectPath: cwd },
+            limit: pageLimit,
+            offset: pageOffset,
+          })
+          : deps.stores.listNotes({
+            ...sessionId === undefined ? {} : { sessionId },
+            ...cwd === undefined ? {} : { projectPath: cwd },
+            status,
+            limit: pageLimit,
+            offset: pageOffset,
+          })
         if (rows.length === 0) return finish({ lines: [] })
         const lines = rows.map(row => {
           const stale = now - row.createdAt > 30 * 24 * 3600 * 1000 ? ' (stale)' : ''
@@ -1065,6 +1304,11 @@ export function defineCtxNoteTool(deps: NoteToolDeps): unknown {
           const title = first.length > 80 ? `${first.slice(0, 79)}…` : first
           return `#${String(row.id)} · ${ageOf(now - row.createdAt)} · ${title}${stale}`
         })
+        // The footer only points at a next page when the page came back full:
+        // an offset past the end would otherwise advertise rows that do not exist.
+        if (rows.length >= pageLimit) {
+          lines.push('', `Next page: ctx_note(action="read", offset=${String(pageOffset + pageLimit)}).`)
+        }
         lines.push('', DISMISS_FOOTER)
         return finish({ lines })
       }

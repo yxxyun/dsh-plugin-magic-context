@@ -161,8 +161,16 @@ export async function autoStageGlobalCandidates(input: {
     try {
       const categories = JSON.stringify(enabled.flatMap(domain => [...domain.shareCategories]))
       scan = db.prepare(
+        // `shareable = 0` is the gate, NOT `scope = 'project'`.
+        //
+        // `scope` used to carry that meaning, and once classify began writing it
+        // the two collided: a row classified `ecosystem` left this candidate pool
+        // AND stayed invisible (shareable = 0), so nothing could ever reach it
+        // again. `shareable` is the field that actually decides visibility, so
+        // gating on it keeps "already shared" and "not yet shared" as the only
+        // two states and leaves `scope` free to describe the audience.
         `SELECT id, content, category FROM memories
-         WHERE status = 'active' AND scope = 'project' AND seen_count >= 2
+         WHERE status = 'active' AND shareable = 0 AND seen_count >= 2
            AND category IN (SELECT value FROM json_each(?))
            AND project_path NOT LIKE 'dir:global:%' AND project_path NOT LIKE 'git:global:%'
          ORDER BY updated_at DESC LIMIT 50`,

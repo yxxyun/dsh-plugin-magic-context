@@ -144,7 +144,10 @@ export const PROFILE_DDL = `
     session_id TEXT NOT NULL,
     source_compartment_start INTEGER,
     source_compartment_end INTEGER,
-    created_at INTEGER NOT NULL);
+    created_at INTEGER NOT NULL,
+    -- v14: last time a review pass judged this row. A "keep" verdict does not
+    -- consume the candidate, so without this the queue never advances.
+    reviewed_at INTEGER);
   CREATE INDEX idx_umc_created ON user_memory_candidates(created_at);
   CREATE TABLE user_memories(
     id INTEGER PRIMARY KEY,

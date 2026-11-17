@@ -81,7 +81,10 @@ import { createTelemetryService } from './dsh/telemetry.ts'
 import { createDashboardService } from './dsh/dashboard.ts'
 import { openMemoryLane } from './dsh/memory-lane.ts'
 import { injectReduceGuidance, preStepListener, type PreStepProjects } from './dsh/pre-step.ts'
-import { wireMaintenance } from './dsh/maintenance-wiring.ts'
+import { ensureDreamSchedules, runDueDreamTasks } from './core/dream-runner.ts'
+import { buildDreamHandlers } from './dsh/dream-handlers.ts'
+import { resolveDreamConfig } from './dsh/dream-config.ts'
+import { vectorBackfillEnabled, wireMaintenance } from './dsh/maintenance-wiring.ts'
 import { SWITCH_SNAPSHOT_META_KEY, buildSwitchSnapshot, diffSwitches } from './dsh/config-switches.ts'
 import { isQuotaExhaustedDetail, RouteHealth, type RouteChoice } from './core/route-health.ts'
 import type { MagicContextDshConfig, MagicContextDshConfigDefineTool } from './dsh/config.ts'
@@ -356,6 +359,186 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
   // panel scopes by — one registry, three consumers.
   const projects: PreStepProjects = { seenIdentities: new Set<string>(), sessionIdentity: new Map<string, string>() }
 
+  // ── Background tasks (phase 1: scheduler + promote-primers) ───────────────
+  // Projects the scheduler serves. Populated from the pre-step's identity
+  // resolution (the only place that knows `config.memory.project ?? cwd`), and
+  // used purely as a throttle: it stops a per-turn pre-step from re-writing
+  // schedule rows that already exist.
+  const dreamProjects = new Set<string>()
+  /** identity → the directory that produced it. The identity is a hash, so
+   *  this is the only route back to a path a task can read files from. */
+  const dreamRoots = new Map<string, string>()
+  const dreamLease = stores.dreamLease()
+  // `classify-memories` needs the route, and the route lives further down (it is
+  // set by the pre-step's per-turn note). The handler resolves it through this
+  // closure at RUN time, so the assignment order here does not matter and the
+  // task always follows the route the conversation is actually using.
+  /**
+   * Dream tunables, resolved at the start of each run.
+   *
+   * `config.dream` is a schemastery volatile reference: the reference is stable
+   * but its contents change when the settings form commits. Resolving here (per
+   * call) rather than once at mount is what makes an edit apply to the next run
+   * without a restart.
+   */
+  const readDreamConfig = () => resolveDreamConfig((config as { dream?: unknown }).dream)
+  const dreamHandlers = buildDreamHandlers({
+    ...lane.promotePrimers === undefined ? {} : { promotePrimers: lane.promotePrimers },
+    classify: {
+      ...memoryWriter === undefined ? {} : { writer: memoryWriter },
+      ...llm === undefined ? {} : { llm: llm as unknown as import('./core/classify-memories.ts').ClassifyLlm },
+      route: () => lastSessionRoute === undefined
+        ? undefined
+        : { provider: lastSessionRoute.provider, model: lastSessionRoute.model },
+      ...journal === undefined ? {} : { journal },
+      sessionId: 'mc-dreamer',
+      config: readDreamConfig,
+    },
+    verify: {
+      ...memoryWriter === undefined ? {} : { writer: memoryWriter },
+      ...llm === undefined ? {} : { llm: llm as unknown as import('./core/verify-memories.ts').VerifyLlm },
+      route: () => lastSessionRoute === undefined
+        ? undefined
+        : { provider: lastSessionRoute.provider, model: lastSessionRoute.model },
+      ...journal === undefined ? {} : { journal },
+      sessionId: 'mc-dreamer',
+      // Read at call time: the map is filled by the pre-step, which runs after
+      // this closure is built.
+      projectRootOf: (identity: string) => dreamRoots.get(identity),
+      config: readDreamConfig,
+    },
+    curate: {
+      ...memoryWriter === undefined ? {} : { writer: memoryWriter },
+      ...llm === undefined ? {} : { llm: llm as unknown as import('./core/curate-memories.ts').CurateLlm },
+      route: () => lastSessionRoute === undefined
+        ? undefined
+        : { provider: lastSessionRoute.provider, model: lastSessionRoute.model },
+      ...journal === undefined ? {} : { journal },
+      sessionId: 'mc-dreamer',
+      // Resolved per run: a vector backfill under a new model changes the
+      // dominant space, and a captured id would then compare nothing.
+      embeddingSpace: () => memorySearch?.dominantEmbeddingModel()?.modelId,
+      config: readDreamConfig,
+    },
+    retrospective: {
+      stores,
+      ...llm === undefined ? {} : { llm: llm as unknown as import('./core/retrospective.ts').RetrospectiveLlm },
+      route: () => lastSessionRoute === undefined
+        ? undefined
+        : { provider: lastSessionRoute.provider, model: lastSessionRoute.model },
+      ...journal === undefined ? {} : { journal },
+      sessionId: 'mc-dreamer',
+      config: readDreamConfig,
+    },
+    // Smart-note evaluation moved out of the fixed-interval sweep and into its
+    // own scheduled task, where upstream keeps it. Host-only: a note carries a
+    // declarative condition, so waking it is filesystem/git/http work.
+    smartNotes: { stores, journal },
+    // User-memory review as its own task, where upstream keeps it. Its candidate
+    // TTL expiry runs unconditionally, so the pool stays bounded even with no
+    // route.
+    reviewUserMemories: {
+      ...profileWriter === undefined ? {} : { profileWriter },
+      stores,
+      journal,
+      ...llm === undefined ? {} : { llm: llm as unknown as import('./core/profile-review.ts').ProfileReviewLlm },
+      route: () => lastSessionRoute === undefined
+        ? undefined
+        : { provider: lastSessionRoute.provider, model: lastSessionRoute.model },
+      config: readDreamConfig,
+    },
+    // The lanes moved off the fixed-interval sweep. All three read their switches
+    // per run (the `*Enabled` closures), so a settings change applies to the next
+    // run without a restart.
+    housekeeping: {
+      stores,
+      ...journal === undefined ? {} : { journal },
+      ...memoryWriter === undefined ? {} : { writer: memoryWriter },
+      ...llm === undefined ? {} : { llm: llm as unknown as { readonly stream: unknown } },
+      route: () => lastSessionRoute === undefined
+        ? undefined
+        : { provider: lastSessionRoute.provider, model: lastSessionRoute.model },
+      autoStageEnabled: () => liveBoolean(config.memory?.global?.machine?.autoStage, true),
+      ...lane.vectorBackfill === undefined ? {} : { vectorBackfill: lane.vectorBackfill },
+      vectorBackfillEnabled: () => vectorBackfillEnabled(config.memory),
+      vectorBackfillLimit: () => config.memory?.vectorBackfillLimit ?? 24,
+      ...lane.indexCommits === undefined ? {} : { indexCommits: lane.indexCommits },
+      indexCommitsEnabled: () => liveBoolean(config.memory?.indexCommits, true),
+      projectRootOf: (identity: string) => dreamRoots.get(identity),
+    },
+  })
+  /**
+   * How often the scheduler looks for due work.
+   *
+   * Five minutes, not one: cron has minute resolution but a task due at 04:17
+   * being picked up at 04:21 costs nothing, and a one-minute tick wakes the
+   * process (and takes a read lock) 1,440 times a day to find no work.
+   */
+  const DREAM_TICK_MS = 5 * 60 * 1000
+  let dreamTickInFlight = false
+  const dreamTick = (): void => {
+    // A slow task must not stack ticks behind it: the lease already prevents a
+    // second *process* from running the same task, this prevents this process
+    // from queueing runs of its own.
+    if (dreamTickInFlight) return
+    dreamTickInFlight = true
+    void runDueDreamTasks({
+      stores,
+      lease: dreamLease,
+      handlers: dreamHandlers,
+      log: (message, data) => {
+        try {
+          journal?.info('dream-run', message, data)
+        } catch {
+          /* the journal is diagnostics; never fail a tick for it */
+        }
+      },
+    })
+      .catch((error: unknown) => {
+        ctx.logger.warn(`magic-context: background-task tick failed: ${errText(error)}`)
+      })
+      .finally(() => {
+        dreamTickInFlight = false
+      })
+  }
+  const dreamTimer = setInterval(dreamTick, DREAM_TICK_MS)
+  // `unref` so a pending tick cannot hold the process open on shutdown; the
+  // interval is best-effort by nature and the next boot re-seeds from the table.
+  ;(dreamTimer as unknown as { unref?: () => void }).unref?.()
+  disposers.push(() => { clearInterval(dreamTimer) })
+
+  /**
+   * Register one project with the scheduler.
+   *
+   * Called from the pre-step's identity resolution — the only place that already
+   * knows `config.memory.project ?? session cwd`. The in-process set is the
+   * throttle: `ensureDreamSchedules` writes rows and a pre-step runs on every
+   * model step, so without it every step would open a write transaction.
+   *
+   * `root` is recorded even when the seeding is throttled: the identity is a hash
+   * for a plain directory, so the original spec is the only route back to a path
+   * the verify task can read files from.
+   */
+  const registerDreamProject = (projectIdentity: string, now: number, root?: string): void => {
+    if (root !== undefined) dreamRoots.set(projectIdentity, root)
+    if (dreamProjects.has(projectIdentity)) return
+    dreamProjects.add(projectIdentity)
+    try {
+      const { seeded } = ensureDreamSchedules(stores, projectIdentity, now)
+      if (seeded.length > 0) {
+        journal?.info('dream-seeded', `seeded ${String(seeded.length)} background-task schedules`, {
+          project: projectIdentity,
+          tasks: seeded,
+        })
+      }
+    } catch (error) {
+      // A scheduler that cannot seed its own rows must not fail the turn that
+      // happened to open the project.
+      dreamProjects.delete(projectIdentity)
+      ctx.logger.warn(`magic-context: dream schedule seeding failed: ${errText(error)}`)
+    }
+  }
+
   // Auto-search hint state: one hint per user turn (preStep runs per model step).
   const searchHints = new SearchHintTracker()
 
@@ -366,9 +549,19 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
   // signal is owned by real traffic and never persisted, so an externally
   // reset quota cannot be trapped by a stale guess.
   let lastSessionRoute: RouteChoice | undefined
+  /** Working directory of the most recent turn, for lanes that need a filesystem path. */
+  let lastSessionCwd: string | undefined
   const routeHealth = new RouteHealth()
 
   // ── §N§ tags + the pressure decision on the admitted user batch ───────────
+  // One lease for this process's lifetime. Creating it here (not per pass) keeps
+  // the holder id stable, so a lease this process already owns is renewed rather
+  // than fought over — the acquire path treats "same holder" as success.
+  const compartmentLease = stores.compartmentLease(
+    journal === undefined
+      ? {}
+      : { log: (sessionId: string, message: string) => journal.info('historian', message, {}, sessionId) },
+  )
   on(DSH_EVENTS.preStep, preStepListener({
     ctx,
     config,
@@ -380,10 +573,15 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
     projects,
     seenSessions,
     activePolicy,
+    lease: compartmentLease,
     /** Engine mount/unmount rides the step band: a form toggle applies without a restart. */
     reconcileEngine: () => reconcileEngine(),
     searchHints,
     noteSessionRoute: route => { lastSessionRoute = route },
+    noteSessionCwd: cwd => { lastSessionCwd = cwd },
+    /** Background-task seeding rides the pre-step: it is the only place holding both the identity and its path. */
+    ensureDreamSchedules: registerDreamProject,
+    ...lane.recordQuestion === undefined ? {} : { recordQuestion: lane.recordQuestion },
   }))
 
   // ── §N§ tags on tool results at landing (Phase 0) ─────────────────────────
@@ -401,7 +599,10 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
   })
 
   // ── Reduce guidance through the SystemPrompt service (MC parity) ──────────
-  injectReduceGuidance({ ctx, config, stores, journal, llm, reduceTracker, lane, projects, seenSessions, activePolicy })
+  injectReduceGuidance({
+    ctx, config, stores, journal, llm, reduceTracker, lane, projects, seenSessions, activePolicy,
+  })
+
 
   // ── Usage recording from durable assistant/message events (Phase 0) ───────
   on(DSH_EVENTS.sessionEvent, (session: Session, event: SessionEvent) => {
@@ -688,6 +889,10 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
         ...memoryRegistration?.visibleMemoryIdsOf === undefined
           ? {}
           : { visibleMemoryIdsOf: memoryRegistration.visibleMemoryIdsOf },
+        // The commit lane rides the same lane object as the memory registration:
+        // both read the corpus, and both are absent when it is unavailable.
+        ...lane.searchCommits === undefined ? {} : { searchCommits: lane.searchCommits },
+        ...lane.searchPrimers === undefined ? {} : { searchPrimers: lane.searchPrimers },
         sessionQueryOf,
       }))
       // ctx_note — the pending-intention queue (write/read/update/dismiss). The
@@ -901,6 +1106,9 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
     vectorBackfill: lane.vectorBackfill,
     routeHealth,
     lastSessionRoute: () => lastSessionRoute,
+    lastSessionCwd: () => lastSessionCwd,
+    ...lane.indexCommits === undefined ? {} : { indexCommits: lane.indexCommits },
+    ...lane.promotePrimers === undefined ? {} : { promotePrimers: lane.promotePrimers },
     projects,
     disposers,
     isDisposed: () => adapterDisposed,
@@ -1202,6 +1410,47 @@ export const Config = z.object({
   historian: z.object({
     provider: z.string().default('').volatile(),
     model: z.string().default('').volatile(),
+  }),
+
+  /**
+   * Background-task tunables (the dreamer lane).
+   *
+   * Declaring this block is safe, unlike `memory`: every field is optional in
+   * meaning, so a materialised `{}` changes nothing — `curateDryRun` still
+   * resolves to the dry run, and an empty `verifyExtraRoots` still means "search
+   * only the project root". Nothing here switches a subsystem on by existing.
+   *
+   * All volatile, and read through `resolveDreamConfig` at the START OF EACH
+   * RUN. A settings commit mutates the volatile reference in place and never
+   * remounts the fiber, so a value captured at mount would silently ignore the
+   * edit until the next restart — which is exactly the complaint this block
+   * exists to answer.
+   *
+   * Schedules are NOT here: they live in `dream_schedule`, per project, with a
+   * run history. A cron in config would fight the table on every boot.
+   */
+  dream: z.object({
+    /** Age at which an importance score is re-ranked (default 14 days). */
+    classifyStaleAfterMs: z.number().min(3_600_000).max(31_536_000_000).default(1_209_600_000).volatile(),
+    classifyBatchSize: z.number().min(1).max(200).default(16).volatile(),
+    verifyBatchSize: z.number().min(1).max(100).default(16).volatile(),
+    /** False is the ONLY value that lets curate write; true or absent = dry run. */
+    curateDryRun: z.boolean().default(true).volatile(),
+    curateSimilarityFloor: z.number().min(0).max(1).default(0.92).volatile(),
+    curateMaxPairs: z.number().min(1).max(50).default(6).volatile(),
+    retrospectiveWindowMs: z.number().min(3_600_000).max(31_536_000_000).default(604_800_000).volatile(),
+    /** Candidates per user-memory review call. Small on purpose: a large batch
+     *  makes the model think until it exhausts its output budget. */
+    profileReviewBatch: z.number().min(1).max(60).default(12).volatile(),
+    /**
+     * Extra trees `verify` may search for cited files, e.g. `C:/data/code`.
+     *
+     * Point these at PARENT directories of your checkouts, not at each project:
+     * the list then stays stable as repositories come and go. Keep each under
+     * the index's file ceiling (~20k source files) — a root that truncates makes
+     * real files read as missing.
+     */
+    verifyExtraRoots: z.array(z.string()).default([]).volatile(),
   }),
 
   journal: z.object({

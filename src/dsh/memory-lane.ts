@@ -11,6 +11,7 @@
  * "working". The explicit opt-out is `memory.enabled: false`; the corpus
  * defaults to beside the adapter store in the profile's dataDir.
  */
+import { DatabaseSync } from 'node:sqlite'
 import type { Context } from '@deepseek-ai/cordis'
 import { dirname, join } from 'node:path'
 import type { AdapterStores } from '../core/stores.ts'
@@ -20,7 +21,12 @@ import type { PressurePolicy } from '../core/policy.ts'
 import { machineDomainConfigOf } from './machine-domain-config.ts'
 import { openMemoryBridge, DEFAULT_SHARE_CATEGORIES, resolveIdentitySpec, type ActivePeerDomain } from '../core/memory-bridge.ts'
 import { openMemoryWriter, type MemoryWriter } from '../core/memory-write.ts'
-import { ensureOwnCorpusStore } from '../core/corpus-store.ts'
+import { ensureAdapterTables, ensureOwnCorpusStore } from '../core/corpus-store.ts'
+import { GIT_COMMIT_DDL } from '../core/git-commit-store.ts'
+import { searchGitCommits, type GitCommitHit } from '../core/git-commit-search.ts'
+import { indexCommitsForProject } from '../core/git-commit-indexer.ts'
+import { insertPrimerCandidates, PRIMER_DDL } from '../core/primer-store.ts'
+import { promotePrimerClusters, searchPrimers as searchPrimersImpl } from '../core/primer-search.ts'
 import { syncMachineDomain } from '../core/machine-domain.ts'
 import { openProfileWriter, type ProfileWriter } from '../core/profile-write.ts'
 import { planBackfill } from '../core/vector-lane.ts'
@@ -84,6 +90,71 @@ export interface MemoryLane {
   memoryScoring(identity: string): MemoryRecallScoring
   /** One wording for the writer's state (boot log + telemetry meta). */
   describeMemoryWrite(): string
+  /**
+   * Git commit search over the indexed history of one project.
+   *
+   * `undefined` when the corpus is unavailable — the `ctx_search` lane then
+   * reports that this deployment has no commit index, rather than returning an
+   * empty result that reads as "no such commit".
+   */
+  searchCommits:
+    | ((input: {
+      readonly projectPath: string
+      readonly query: string
+      readonly limit: number
+      readonly from?: number
+      readonly to?: number
+    }) => readonly GitCommitHit[])
+    | undefined
+  /**
+   * Index a project's git history. Returns undefined when the corpus is
+   * unavailable. Called from the maintenance tick, never from the request path:
+   * a `git log` over a long history would otherwise delay the turn.
+   */
+  indexCommits:
+    | ((input: {
+      readonly projectPath: string
+      readonly embedLimit?: number
+      readonly readLimit?: number
+    }) => Promise<import('../core/git-commit-indexer.ts').IndexCommitsResult | undefined>)
+    | undefined
+  /** Primer search over the active primers of one project. */
+  searchPrimers:
+    | ((input: {
+      readonly projectPath: string
+      readonly query: string
+      readonly limit: number
+    }) => readonly import('../core/primer-search.ts').PrimerHit[])
+    | undefined
+  /**
+   * Record one observed user question as primer evidence.
+   *
+   * Cheap by design (one upsert, no embedding on the request path): the vector is
+   * filled later by whoever can afford it. A question is only recorded when it
+   * LOOKS like one — the caller decides, because "is this a question" needs the
+   * surrounding text and this lane only sees the string.
+   */
+  recordQuestion:
+    | ((input: {
+      readonly projectPath: string
+      readonly sessionId: string
+      readonly question: string
+      readonly sourceMessageTime: number
+      readonly sourceStartMessageId: string
+      readonly sourceEndMessageId: string
+      readonly sourceCompartmentStart?: number | null
+      readonly sourceCompartmentEnd?: number | null
+    }) => number | undefined)
+    | undefined
+  /**
+   * Cluster this project's observed questions and promote the ones that recur.
+   * Returns undefined when the corpus is unavailable.
+   */
+  promotePrimers:
+    | ((input: {
+      readonly projectPath: string
+    }) => { readonly created: readonly number[]; readonly refreshed: readonly number[] } | undefined)
+    | undefined
   /** The `defineCtxMemoryTool` deps object (identity resolution + recall + search). */
   ctxMemoryRegistration(input: {
     activePolicy: () => PressurePolicy
@@ -157,6 +228,15 @@ export function openMemoryLane(
       } catch {
         // best effort only — the meta row is observability, not a gate
       }
+    }
+    // The chunk table is the adapter's own addition, so it must be laid down on
+    // an INHERITED corpus too — `ensureOwnCorpusStore` returns 'exists' for a
+    // non-empty file and never touches it, which would leave `memory_chunks`
+    // absent forever on this install. Fail-open: the vector lane reports its own
+    // reason when the table is missing.
+    const additions = ensureAdapterTables(target)
+    if (additions.outcome !== 'ready') {
+      ctx.logger.warn(`magic-context dsh adapter: chunk table unavailable (${additions.detail ?? 'unknown'})`)
     }
   }
   // WP10 projection at MOUNT: the machine domain row's existence and enabled
@@ -533,12 +613,194 @@ export function openMemoryLane(
     }
   }
 
+  // ── git commit lane ───────────────────────────────────────────────────────
+  // Both entry points need the corpus database, which the writer already holds.
+  // They are undefined when the writer is unavailable: a commit lane without a
+  // writable corpus could read but never index, which would report stale hits as
+  // if they were current.
+  // The commit lane opens its OWN connection to the corpus rather than reaching
+  // into the writer's handle: `MemoryWriter` deliberately exposes only `dbPath`,
+  // and widening that interface to hand out a raw database would let any caller
+  // bypass the writer's fence checks. One extra connection to a WAL database is
+  // cheap and keeps the fence surface unchanged.
+  let commitDbHandle: import('node:sqlite').DatabaseSync | undefined
+  let commitDbPath: string | undefined
+  const commitDb = (): import('node:sqlite').DatabaseSync | undefined => {
+    if (memoryWriter === undefined) return undefined
+    const path = memoryWriter.dbPath
+    if (commitDbHandle !== undefined && commitDbPath === path) return commitDbHandle
+    try {
+      commitDbHandle?.close()
+    } catch {
+      /* the previous handle is already gone */
+    }
+    try {
+      commitDbHandle = new DatabaseSync(path)
+      commitDbHandle.exec('PRAGMA busy_timeout = 5000')
+      commitDbPath = path
+      return commitDbHandle
+    } catch {
+      commitDbHandle = undefined
+      commitDbPath = undefined
+      return undefined
+    }
+  }
+
+  const searchCommits = memoryWriter === undefined
+    ? undefined
+    : (input: {
+      readonly projectPath: string
+      readonly query: string
+      readonly limit: number
+      readonly from?: number
+      readonly to?: number
+    }): readonly GitCommitHit[] => {
+      const db = commitDb()
+      if (db === undefined) return []
+      // The vector lane is best-effort: a query without an embedding still gets
+      // the FTS and LIKE lanes, which is what makes a short or symbol-heavy query
+      // work at all.
+      let queryEmbedding: Float32Array | null = null
+      try {
+        if (embedder !== undefined) {
+          const [vector] = embedder.embed([input.query]) as unknown as [Float32Array | undefined]
+          queryEmbedding = vector ?? null
+        }
+      } catch {
+        queryEmbedding = null
+      }
+      return searchGitCommits(db, input.projectPath, input.query, {
+        limit: input.limit,
+        ...input.from === undefined ? {} : { from: input.from },
+        ...input.to === undefined ? {} : { to: input.to },
+        queryEmbedding,
+        queryModelId: queryEmbedding === null ? null : embedder?.modelId ?? null,
+      })
+    }
+
+  const indexCommits = memoryWriter === undefined
+    ? undefined
+    : async (input: {
+      readonly projectPath: string
+      readonly embedLimit?: number
+      readonly readLimit?: number
+    }): Promise<import('../core/git-commit-indexer.ts').IndexCommitsResult | undefined> => {
+      const db = commitDb()
+      if (db === undefined) return undefined
+      // Lay the three tables down on first use: they are the adapter's own
+      // additions, so an inherited corpus does not have them yet.
+      try {
+        db.exec(GIT_COMMIT_DDL)
+      } catch {
+        return undefined
+      }
+      return indexCommitsForProject({
+        db,
+        projectPath: input.projectPath,
+        ...input.readLimit === undefined ? {} : { readLimit: input.readLimit },
+        ...input.embedLimit === undefined ? {} : { embedLimit: input.embedLimit },
+        ...embedder === undefined
+          ? {}
+          : {
+            modelId: embedder.modelId,
+            embed: (texts: readonly string[]) => embedder.embed(texts),
+          },
+        log: (message: string) => ctx.logger.info(message),
+      })
+    }
+
+  const searchPrimers = memoryWriter === undefined
+    ? undefined
+    : (input: {
+      readonly projectPath: string
+      readonly query: string
+      readonly limit: number
+    }): readonly import('../core/primer-search.ts').PrimerHit[] => {
+      const db = commitDb()
+      if (db === undefined) return []
+      let queryEmbedding: Float32Array | null = null
+      try {
+        if (embedder !== undefined) {
+          const [vector] = embedder.embed([input.query]) as unknown as [Float32Array | undefined]
+          queryEmbedding = vector ?? null
+        }
+      } catch {
+        queryEmbedding = null
+      }
+      return searchPrimersImpl(db, input.projectPath, input.query, {
+        limit: input.limit,
+        queryEmbedding,
+        queryModelId: queryEmbedding === null ? null : embedder?.modelId ?? null,
+      })
+    }
+
+  const recordQuestion = memoryWriter === undefined
+    ? undefined
+    : (input: {
+      readonly projectPath: string
+      readonly sessionId: string
+      readonly question: string
+      readonly sourceMessageTime: number
+      readonly sourceStartMessageId: string
+      readonly sourceEndMessageId: string
+      readonly sourceCompartmentStart?: number | null
+      readonly sourceCompartmentEnd?: number | null
+    }): number | undefined => {
+      const db = commitDb()
+      if (db === undefined) return undefined
+      try {
+        db.exec(PRIMER_DDL)
+      } catch {
+        return undefined
+      }
+      try {
+        const ids = insertPrimerCandidates(db, [{
+          projectPath: input.projectPath,
+          harness: 'dsh',
+          sessionId: input.sessionId,
+          question: input.question,
+          sourceMessageTime: input.sourceMessageTime,
+          sourceStartMessageId: input.sourceStartMessageId,
+          sourceEndMessageId: input.sourceEndMessageId,
+          sourceCompartmentStart: input.sourceCompartmentStart ?? null,
+          sourceCompartmentEnd: input.sourceCompartmentEnd ?? null,
+        }])
+        return ids[0]
+      } catch (error) {
+        // Recording evidence must never fail a turn.
+        ctx.logger.warn(`magic-context question record failed: ${error instanceof Error ? error.message : String(error)}`)
+        return undefined
+      }
+    }
+
+  const promotePrimers = memoryWriter === undefined
+    ? undefined
+    : (input: { readonly projectPath: string }): { readonly created: readonly number[]; readonly refreshed: readonly number[] } | undefined => {
+      const db = commitDb()
+      if (db === undefined) return undefined
+      try {
+        db.exec(PRIMER_DDL)
+      } catch {
+        return undefined
+      }
+      try {
+        return promotePrimerClusters(db, input.projectPath)
+      } catch (error) {
+        ctx.logger.warn(`magic-context primer promotion failed: ${error instanceof Error ? error.message : String(error)}`)
+        return undefined
+      }
+    }
+
   return {
     memoryEnabled,
     memorySettings,
     memoryRecall,
     memoryWriter,
-    profileWriter,
+    searchCommits,
+    indexCommits,
+    searchPrimers,
+    recordQuestion,
+    promotePrimers,    profileWriter,
     vectorBackfill,
     memorySearch,
     visibleMemoryIdsBySession,

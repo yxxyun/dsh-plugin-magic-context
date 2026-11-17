@@ -78,8 +78,14 @@ export function buildSearchHint(
   const header = lines.length === 1
     ? 'Your memory may contain 1 related fragment:'
     : `Your memory may contain ${String(lines.length)} related fragments:`
-  const footer = 'If the fragments above seem relevant to the current request, you may run ctx_memory '
-    + 'with action "search" to retrieve full context. Otherwise ignore.'
+  // Upstream's footer names `ctx_search` (auto-search-hint.ts). The local port
+  // had rewritten it to `ctx_memory with action "search"` — but ctx_search is
+  // registered as its own tool here too, so the footer pointed at an action
+  // that tool does not have. Measured cost of that mismatch: of 1,464 steps
+  // that followed a fired hint, 8 (0.55%) reached a search tool, against a
+  // 0.14% baseline — a hint that costs more to decode than to act on.
+  const footer = 'If the fragments above seem relevant to the current request, you may run ctx_search '
+    + 'to retrieve full context. Otherwise ignore.'
   const body = [header, ...lines.map(line => `- ${line}`), footer].join('\n')
   const wrapped = `<ctx-search-hint>\n${body}\n</ctx-search-hint>`
   if (wrapped.length <= HINT_MAX_CHARS) return wrapped

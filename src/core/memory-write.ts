@@ -42,6 +42,7 @@ import { existsSync } from 'node:fs'
 import { MEMORY_SCHEMA_MAX_VERSION, normalizeMemoryContent } from './memory-bridge.ts'
 import { V2_MEMORY_CATEGORIES, isPromotableCategory, resolveExpiresAt, resolveHistorianExpiresAt } from './memory-categories.ts'
 import { errText } from './types.ts'
+import { assessShareability } from './shareable-guard.ts'
 
 /** MC's `normalize-hash.ts`: md5 of the whitespace/case-normalized content. */
 export function normalizedMemoryHash(content: string): string {
@@ -107,6 +108,15 @@ export interface MemoryRecord {
   readonly supersededByMemoryId: number | null
   readonly mergedFrom: string | null
   readonly metadataJson: string | null
+  /**
+   * When the importance score was last banked, or null if it never was.
+   *
+   * Exposed because `classify-memories` needs to tell "never scored" apart from
+   * "scored before the pool grew": the verification sweep only scores rows it
+   * verifies, so a row that was verified a year ago keeps its score forever even
+   * as the memories around it change what "important" means.
+   */
+  readonly classifiedAt: number | null
 }
 
 export type MemoryWriteFailureReason =
@@ -114,6 +124,10 @@ export type MemoryWriteFailureReason =
   | 'unavailable'
   | 'invalid-argument'
   | 'invalid-category'
+  /** The text carries a credential, a local path or a local endpoint, so it must
+   *  not enter the shared store. Distinct from `invalid-category` so a caller can
+   *  tell "wrong shape" from "this material cannot leave the machine". */
+  | 'shareable-check-failed'
   | 'empty-content'
   /** `source_type = 'user'` is reserved for the dashboard (contract §1.3). */
   | 'source-type-reserved'
@@ -248,6 +262,22 @@ export interface ListMemoriesOptions {
    * outside the window unreachable.
    */
   readonly unverifiedOnly?: boolean
+  /**
+   * Keep only rows whose importance score is older than this epoch instant, or
+   * that were never scored at all.
+   *
+   * This is the `classify-memories` window, and it is deliberately NOT the
+   * unverified pool: the verification sweep scores the rows it verifies, so
+   * those all carry a score from the moment they were judged. What goes stale is
+   * the rest — a memory scored when the project had 40 rows is ranked against a
+   * pool that may now hold 400, and "important" means something different. A
+   * re-read of the whole pool on a schedule is the only way that score keeps
+   * describing the pool it is ranked in.
+   *
+   * Filtered in SQL for the same reason as `unverifiedOnly`: a fixed render
+   * window would keep returning the same already-fresh rows.
+   */
+  readonly classificationStaleBefore?: number
 }
 
 /** The v2 taxonomy is the only category set the agent write path accepts (§3.1). */
@@ -423,7 +453,22 @@ export interface MemoryWriter {
    */
   classifyMemories(
     identity: string,
-    entries: ReadonlyArray<{ readonly id: number; readonly importance: number }>,
+    entries: ReadonlyArray<{
+      readonly id: number
+      readonly importance: number
+      /**
+       * The sharing judgement, applied ONLY to rows that are still private.
+       *
+       * `scope` is the audience and `shareable` the gate; a row already carrying
+       * `shareable = 1` is skipped entirely by the sharing statement, so a later
+       * re-score cannot withdraw a publication or widen one.
+       */
+      readonly shareable?: boolean
+      readonly scope?: 'project' | 'ecosystem' | 'universe'
+      /** Pre-computed verdict from `shareable-guard`. When false, the writer
+       *  forces `shareable = 0` regardless of what the entry asked for. */
+      readonly blocked?: boolean
+    }>,
     classifiedAt: number,
   ): number
   /**
@@ -443,6 +488,43 @@ export interface MemoryWriter {
   }): void
   /** Remembered skip hashes for the given rows (content-hash keyed). */
   verifySkipHashes(identity: string, ids: readonly number[]): ReadonlyMap<number, string>
+  /**
+   * Maintenance/curate: live rows of one project that carry a vector in
+   * `modelId`'s space, newest first.
+   *
+   * The consolidation task's whole job is finding pairs of memories that say the
+   * same thing, and a vector is the only signal that catches a duplicate phrased
+   * differently. Rows with no vector are simply absent — the task then reports
+   * "nothing to compare" rather than falling back to text matching, because a
+   * hash-equal pair never reaches it at all (dedup already refused that insert).
+   */
+  listVectors(
+    identity: string,
+    modelId: string,
+    limit?: number,
+  ): ReadonlyArray<{
+    readonly id: number
+    readonly category: string
+    readonly content: string
+    readonly importance: number
+    readonly seenCount: number
+    readonly createdAt: number
+    readonly embedding: Float32Array
+  }>
+  /**
+   * Maintenance/curate: remember that the curator could not decide a row
+   * (`skip`). Metadata only, same shape and reasoning as
+   * {@link recordVerifySkip}: a pair the model declined is not re-asked every
+   * run, and an edit re-opens it because the key is the content hash.
+   */
+  recordCurateSkip(input: {
+    readonly identity: string
+    readonly id: number
+    readonly contentHash: string
+    readonly at: number
+  }): void
+  /** Remembered curate skip hashes for the given rows (content-hash keyed). */
+  curateSkipHashes(identity: string, ids: readonly number[]): ReadonlyMap<number, string>
   close(): void
 }
 
@@ -528,7 +610,8 @@ const MEMORY_SELECT_COLUMNS = `
   memories.verified_at AS verifiedAt,
   memories.superseded_by_memory_id AS supersededByMemoryId,
   memories.merged_from AS mergedFrom,
-  memories.metadata_json AS metadataJson
+  memories.metadata_json AS metadataJson,
+  memories.classified_at AS classifiedAt
 `
 
 /** The 21-value agent INSERT (§11.1): 13 bound parameters, the rest literals. */
@@ -610,6 +693,25 @@ const CLASSIFY_MEMORY = `
    WHERE project_path = ? AND id = ? AND status IN ('active','permanent')
 `
 
+/**
+ * The sharing half of a classification, deliberately a SEPARATE statement.
+ *
+ * Two reasons it cannot be folded into {@link CLASSIFY_MEMORY}:
+ *
+ *  - importance must be re-banked on every row on its own schedule, while the
+ *    sharing decision must never touch a row that is already shared (that row's
+ *    visibility was decided when it was published, and a later re-score must not
+ *    quietly withdraw or widen it);
+ *  - `AND shareable = 0` is the whole guard, and it has to apply to the sharing
+ *    columns only. Putting it on the combined statement would silently freeze the
+ *    importance of every shared row.
+ */
+const CLASSIFY_SHARING = `
+  UPDATE memories SET shareable = ?, scope = ?
+   WHERE project_path = ? AND id = ? AND status IN ('active','permanent')
+     AND shareable = 0
+`
+
 /** Merge target (canonical) aggregation (§11.4). */
 const MERGE_MEMORY_TARGET = `
   UPDATE memories
@@ -658,10 +760,21 @@ export function sharingToRestore(row: { readonly shareable: number } | undefined
 }
 
 /** `list` (§11.6): injectable rows of one project, in MC's render order. */
-const listMemoriesSql = (unverifiedOnly: boolean, recurrenceFirst = false): string =>
+const listMemoriesSql = (
+  unverifiedOnly: boolean,
+  recurrenceFirst = false,
+  classificationStaleBefore?: number,
+): string =>
   `SELECT ${MEMORY_SELECT_COLUMNS} FROM memories
    WHERE project_path = ? AND status IN ('active','permanent') AND (expires_at IS NULL OR expires_at > ?)`
   + (unverifiedOnly ? ` AND verification_status = 'unverified'` : '')
+  + (classificationStaleBefore === undefined
+    ? ''
+    // Bound as a parameter, not interpolated: the cutoff moves every run, and
+    // splintering the prepared-statement cache by timestamp would prepare a new
+    // statement for every tick. NULL sorts first in SQLite's default comparison,
+    // which is exactly right — "never scored" is the stalest possible state.
+    : " AND (classified_at IS NULL OR classified_at <= ?)")
   + (recurrenceFirst
     ? // Sweep-internal order, maintenance only — the §11.6 render order above is
       // untouched. A fact re-derived across sessions (seen_count ≥ 2) is the
@@ -672,11 +785,17 @@ const listMemoriesSql = (unverifiedOnly: boolean, recurrenceFirst = false): stri
 
 const LIST_MEMORIES = listMemoriesSql(false)
 
+
 /** Candidates for the maintenance sweep: the ORDER BY window stays the same,
  * but the unverified filter is applied BEFORE the limit, so verification
  * progress always advances through the whole project — and recurrence jumps
  * the queue (see listMemoriesSql). */
 const LIST_MEMORIES_UNVERIFIED = listMemoriesSql(true, true)
+
+/** The `classify-memories` window: rows whose score is stale, recurrence first
+ *  so a fact the project keeps re-deriving is re-ranked before a one-off. The
+ *  cutoff is the one bound parameter (see `classificationStaleBefore`). */
+const LIST_MEMORIES_CLASSIFY_STALE = listMemoriesSql(false, true, 0)
 
 // (The 2026-10-13 corpus cutover removed the module-managed authority guard:
 //  the own corpus carries no authority tables and no Rust module exists —
@@ -703,12 +822,16 @@ function mergeArchiveMetadata(raw: string | null, reason: string): string {
 
 /** Parse a `merged_from` JSON array of ids, tolerating NULL/malformed values. */
 /**
- * Merge a remembered verify skip into `metadata_json` (`{verify_skip:{hash,at}}`),
- * exactly like {@link mergeArchiveMetadata}: a malformed object is replaced by a
- * fresh one rather than propagated. A skip is bookkeeping, so it must never
- * break the row it annotates.
+ * Merge a remembered skip into `metadata_json` (`{<key>:{hash,at}}`), exactly
+ * like {@link mergeArchiveMetadata}: a malformed object is replaced by a fresh
+ * one rather than propagated. A skip is bookkeeping, so it must never break the
+ * row it annotates.
+ *
+ * Keyed rather than fixed because two lanes now remember skips — the verify
+ * sweep (`verify_skip`) and the curator (`curate_skip`) — and a shared key would
+ * let one lane's refusal silence the other's question.
  */
-function mergeVerifySkipMetadata(raw: string | null, contentHash: string, at: number): string {
+function mergeSkipMetadata(raw: string | null, key: string, contentHash: string, at: number): string {
   let base: Record<string, unknown> = {}
   if (raw !== null) {
     try {
@@ -720,22 +843,41 @@ function mergeVerifySkipMetadata(raw: string | null, contentHash: string, at: nu
       // A malformed object is discarded, not propagated.
     }
   }
-  return JSON.stringify({ ...base, verify_skip: { hash: contentHash, at } })
+  return JSON.stringify({ ...base, [key]: { hash: contentHash, at } })
 }
 
 /** The remembered skip hash in `metadata_json`, when one is well-formed. */
-function parseVerifySkipHash(raw: string | null): string | undefined {
+function parseSkipHash(raw: string | null, key: string): string | undefined {
   if (raw === null) return undefined
   try {
     const parsed: unknown = JSON.parse(raw)
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
-    const skip = (parsed as { verify_skip?: unknown }).verify_skip
+    const skip = (parsed as Record<string, unknown>)[key]
     if (typeof skip !== 'object' || skip === null || Array.isArray(skip)) return undefined
     const hash = (skip as { hash?: unknown }).hash
     return typeof hash === 'string' && hash.length > 0 ? hash : undefined
   } catch {
     return undefined
   }
+}
+
+const VERIFY_SKIP_KEY = 'verify_skip'
+const CURATE_SKIP_KEY = 'curate_skip'
+
+function mergeVerifySkipMetadata(raw: string | null, contentHash: string, at: number): string {
+  return mergeSkipMetadata(raw, VERIFY_SKIP_KEY, contentHash, at)
+}
+
+function parseVerifySkipHash(raw: string | null): string | undefined {
+  return parseSkipHash(raw, VERIFY_SKIP_KEY)
+}
+
+function mergeCurateSkipMetadata(raw: string | null, contentHash: string, at: number): string {
+  return mergeSkipMetadata(raw, CURATE_SKIP_KEY, contentHash, at)
+}
+
+function parseCurateSkipHash(raw: string | null): string | undefined {
+  return parseSkipHash(raw, CURATE_SKIP_KEY)
 }
 
 function parseMergedFrom(raw: string | null): number[] {
@@ -805,6 +947,9 @@ export function openMemoryWriter(options: MemoryWriterOptions): MemoryWriter {
       classifyMemories: () => 0,
       recordVerifySkip: () => undefined,
       verifySkipHashes: () => new Map<number, string>(),
+      listVectors: () => [],
+      recordCurateSkip: () => undefined,
+      curateSkipHashes: () => new Map<number, string>(),
       recordRetrieval: () => noTelemetry,
       close: () => undefined,
     }
@@ -925,6 +1070,8 @@ export function openMemoryWriter(options: MemoryWriterOptions): MemoryWriter {
     const listMemoriesLimited = db.prepare(`${LIST_MEMORIES} LIMIT ?`)
     const listUnverifiedAll = db.prepare(LIST_MEMORIES_UNVERIFIED)
     const listUnverifiedLimited = db.prepare(`${LIST_MEMORIES_UNVERIFIED} LIMIT ?`)
+    const listClassifyStaleAll = db.prepare(LIST_MEMORIES_CLASSIFY_STALE)
+    const listClassifyStaleLimited = db.prepare(`${LIST_MEMORIES_CLASSIFY_STALE} LIMIT ?`)
     // Content changes invalidate the classify/verify artefacts (§4.5). Both
     // tables are absent on trimmed databases, hence the table guard.
     const deleteEmbeddings = tables.has('memory_embeddings')
@@ -1188,6 +1335,20 @@ export function openMemoryWriter(options: MemoryWriterOptions): MemoryWriter {
         }
         if (input.identity.trim().length === 0) {
           return refusal('publish-domain', 'invalid-argument', 'Error: a domain memory needs an identity.')
+        }
+        // The shareability gate, at the one place a memory becomes visible to
+        // other projects. This is the last line, not the first: callers upstream
+        // of it also screen, but a row reaching the shared store with a local
+        // path or a credential in it cannot be un-shared from the other
+        // projects' context, so the write itself refuses.
+        const shareability = assessShareability(content)
+        if (!shareability.safe) {
+          return refusal(
+            'publish-domain',
+            'shareable-check-failed',
+            `Error: this memory is not safe to share (${String(shareability.refusal)}: `
+              + `${shareability.fragment ?? 'unscannable'}). Remove the local path, endpoint or credential first.`,
+          )
         }
         if (corpusFenced) return fenceRefusal('publish-domain')
         const hash = normalizedMemoryHash(content)
@@ -1600,13 +1761,22 @@ export function openMemoryWriter(options: MemoryWriterOptions): MemoryWriter {
         try {
           const cutoff = listOptions?.now ?? now()
           const limit = listOptions?.limit
-          const all = listOptions?.unverifiedOnly === true ? listUnverifiedAll : listMemoriesAll
-          const limited = listOptions?.unverifiedOnly === true ? listUnverifiedLimited : listMemoriesLimited
-          if (limit !== undefined) {
-            if (!Number.isInteger(limit) || limit <= 0) return []
-            return asMemoryRecords(limited.all(identity, cutoff, limit))
-          }
-          return asMemoryRecords(all.all(identity, cutoff))
+          const staleBefore = listOptions?.classificationStaleBefore
+          // Three windows, and only one of them binds a fourth parameter. Kept as
+          // a flat branch rather than a builder so the arity of each `.all()`
+          // stays visible at the call site — a mismatched parameter list here
+          // fails silently as "no rows".
+          const all = staleBefore !== undefined
+            ? listClassifyStaleAll
+            : listOptions?.unverifiedOnly === true ? listUnverifiedAll : listMemoriesAll
+          const limited = staleBefore !== undefined
+            ? listClassifyStaleLimited
+            : listOptions?.unverifiedOnly === true ? listUnverifiedLimited : listMemoriesLimited
+          const bind = (statement: typeof all): unknown => staleBefore !== undefined
+            ? limit !== undefined ? statement.all(identity, cutoff, Math.trunc(staleBefore), limit) : statement.all(identity, cutoff, Math.trunc(staleBefore))
+            : limit !== undefined ? statement.all(identity, cutoff, limit) : statement.all(identity, cutoff)
+          if (limit !== undefined && (!Number.isInteger(limit) || limit <= 0)) return []
+          return asMemoryRecords(bind(limit !== undefined ? limited : all))
         } catch {
           return []
         }
@@ -1700,6 +1870,7 @@ export function openMemoryWriter(options: MemoryWriterOptions): MemoryWriter {
           if (corpusFenced) return 0
           const scored = runImmediate<{ ok: true; changed: number }>(() => {
             const statement = db.prepare(CLASSIFY_MEMORY)
+            const sharing = db.prepare(CLASSIFY_SHARING)
             let changed = 0
             for (const entry of entries) {
               if (!Number.isInteger(entry.id) || entry.id <= 0) continue
@@ -1707,6 +1878,20 @@ export function openMemoryWriter(options: MemoryWriterOptions): MemoryWriter {
               // so an out-of-range verdict can't skew m[0] ranking either side.
               const importance = Math.min(100, Math.max(1, Math.round(entry.importance)))
               changed += Number(statement.run(importance, classifiedAt, identity, entry.id).changes)
+              if (entry.shareable === undefined) continue
+              // A blocked entry is recorded as private rather than skipped: the
+              // point of the block is that the row stays project-local, and
+              // leaving the columns untouched would let a previous score stand.
+              const wanted = entry.shareable && entry.blocked !== true
+              const scope = wanted ? (entry.scope ?? 'project') : 'project'
+              if (entry.blocked === true) {
+                // Keep the audience honest when sharing is refused: a row marked
+                // universe but not shareable renders for nobody and reads as
+                // already-done to the auto-stage scan.
+                sharing.run(0, 'project', identity, entry.id)
+                continue
+              }
+              sharing.run(wanted ? 1 : 0, scope, identity, entry.id)
             }
             return { ok: true, changed }
           })
@@ -1749,6 +1934,80 @@ export function openMemoryWriter(options: MemoryWriterOptions): MemoryWriter {
         } catch (error) {
           // Fail-open: an unreadable annotation must not stop the sweep.
           options.logger.warn(`magic-context memory: verifySkipHashes failed: ${errText(error)}`)
+        }
+        return remembered
+      },
+      listVectors: (identity, modelId, limit = 500) => {
+        if (!tables.has('memory_embeddings')) return []
+        if (modelId.length === 0) return []
+        try {
+          if (corpusFenced) return []
+          const rows = db.prepare(
+            `SELECT m.id AS id, m.category AS category, m.content AS content,
+                    COALESCE(m.importance, 50) AS importance,
+                    COALESCE(m.seen_count, 0) AS seenCount,
+                    m.created_at AS createdAt,
+                    e.embedding AS embedding
+               FROM memory_embeddings e INNER JOIN memories m ON m.id = e.memory_id
+              WHERE m.project_path = ? AND e.model_id = ?
+                AND m.status IN ('active','permanent')
+                AND (m.expires_at IS NULL OR m.expires_at > ?)
+              ORDER BY m.updated_at DESC, m.id DESC
+              LIMIT ?`,
+          ).all(identity, modelId, now(), Math.max(1, Math.min(2_000, limit))) as Array<{
+            id: number; category: string; content: string; importance: number
+            seenCount: number; createdAt: number; embedding: Buffer
+          }>
+          return rows.map(row => ({
+            id: Number(row.id),
+            category: String(row.category),
+            content: String(row.content),
+            importance: Number(row.importance),
+            seenCount: Number(row.seenCount),
+            createdAt: Number(row.createdAt),
+            // node:sqlite hands back a Buffer whose byteOffset may be non-zero,
+            // so the view has to be built from the buffer, offset and length —
+            // `new Float32Array(buffer)` alone would read the wrong bytes.
+            embedding: new Float32Array(
+              row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4,
+            ),
+          }))
+        } catch (error) {
+          options.logger.warn(`magic-context memory: listVectors failed: ${errText(error)}`)
+          return []
+        }
+      },
+      recordCurateSkip: ({ identity, id, contentHash, at }) => {
+        try {
+          if (corpusFenced) return
+          if (!Number.isInteger(id) || id <= 0 || contentHash.length === 0) return
+          runImmediate<{ ok: true }>(() => {
+            const row = db.prepare(
+              'SELECT metadata_json FROM memories WHERE project_path = ? AND id = ?',
+            ).get(identity, id) as { metadata_json?: string | null } | undefined
+            if (row === undefined) return { ok: true }
+            db.prepare('UPDATE memories SET metadata_json = ? WHERE project_path = ? AND id = ?')
+              .run(mergeCurateSkipMetadata(row.metadata_json ?? null, contentHash, at), identity, id)
+            return { ok: true }
+          })
+        } catch (error) {
+          options.logger.warn(`magic-context memory: recordCurateSkip failed: ${errText(error)}`)
+        }
+      },
+      curateSkipHashes: (identity, ids) => {
+        const remembered = new Map<number, string>()
+        if (ids.length === 0) return remembered
+        try {
+          const placeholders = ids.map(() => '?').join(',')
+          const rows = db.prepare(
+            `SELECT id, metadata_json FROM memories WHERE project_path = ? AND id IN (${placeholders})`,
+          ).all(identity, ...ids) as Array<{ id: number; metadata_json?: string | null }>
+          for (const row of rows) {
+            const hash = parseCurateSkipHash(row.metadata_json ?? null)
+            if (hash !== undefined) remembered.set(Number(row.id), hash)
+          }
+        } catch (error) {
+          options.logger.warn(`magic-context memory: curateSkipHashes failed: ${errText(error)}`)
         }
         return remembered
       },

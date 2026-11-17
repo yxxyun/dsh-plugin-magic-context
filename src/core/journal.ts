@@ -53,6 +53,11 @@ export type JournalKind =
   | 'search-hint'
   | 'memory-promote'
   | 'global-review'
+  /** One user-memory review pass: candidate TTL, promotion verdicts, call failures.
+   *  Distinct from `maintenance` because the sweep is gone — this lane used to log
+   *  under that kind, which made a failed review indistinguishable from sweep
+   *  activity in any query that filtered on the kind alone. */
+  | 'profile-review'
   | 'maintenance'
   | 'memory-sample'
   | 'session-notice'
@@ -60,6 +65,30 @@ export type JournalKind =
   | 'context-pressure'
   | 'tool-call'
   | 'engine'
+  /** One background-task run (see `core/dream-runner.ts`). Kept distinct from
+   *  `maintenance` because the two have different cadences and different
+   *  failure semantics: a maintenance step is part of a pass, a dream run is
+   *  its own unit that backs off on its own schedule. */
+  | 'dream-run'
+  /** A project's schedule rows were seeded for the first time in this process. */
+  | 'dream-seeded'
+  /** One `classify-memories` run: how many stale scores were re-banked, and
+   *  what it cost. Separate from `dream-run` because the runner's row records
+   *  the schedule outcome while this one records the model's answer quality
+   *  (dropped ids, unparsable manifests). */
+  | 'dream-classify'
+  /** One `verify` run: verdict counts plus how the filesystem evidence resolved
+   *  (found / missing / ambiguous). Kept apart from `dream-run` because the
+   *  evidence tally is the whole diagnostic value of a file-backed verify. */
+  | 'dream-verify'
+  /** One `curate` run: merge/archive/keep/skip counts plus every safety refusal.
+   *  Separate from `dream-run` because the refusal tally is the audit trail for
+   *  the only task that deletes rows. */
+  | 'dream-curate'
+  /** One `retrospective` run: how much friction the window held and whether a
+   *  note came out of it. Separate from `dream-run` because the signal counts are
+   *  what makes a quiet week verifiable. */
+  | 'dream-retro'
   | 'error'
 
 export interface JournalEntry {

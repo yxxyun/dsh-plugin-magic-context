@@ -81,7 +81,7 @@ describe('schema v8 migration', () => {
   it('is the current version and upgrades a v7 store without losing rows', () => {
     const dir = tempDir()
     const store = openStore(dir)
-    expect(SCHEMA_VERSION).toBe(11)
+    expect(SCHEMA_VERSION).toBe(14)
     store.allocateTag('s1', { kind: 'user-message', messageId: 'm1' }, NOW)
     store.saveBaselineState({
       sessionId: 's1',

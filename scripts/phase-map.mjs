@@ -22,6 +22,48 @@
 const PHASE_BASE = [
   'tests/phase-map.spec.ts',
   'tests/client-pure.spec.ts',
+  // `ctx_search`'s from/to contract: a date-only `to` must cover the whole day,
+  // and an impossible date must be refused rather than normalised by Date.UTC.
+  'tests/date-range.spec.ts',
+  // `ctx_note` read paging: the note queue is the one that grows in a long
+  // session, so limit/offset/filter are what keep it reachable.
+  'tests/note-paging.spec.ts',
+  // Protection window: the mass window and the count floor are independent and
+  // the wider one wins (upstream `cutoff = min(mass_cutoff, newest3_cutoff)`).
+  'tests/emergency-structural-min.spec.ts',
+  // Work metrics: growth vs. peak context, and the incremental carry must equal
+  // the cold fold (verified on a 5,285-step live session, 0 mismatches).
+  'tests/work-metrics.spec.ts',
+  // Cross-process compartment lease: mutual exclusion between processes, TTL
+  // takeover, and dead-owner reclaim (the in-process inFlight guard cannot see
+  // any of that).
+  'tests/compartment-lease.spec.ts',
+  // Smart notes: declarative surface conditions are DATA, never code, and a path
+  // escaping the project root is refused at parse time.
+  'tests/surface-condition.spec.ts',
+  // The tick that wakes them: false stays parked, errors retry, repeated errors
+  // surface with a warning instead of parking invisibly.
+  'tests/smart-notes.spec.ts',
+  // Token estimation: `chars/4` under-counted the provider by 31% (CJK is ~1
+  // token/char), and every request carries ~42k of fixed overhead no persisted
+  // document contains. The floor must stay positive — a zero reintroduces the
+  // under-estimate this module exists to remove.
+  'tests/token-estimate.spec.ts',
+  // Memory chunking: no gap between consecutive spans, every chunk opens on a word
+  // (not mid-token), and the first/last chunks reach the ends of the source.
+  'tests/memory-chunk.spec.ts',
+  // Chunk vectors: replace-not-append (a shrunk memory must not leave orphans),
+  // best-chunk ranking (averaging reproduces the dilution chunking removes), and
+  // byte-exact round-trip (a view into a statement buffer is freed by the next query).
+  'tests/chunk-store.spec.ts',
+  // Git commit lane: the parse contract (US/RS not NUL, four-separator split,
+  // full-object-name check), eviction by COMMIT time, the conditional upsert, and
+  // the FTS + semantic merge.
+  'tests/git-commits.spec.ts',
+  // Primer lane: support counts distinct DAYS (a burst is not a habit), promotion
+  // needs support AND span, the occurrence key keeps recurrences separate, and a
+  // primer with no vector must still absorb its own recurrences (normalization bug).
+  'tests/primer.spec.ts',
   // The SOFT-refresh cache invariant: m[0] must not change a byte when
   // compartments land in m[1], and the heading carries no tier/time. Baseline:
   // it pins the upstream rule (ARCHITECTURE.md:96) the local renderer broke.
@@ -125,6 +167,14 @@ const PHASE_B = [
 
 /** Phase C: org/machine domains. Publishing writes the corpus. */
 const PHASE_C = [
+  // The gate a memory must pass before it becomes visible to another project.
+  // It replaces "a human reads every approval card": measured on this
+  // installation, 130 of 896 active memories carry a local path, a loopback
+  // endpoint or a credential, and one of those was already published.
+  'tests/shareable-guard.spec.ts',
+  // The judgement wired into the two places a row can become shared: the
+  // automatic path (classify, upstream's model) and the manual one (publish).
+  'tests/shareable-wiring.spec.ts',
   'tests/org-domain.spec.ts',
   'tests/domain-publish.spec.ts',
   'tests/machine-domain.spec.ts',
@@ -153,6 +203,63 @@ const PHASE_D = [
   'tests/baseline-stability.spec.ts',
   'tests/baseline-clock-freeze.spec.ts',
   'tests/report-dilution.spec.ts',
+]
+
+/**
+ * Phase E: background tasks (the Dreamer lane).
+ *
+ * The gate here is the scheduler's safety rules, not its features: a task that
+ * runs when it should not, or writes effects after reporting a failure, is worse
+ * than no scheduler at all. Only `promote-primers` is wired in this phase — the
+ * one task with no model call — so the clock and the lease are proven before any
+ * completion is added.
+ */
+const PHASE_E = [
+  // The clock: strictly-after semantics, Vixie dom/dow OR-matching, and an
+  // impossible expression resolving to null instead of a far-future date.
+  'tests/dream-cron.spec.ts',
+  // The rules: lease before work, no effects after a failure, the clock moving
+  // in the same transaction as the run row, and failure backoff.
+  'tests/dream-scheduler.spec.ts',
+  // Phase 2: re-ranking importance. The assertions that matter are the failure
+  // paths (a failed call or bad manifest writes NOTHING) and the staleness
+  // window (a freshly scored row is skipped).
+  'tests/dream-classify.spec.ts',
+  // Phase 3: file-backed verification. The evidence module is where the
+  // no-guessing rule lives (an ambiguous filename stays ambiguous, a URL is not
+  // a path), and `dream-verify` is where the pool rule lives (unverified AND
+  // cites a file — nothing else is this task's business).
+  'tests/memory-evidence.spec.ts',
+  'tests/dream-verify.spec.ts',
+  // Phase 4: consolidation. The gate's four refusals are pure functions with a
+  // test each, and the dry-run assertions check that the DEFAULT mode writes
+  // nothing at all.
+  'tests/curate-safety.spec.ts',
+  'tests/dream-curate.spec.ts',
+  // Phase 5: the retrospective. The friction ranking is a judgement (severity
+  // breaks a total-cost tie), and "a quiet window costs nothing" is the rule that
+  // keeps a nightly job from becoming noise.
+  'tests/dream-retrospective.spec.ts',
+  // The tunables: volatile unwrapping (a wrapper read as a value silently takes
+  // the default), bounds, and the per-run resolution that makes a settings edit
+  // apply without a restart.
+  'tests/dream-config.spec.ts',
+  // TTL expiry, moved into `curate` to match upstream's placement ("Curate owns
+  // the TTL lifecycle transition"). The old maintenance tests asserted the sweep
+  // did it; they now assert it does NOT, because two writers racing the same
+  // rows is the bug the move fixed.
+  'tests/expire-memories.spec.ts',
+  // Smart notes as their own scheduled task, where upstream keeps them (they
+  // used to be the last step of the maintenance sweep).
+  'tests/dream-smart-notes.spec.ts',
+  // User-memory review as a task (was the middle of the maintenance sweep).
+  'tests/dream-review-user-memories.spec.ts',
+  // The three lanes moved off the fixed-interval sweep: auto-staging, vector
+  // backfill (which now carries the RSS series), and the commit index.
+  'tests/dream-housekeeping.spec.ts',
+  // Every canonical task has a capability, a schedule, and a handler. A task
+  // name without a handler is silently never executed.
+  'tests/dream-registry-complete.spec.ts',
 ]
 
 export const PHASES = [
@@ -226,6 +333,33 @@ export const PHASES = [
       'profile 依赖卫生判据（tests/profile-checks.spec.ts，2026-10-11 启动失败后加）是静态检查：'
       + '只看 profile 根 node_modules/@deepseek-ai/（Node 真能解析到的位置），看不到 .pnpm 内部未提升的副本；'
       + '宿主包清单读不到时（app.asar 不可达）dependencies 一项降级为 WARN，不冒充绿灯',
+    ],
+  },
+  {
+    id: 'e',
+    title: 'E 后台任务（Dreamer 调度骨架）',
+    specs: PHASE_E,
+    checks: [],
+    blind: [
+      'promote-primers 与 classify-memories 有 handler；verify / curate / retrospective '
+      + '在 registry 里有名字与预算，但无 handler，跑起来记 skipped 而非失败——'
+      + '这是阶段顺序的显式事实，不是缺陷',
+      'classify 只重排 importance：scope / shareable 有意不写（分享范围归人工发布闸门，'
+      + '不能让夜间模型调用悄悄扩大可见性）；上游 classify 三个字段全写，这里是有意收窄',
+      'cron 只在本地墙钟时区验证；跨时区（同一 db 被不同 TZ 的进程打开）未测，'
+      + '结论是 next_due_at 是绝对 epoch，跨时区不会重复触发但触发时刻跟随写入方',
+      'lease 的跨进程互斥用同一 db 文件的第二个 openStores 模拟，'
+      + '没有真的起第二个 node 进程——PID 存活性判据（isPidAlive）只在 compartment-lease 用例里覆盖',
+      '真机 dwell 未跑：本轮验证止于"5 分钟 tick 在 mount 后启动、dispose 时清理、'
+      + '首次打开项目时播种 rows"，没有等一个真实 cron 到点',
+      'classify 的 route 跟随主会话最新路由；进程内还没有任何会话跑过时 route 为空 → '
+      + '任务记 skipped。真机上首次 boot 到第一次对话之间存在这个窗口',
+      '宿主进程被 Electron 独占，无法用 --dump-config 复验 profile 层；'
+      + '调度器是否真的在跑要看 journal 的 dream-run / dream-seeded / dream-classify 行',
+      'index.ts 的装配没有测试覆盖：所有验收脚本都是直接调函数，绕过了真实的 on(preStep, …) 接线。'
+      + '2026-11-17 实测踩过一次——ensureDreamSchedules 传给了 injectReduceGuidance（只做 systemPrompt 注入）'
+      + '而不是 preStepListener，结果 dream_schedule 一直是 0 行、journal 零 dream-* 行，而全部单测与五个验收脚本都通过。'
+      + '判据只能是重启后查 dream_schedule 行数与 journal，不能靠测试绿灯',
     ],
   },
 ]

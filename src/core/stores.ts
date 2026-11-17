@@ -18,9 +18,12 @@ import type { JournalEntry, JournalKind, JournalLevel } from './journal.ts'
 import type { MemoryFact } from './memory-categories.ts'
 import type { DomainKind } from './domains.ts'
 import { parseShareCategories, serializeShareCategories } from './domains.ts'
+import { computeWorkMetrics, toAssistantUsageRow, type WorkMetrics } from './work-metrics.ts'
+import { openCompartmentLease, type CompartmentLease, type LeaseDatabase } from './compartment-lease.ts'
+import { openDreamLease, type DreamLease, type DreamLeaseOptions } from './dream-lease.ts'
 import type { TagRecord, TagTarget, UsageRecord } from './types.ts'
 
-export const SCHEMA_VERSION = 11
+export const SCHEMA_VERSION = 14
 
 /** The m[0]/m[1] baseline identity for one session. */
 export interface BaselineState {
@@ -203,6 +206,57 @@ export interface NoteRow {
   readonly readyReason?: string
   /** Message ordinal the note was written at, when the session could provide one. */
   readonly anchorOrdinal?: number
+  /**
+   * Consecutive smart-note checks that ERRORED. A false condition does not count
+   * — it is progress, and resets the counter — so this only climbs when the check
+   * itself is broken (bad URL, unreadable file).
+   */
+  readonly checkFailureCount?: number
+}
+
+/**
+ * One project's cadence for one background task (v13).
+ *
+ * `nextDueAt` is the only field the scheduler actually polls, and it is stored
+ * rather than derived so a restart cannot re-fire a run that already happened.
+ * `undefined` (NULL in the row) means "never": an empty cron, or an expression
+ * naming an impossible instant such as Feb 31. Those rows are skipped, not
+ * retried every tick.
+ */
+export interface DreamScheduleRow {
+  readonly projectPath: string
+  readonly task: string
+  /** 5-field cron in local time; `''` means never. */
+  readonly cron: string
+  readonly nextDueAt?: number
+  readonly lastRunAt?: number
+  /** `ok` | `failed` | `skipped` — the last completed run, not the current one. */
+  readonly lastStatus?: DreamRunStatus
+  readonly lastError?: string
+  /**
+   * Consecutive failed runs. Drives backoff, so a task whose code is broken
+   * stops being retried every minute; reset to 0 by any completed run.
+   */
+  readonly consecutiveFailures: number
+  readonly enabled: boolean
+  readonly updatedAt: number
+}
+
+export type DreamRunStatus = 'running' | 'ok' | 'failed' | 'skipped'
+
+/** One completed (or in-flight) background-task run. */
+export interface DreamRunRow {
+  readonly id: number
+  readonly projectPath: string
+  readonly task: string
+  readonly startedAt: number
+  readonly finishedAt?: number
+  readonly status: DreamRunStatus
+  readonly itemsProcessed: number
+  readonly itemsChanged: number
+  readonly tokensUsed: number
+  readonly summary?: string
+  readonly error?: string
 }
 
 /** One row of the dashboard's session list (see `AdapterStores.listSessions`).
@@ -237,6 +291,22 @@ export interface AdapterStores {
   listUsage(sessionId: string): UsageRecord[]
   /** Newest usage row by seq, or undefined before the first response. */
   latestUsage(sessionId: string): UsageRecord | undefined
+  /**
+   * Work metrics for a session: `newWorkTokens` (context growth) against
+   * `totalInputTokens` (what the context had to hold at its peak per phase).
+   *
+   * The distinction drives compaction: re-reading a stable prefix grows
+   * `totalInputTokens` without producing work, which is the case where a
+   * rebuild costs more than it saves. Derived from `usage_records` by
+   * `core/work-metrics.ts`.
+   */
+  workMetrics(sessionId: string): WorkMetrics
+  /**
+   * Cross-process lease on compartment state. Opened on first call and reused,
+   * so the holder id stays stable for this process's lifetime — a lease this
+   * process already owns is renewed rather than fought over.
+   */
+  compartmentLease(options?: { log?: (sessionId: string, message: string) => void }): CompartmentLease
   /**
    * Newest timestamp at which something changed the INJECTED surface for this
    * session — a compartment landing, or the m[0] baseline being refreshed.
@@ -438,6 +508,15 @@ export interface AdapterStores {
       projectPath?: string
       anchorOrdinal?: number
       type?: NoteRow['type']
+      /**
+       * Declarative surface condition (`core/surface-condition.ts`). A note that
+       * carries one is a SMART note: it stays parked until a maintenance tick
+       * evaluates the condition and finds it holds, then becomes `ready`.
+       * Validated by the caller — the store records what it is given.
+       */
+      surfaceCondition?: string
+      /** Next scheduled check, epoch ms. Required for a smart note to be polled. */
+      nextCheckAt?: number
     },
     now: number,
   ): NoteRow
@@ -452,6 +531,8 @@ export interface AdapterStores {
     projectPath?: string
     status?: NoteRow['status'] | 'open'
     limit?: number
+    /** Rows to skip after ordering, for paging a long note queue. */
+    offset?: number
   }): NoteRow[]
   /** Rewrite one note's content; `undefined` when the id does not exist. */
   updateNote(id: number, content: string, now: number): NoteRow | undefined
@@ -459,6 +540,94 @@ export interface AdapterStores {
   retireNotes(ids: readonly number[], mode: 'dismiss' | 'delete', now: number): number
   /** Age out dismissed rows (maintenance tick). */
   pruneNotes(before: number): number
+  /**
+   * Smart notes whose check is due, oldest deadline first.
+   *
+   * Only `pending` rows carrying a condition are returned: a note that already
+   * surfaced (`ready`) or was retired must not be re-checked, and a plain note
+   * has nothing to check.
+   */
+  listDueSurfaceChecks(now: number, limit?: number): NoteRow[]
+  /**
+   * Record one check outcome.
+   *
+   * - `met` → the note becomes `ready` and carries the reason it woke, which is
+   *   what the agent sees when it surfaces.
+   * - not met → the row stays `pending` with its next deadline moved forward.
+   *
+   * A failure count is tracked separately from a plain "not met" so a note whose
+   * check keeps erroring (bad URL, deleted file) can be surfaced with a warning
+   * instead of parking forever in silence.
+   */
+  recordSurfaceCheck(input: {
+    id: number
+    met: boolean
+    /** Why it woke, or why the check failed. */
+    reason?: string
+    /** Next deadline when it did not wake. */
+    nextCheckAt?: number
+    /** Whether this outcome was an error rather than a false condition. */
+    failed?: boolean
+  }, now: number): NoteRow | undefined
+  // ── Background tasks (v13) ───────────────────────────────────────────────
+  /**
+   * One project's schedule row for one task, or undefined before it is seeded.
+   *
+   * The runner reads this instead of computing a due instant from the clock:
+   * a restart must not re-fire a task that already ran, so the next due instant
+   * is state, not a derivation.
+   */
+  getDreamSchedule(projectPath: string, task: string): DreamScheduleRow | undefined
+  /** Every schedule row for one project, in canonical task order. */
+  listDreamSchedules(projectPath: string): DreamScheduleRow[]
+  /**
+   * Create or replace a schedule row. `nextDueAt: null` means "never fires" —
+   * either the cron is empty or it names an instant that cannot occur.
+   */
+  upsertDreamSchedule(row: DreamScheduleRow): void
+  /**
+   * Tasks whose `next_due_at` has passed, oldest first, across every project.
+   *
+   * `enabled = 0` and `next_due_at IS NULL` rows are excluded here rather than
+   * by the caller: a task nobody enabled is not due, and it must not appear in
+   * a backlog count either.
+   */
+  listDueDreamTasks(now: number, limit?: number): DreamScheduleRow[]
+  /**
+   * Record the outcome of a run and advance the schedule.
+   *
+   * `nextDueAt` is computed by the caller (it owns the cron expression) but
+   * written here in the same statement as the run row, so a crash between the
+   * two cannot leave a task "ran but still due".
+   */
+  recordDreamRun(input: {
+    projectPath: string
+    task: string
+    startedAt: number
+    finishedAt: number
+    /** `skipped` means the task chose to do nothing — not an error. */
+    status: DreamRunStatus
+    itemsProcessed?: number
+    itemsChanged?: number
+    tokensUsed?: number
+    summary?: string
+    error?: string
+    /** Next due instant, or null when the task will not run again. */
+    nextDueAt: number | null
+    /** Consecutive-failure count to store (0 resets the backoff). */
+    consecutiveFailures: number
+  }): void
+  /** Most recent runs for one project, newest first — the dashboard's history. */
+  listDreamRuns(projectPath: string, limit?: number): DreamRunRow[]
+  /**
+   * Cross-process lease on a background-task domain, opened on first call and
+   * reused so the holder id stays stable for this process's lifetime.
+   *
+   * Separate from `compartmentLease()` on purpose: that one is keyed by session
+   * and lives for one pass, this one is keyed by project + lease domain and
+   * guards a run that can be much longer.
+   */
+  dreamLease(options?: Omit<DreamLeaseOptions, 'db'>): DreamLease
   close(): void
   /**
    * True once `close()` ran. A remounted adapter (hmr reload) closes the old
@@ -826,6 +995,94 @@ const MIGRATIONS: readonly Migration[] = [
       `)
     },
   },
+  {
+    version: 12,
+    up: (db) => {
+      // Smart notes: `surface_condition` and `ready_at` already exist from v11,
+      // so the only new state is how many consecutive checks ERRORED. A plain
+      // "condition is false" is progress and resets it; an error increments it,
+      // so a note whose check is broken can be surfaced with a warning rather
+      // than parking silently forever.
+      db.exec('ALTER TABLE notes ADD COLUMN check_failure_count INTEGER NOT NULL DEFAULT 0')
+    },
+  },
+  {
+    // v13: background-task scheduling (`dream_schedule` + `dream_runs`).
+    //
+    // Nothing in this adapter ran on a clock before: every write was triggered
+    // by a turn the user started. A scheduler needs two things that have to
+    // survive a restart, because the whole point is running while nobody is
+    // watching — the next due instant per task, and a record of what the last
+    // run did. A restart must not re-fire a task it already ran today, so the
+    // due instant is persisted rather than computed from process start.
+    //
+    // `project_path` is in the primary key: one machine holds many projects and
+    // each keeps its own cadence. `next_due_at` is NULL for `''` (never) and for
+    // an expression that can never fire (Feb 31) — the scheduler skips those
+    // instead of retrying every tick.
+    //
+    // `consecutive_failures` drives backoff: a task that keeps failing must stop
+    // being retried every minute, and the count is also what the dashboard shows
+    // to explain why a task went quiet.
+    version: 13,
+    up: (db) => {
+      // `IF NOT EXISTS` throughout: a real upgrade never re-runs a migration
+      // (the `meta.schema_version` guard prevents it), but the migration is also
+      // the schema definition that tooling and downgrade fixtures replay, and a
+      // replayed `CREATE TABLE` must not abort the whole chain.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS dream_schedule(
+          project_path TEXT NOT NULL,
+          task TEXT NOT NULL,
+          cron TEXT NOT NULL,
+          next_due_at INTEGER,
+          last_run_at INTEGER,
+          last_status TEXT,
+          last_error TEXT,
+          consecutive_failures INTEGER NOT NULL DEFAULT 0,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY(project_path, task)
+        );
+        CREATE INDEX IF NOT EXISTS idx_dream_schedule_due ON dream_schedule(next_due_at);
+        CREATE TABLE IF NOT EXISTS dream_runs(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          project_path TEXT NOT NULL,
+          task TEXT NOT NULL,
+          started_at INTEGER NOT NULL,
+          finished_at INTEGER,
+          status TEXT NOT NULL CHECK(status IN ('running','ok','failed','skipped')),
+          items_processed INTEGER NOT NULL DEFAULT 0,
+          items_changed INTEGER NOT NULL DEFAULT 0,
+          tokens_used INTEGER NOT NULL DEFAULT 0,
+          summary TEXT,
+          error TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_dream_runs_project_task ON dream_runs(project_path, task, started_at DESC);
+      `)
+    },
+  },
+  {
+    // v14: remember which candidates a review pass has already judged.
+    //
+    // `review-user-memories` reads its batch oldest-first, and a candidate the
+    // model answers "keep" for is deliberately not consumed — it may become
+    // promotable once another session corroborates it. Without a
+    // last-looked-at stamp those rows never leave the head of the queue: measured
+    // 2026-11-17, 141 candidates waiting, the same first 12 offered on every run,
+    // and the 129 behind them unreachable forever.
+    version: 14,
+    up: (db) => {
+      // Guarded rather than bare: `ALTER TABLE` has no `IF NOT EXISTS`, and a
+      // migration chain that throws here leaves every later table uncreated. The
+      // candidates table is created by an earlier migration in a real store, but
+      // fixture stores and downgrade replays can reach this point without it.
+      const columns = db.prepare('PRAGMA table_info(user_memory_candidates)').all() as Array<{ name: string }>
+      if (columns.length === 0) return
+      if (columns.some(column => column.name === 'reviewed_at')) return
+      db.exec('ALTER TABLE user_memory_candidates ADD COLUMN reviewed_at INTEGER')
+    },
+  },
 ]
 
 export class StoreAheadOfAdapterError extends Error {
@@ -859,6 +1116,14 @@ export function openStores(dataDir: string): AdapterStores {
   mkdirSync(dirname(dbPath), { recursive: true })
   const db = new DatabaseSync(dbPath)
   db.exec('PRAGMA journal_mode = WAL')
+  // Without a busy timeout every concurrent writer fails instantly with
+  // SQLITE_BUSY instead of waiting. Two writers are real here: the host can
+  // remount the plugin under HMR while an in-flight pass still holds the handle,
+  // and a second agent session on the same machine shares this database. WAL
+  // permits the concurrent readers either way; this is what makes the writers
+  // queue instead of erroring. Same 5s ceiling SQLite recommends for desktop
+  // workloads — long enough to ride out a pass, short enough not to hang a turn.
+  db.exec('PRAGMA busy_timeout = 5000')
   let closed = false
 
   let persisted = 0
@@ -1004,6 +1269,20 @@ export function openStores(dataDir: string): AdapterStores {
       cacheWriteTokens: row.cache_write_tokens ?? undefined,
       recordedAt: row.recorded_at,
     }
+  }
+
+  const workMetrics = (sessionId: string): WorkMetrics =>
+    computeWorkMetrics(listUsage(sessionId).map(toAssistantUsageRow))
+
+  /**
+   * Cross-process lease, opened lazily on first use. Lazy because most
+   * constructions (tests, drift checks) never touch it, and creating the table
+   * is a write — opening eagerly would make every reader take a write lock.
+   */
+  let leaseInstance: CompartmentLease | undefined
+  const compartmentLease = (options: { log?: (sessionId: string, message: string) => void } = {}): CompartmentLease => {
+    leaseInstance ??= openCompartmentLease({ db: db as unknown as LeaseDatabase, ...options })
+    return leaseInstance
   }
 
   const latestHistoryChangeAt = (sessionId: string): number | undefined => {
@@ -1567,6 +1846,8 @@ export function openStores(dataDir: string): AdapterStores {
     session_id: string | null; project_path: string | null; surface_condition: string | null
     created_at: number; updated_at: number; ready_at: number | null
     ready_reason: string | null; anchor_ordinal: number | null
+    /** v12: consecutive ERRORED checks (a false condition does not count). */
+    check_failure_count: number
   }
 
   const toNote = (row: NoteDbRow): NoteRow => ({
@@ -1582,20 +1863,33 @@ export function openStores(dataDir: string): AdapterStores {
     ...row.ready_at === null ? {} : { readyAt: row.ready_at },
     ...row.ready_reason === null ? {} : { readyReason: row.ready_reason },
     ...row.anchor_ordinal === null ? {} : { anchorOrdinal: row.anchor_ordinal },
+    ...row.check_failure_count === undefined || row.check_failure_count === null
+      ? {}
+      : { checkFailureCount: row.check_failure_count },
   })
 
   const createNote: AdapterStores['createNote'] = (input, now) => {
+    const smart = input.surfaceCondition !== undefined
     const row = db.prepare(
-      'INSERT INTO notes(type, status, content, session_id, project_path, created_at, updated_at, anchor_ordinal) '
-        + "VALUES(?, 'active', ?, ?, ?, ?, ?, ?) RETURNING *",
+      'INSERT INTO notes(type, status, content, session_id, project_path, created_at, updated_at, '
+        + 'anchor_ordinal, surface_condition, ready_at) '
+        + 'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *',
     ).get(
-      input.type ?? 'session',
+      // A smart note is a project-scoped row waiting on an external check; a
+      // plain note is an active session intention. Keeping the type distinct
+      // means `listNotes({status:'open'})` still shows only real intentions.
+      input.type ?? (smart ? 'smart' : 'session'),
+      // A smart note starts parked, not active: its content is not actionable
+      // until the condition holds.
+      smart ? 'pending' : 'active',
       input.content,
       input.sessionId ?? null,
       input.projectPath ?? null,
       now,
       now,
       input.anchorOrdinal ?? null,
+      input.surfaceCondition ?? null,
+      input.nextCheckAt ?? null,
     ) as unknown as NoteDbRow
     return toNote(row)
   }
@@ -1609,9 +1903,14 @@ export function openStores(dataDir: string): AdapterStores {
     const clauses: string[] = []
     const parameters: Array<string | number> = []
     if (filter.status === 'open') {
-      // "Open" is the read view's default: everything that is still a live
-      // intention. Dismissed rows are retired and stay out of it.
-      clauses.push("status <> 'dismissed'")
+      // "Open" is the read view's default: everything still worth reading.
+      //  - `active`  a plain note, still a live intention;
+      //  - `ready`   a smart note whose condition came true — the whole reason it
+      //              was parked, so it must not be hidden here;
+      //  - `pending` is deliberately EXCLUDED: a parked note is not actionable
+      //              yet, and listing it would spend attention on a reminder
+      //              that cannot be acted on.
+      clauses.push("status IN ('active', 'ready')")
     } else if (filter.status !== undefined) {
       clauses.push('status = ?')
       parameters.push(filter.status)
@@ -1631,9 +1930,12 @@ export function openStores(dataDir: string): AdapterStores {
     if (scopes.length > 0) clauses.push(`(${scopes.join(' OR ')})`)
     const where = clauses.length === 0 ? '' : ` WHERE ${clauses.join(' AND ')}`
     const limit = filter.limit === undefined ? 25 : Math.max(1, Math.min(100, filter.limit))
+    // OFFSET without a deterministic ORDER BY would page over a shifting window,
+    // so the ordering above is part of this contract, not decoration.
+    const offset = filter.offset === undefined ? 0 : Math.max(0, filter.offset)
     const rows = db.prepare(
-      `SELECT * FROM notes${where} ORDER BY created_at DESC, id DESC LIMIT ?`,
-    ).all(...parameters, limit) as unknown as NoteDbRow[]
+      `SELECT * FROM notes${where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
+    ).all(...parameters, limit, offset) as unknown as NoteDbRow[]
     return rows.map(toNote)
   }
 
@@ -1653,9 +1955,187 @@ export function openStores(dataDir: string): AdapterStores {
     return Number(result.changes)
   }
 
+  const listDueSurfaceChecks: AdapterStores['listDueSurfaceChecks'] = (now, limit) => {
+    // `ready_at` doubles as the next-check deadline for a parked smart note:
+    // the column is unused while the note is pending, and reusing it keeps the
+    // schema at v11 (no migration for a feature that is purely additive).
+    const rows = db.prepare(
+      "SELECT * FROM notes WHERE status = 'pending' AND surface_condition IS NOT NULL "
+        + 'AND (ready_at IS NULL OR ready_at <= ?) '
+        + 'ORDER BY ready_at IS NULL DESC, ready_at ASC, id ASC LIMIT ?',
+    ).all(now, Math.max(1, Math.min(100, limit ?? 25))) as unknown as NoteDbRow[]
+    return rows.map(toNote)
+  }
+
+  const recordSurfaceCheck: AdapterStores['recordSurfaceCheck'] = (input, now) => {
+    const existing = db.prepare('SELECT * FROM notes WHERE id = ?').get(input.id) as NoteDbRow | undefined
+    if (existing === undefined) return undefined
+    const failures = Number(existing.check_failure_count) || 0
+    if (input.met) {
+      const row = db.prepare(
+        "UPDATE notes SET status = 'ready', ready_at = ?, ready_reason = ?, updated_at = ?, "
+          + 'check_failure_count = 0 WHERE id = ? RETURNING *',
+      ).get(now, input.reason ?? 'the condition holds', now, input.id) as unknown as NoteDbRow
+      return toNote(row)
+    }
+    const row = db.prepare(
+      'UPDATE notes SET updated_at = ?, ready_at = ?, check_failure_count = ? WHERE id = ? RETURNING *',
+    ).get(
+      now,
+      input.nextCheckAt ?? now + 60_000,
+      // A false condition is progress, not a failure: only an ERROR increments
+      // the counter, so a note waiting on a genuinely false condition never
+      // looks broken.
+      input.failed === true ? failures + 1 : 0,
+      input.id,
+    ) as unknown as NoteDbRow
+    return toNote(row)
+  }
+
   const pruneNotes = (before: number): number => {
     const result = db.prepare("DELETE FROM notes WHERE status = 'dismissed' AND updated_at < ?").run(before)
     return Number(result.changes)
+  }
+
+  // ── Background tasks (v13) ─────────────────────────────────────────────────
+
+  interface DreamScheduleDbRow {
+    project_path: string; task: string; cron: string
+    next_due_at: number | null; last_run_at: number | null
+    last_status: string | null; last_error: string | null
+    consecutive_failures: number; enabled: number; updated_at: number
+  }
+
+  interface DreamRunDbRow {
+    id: number; project_path: string; task: string
+    started_at: number; finished_at: number | null; status: string
+    items_processed: number; items_changed: number; tokens_used: number
+    summary: string | null; error: string | null
+  }
+
+  const toDreamSchedule = (row: DreamScheduleDbRow): DreamScheduleRow => ({
+    projectPath: row.project_path,
+    task: row.task,
+    cron: row.cron,
+    ...row.next_due_at === null ? {} : { nextDueAt: row.next_due_at },
+    ...row.last_run_at === null ? {} : { lastRunAt: row.last_run_at },
+    ...row.last_status === null ? {} : { lastStatus: row.last_status as DreamRunStatus },
+    ...row.last_error === null ? {} : { lastError: row.last_error },
+    consecutiveFailures: row.consecutive_failures,
+    // Stored as 0/1 for SQLite's benefit; the interface stays boolean so no
+    // caller has to remember which way the integer points.
+    enabled: row.enabled !== 0,
+    updatedAt: row.updated_at,
+  })
+
+  const toDreamRun = (row: DreamRunDbRow): DreamRunRow => ({
+    id: row.id,
+    projectPath: row.project_path,
+    task: row.task,
+    startedAt: row.started_at,
+    ...row.finished_at === null ? {} : { finishedAt: row.finished_at },
+    status: row.status as DreamRunStatus,
+    itemsProcessed: row.items_processed,
+    itemsChanged: row.items_changed,
+    tokensUsed: row.tokens_used,
+    ...row.summary === null ? {} : { summary: row.summary },
+    ...row.error === null ? {} : { error: row.error },
+  })
+
+  const getDreamSchedule = (projectPath: string, task: string): DreamScheduleRow | undefined => {
+    const row = db.prepare('SELECT * FROM dream_schedule WHERE project_path = ? AND task = ?')
+      .get(projectPath, task) as DreamScheduleDbRow | undefined
+    return row === undefined ? undefined : toDreamSchedule(row)
+  }
+
+  const listDreamSchedules = (projectPath: string): DreamScheduleRow[] =>
+    (db.prepare('SELECT * FROM dream_schedule WHERE project_path = ? ORDER BY task')
+      .all(projectPath) as unknown as DreamScheduleDbRow[]).map(toDreamSchedule)
+
+  const upsertDreamSchedule = (row: DreamScheduleRow): void => {
+    db.prepare(
+      'INSERT INTO dream_schedule(project_path, task, cron, next_due_at, last_run_at, last_status, '
+        + 'last_error, consecutive_failures, enabled, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?) '
+        + 'ON CONFLICT(project_path, task) DO UPDATE SET cron = excluded.cron, '
+        + 'next_due_at = excluded.next_due_at, last_run_at = excluded.last_run_at, '
+        + 'last_status = excluded.last_status, last_error = excluded.last_error, '
+        + 'consecutive_failures = excluded.consecutive_failures, enabled = excluded.enabled, '
+        + 'updated_at = excluded.updated_at',
+    ).run(
+      row.projectPath,
+      row.task,
+      row.cron,
+      row.nextDueAt ?? null,
+      row.lastRunAt ?? null,
+      row.lastStatus ?? null,
+      row.lastError ?? null,
+      row.consecutiveFailures,
+      row.enabled ? 1 : 0,
+      row.updatedAt,
+    )
+  }
+
+  const listDueDreamTasks = (now: number, limit?: number): DreamScheduleRow[] =>
+    (db.prepare(
+      'SELECT * FROM dream_schedule WHERE enabled = 1 AND next_due_at IS NOT NULL AND next_due_at <= ? '
+        + 'ORDER BY next_due_at ASC, task ASC LIMIT ?',
+    ).all(now, Math.max(1, Math.min(200, limit ?? 20))) as unknown as DreamScheduleDbRow[]).map(toDreamSchedule)
+
+  const recordDreamRun: AdapterStores['recordDreamRun'] = (input) => {
+    // Both writes in one transaction: a crash between them would leave a task
+    // that ran but is still due, which is the double-fire this table exists to
+    // prevent. The run row is the history; the schedule row is the clock.
+    db.exec('BEGIN')
+    try {
+      db.prepare(
+        'INSERT INTO dream_runs(project_path, task, started_at, finished_at, status, '
+          + 'items_processed, items_changed, tokens_used, summary, error) '
+          + 'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      ).run(
+        input.projectPath,
+        input.task,
+        input.startedAt,
+        input.finishedAt,
+        input.status,
+        input.itemsProcessed ?? 0,
+        input.itemsChanged ?? 0,
+        input.tokensUsed ?? 0,
+        input.summary ?? null,
+        input.error ?? null,
+      )
+      db.prepare(
+        'UPDATE dream_schedule SET next_due_at = ?, last_run_at = ?, last_status = ?, last_error = ?, '
+          + 'consecutive_failures = ?, updated_at = ? WHERE project_path = ? AND task = ?',
+      ).run(
+        input.nextDueAt,
+        input.finishedAt,
+        input.status,
+        input.error ?? null,
+        input.consecutiveFailures,
+        input.finishedAt,
+        input.projectPath,
+        input.task,
+      )
+      db.exec('COMMIT')
+    } catch (error) {
+      db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  const listDreamRuns = (projectPath: string, limit?: number): DreamRunRow[] =>
+    (db.prepare('SELECT * FROM dream_runs WHERE project_path = ? ORDER BY started_at DESC, id DESC LIMIT ?')
+      .all(projectPath, Math.max(1, Math.min(200, limit ?? 20))) as unknown as DreamRunDbRow[]).map(toDreamRun)
+
+  /**
+   * Dream lease, opened lazily on first use — same reasoning as the compartment
+   * lease: creating the table is a write, so eager opening would make every
+   * reader take a write lock.
+   */
+  let dreamLeaseInstance: DreamLease | undefined
+  const dreamLease = (options: Omit<DreamLeaseOptions, 'db'> = {}): DreamLease => {
+    dreamLeaseInstance ??= openDreamLease({ db: db as unknown as LeaseDatabase, ...options })
+    return dreamLeaseInstance
   }
 
   /**
@@ -1807,6 +2287,15 @@ export function openStores(dataDir: string): AdapterStores {
     updateNote,
     retireNotes,
     pruneNotes,
+    getDreamSchedule,
+    listDreamSchedules,
+    upsertDreamSchedule,
+    listDueDreamTasks,
+    recordDreamRun,
+    listDreamRuns,
+    dreamLease,
+    listDueSurfaceChecks,
+    recordSurfaceCheck,
     listSessions,
     allocateTag,
     getTag,
@@ -1814,6 +2303,8 @@ export function openStores(dataDir: string): AdapterStores {
     recordUsage,
     listUsage,
     latestUsage,
+    workMetrics,
+    compartmentLease,
     latestHistoryChangeAt,
     queueDrop,
     listPendingDrops,

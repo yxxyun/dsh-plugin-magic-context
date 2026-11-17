@@ -18,6 +18,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type { Compartment, CompartmentDraft } from '../core/compartments.ts'
+import { estimateTokens } from '../core/token-estimate.ts'
 import type { Journal } from '../core/journal.ts'
 import type { PressurePolicy } from '../core/policy.ts'
 import type { AdapterStores } from '../core/stores.ts'
@@ -188,7 +189,7 @@ export async function recompactCompartments(
       })
       continue
     }
-    const tokens = nodes.reduce((total, node) => total + Math.max(1, Math.ceil(node.text.length / 4)), 0)
+    const tokens = nodes.reduce((total, node) => total + estimateTokens(node.text), 0)
     try {
       const draft: CompartmentDraft = await callHistorian(historianDeps, {
         sessionId: input.sessionId,

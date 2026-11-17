@@ -724,7 +724,7 @@ describe('baseline rendering: the delta lane stays inside m[1] (A7)', () => {
 describe('adapter store: the per-session mutation cursor (schema v6)', () => {
   it('round-trips the cursor and the epoch fingerprint', () => {
     const dataDir = tempDir('mc-delta-store-')
-    expect(SCHEMA_VERSION).toBe(11)
+    expect(SCHEMA_VERSION).toBe(14)
     const stores = openStores(dataDir)
     try {
       stores.saveBaselineState({
@@ -775,6 +775,11 @@ describe('adapter store: the per-session mutation cursor (schema v6)', () => {
       DROP TABLE domain_members;
       DROP TABLE domains;
       DROP TABLE notes;
+      -- v13's tables did not exist in a real v5 database either, so the fixture
+      -- drops them: otherwise the v13 migration replays over live tables and the
+      -- chain aborts on "already exists" instead of testing the upgrade.
+      DROP TABLE dream_runs;
+      DROP TABLE dream_schedule;
       UPDATE meta SET value = '5' WHERE key = 'schema_version';
     `)
     db.close()
@@ -800,7 +805,7 @@ describe('adapter store: the per-session mutation cursor (schema v6)', () => {
     const check = new DatabaseSync(dbPath, { readOnly: true })
     try {
       const version = check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }
-      expect(version.value).toBe('11')
+      expect(version.value).toBe('14')
       const names = new Set(
         (check.prepare('PRAGMA table_info(baseline_state)').all() as Array<{ name: string }>).map(row => row.name),
       )
@@ -844,6 +849,9 @@ describe('adapter store: the per-session mutation cursor (schema v6)', () => {
       DROP TABLE domain_members;
       DROP TABLE domains;
       DROP TABLE notes;
+      -- Same reason as the v5 fixture: v13's tables postdate a v3 database.
+      DROP TABLE dream_runs;
+      DROP TABLE dream_schedule;
       UPDATE meta SET value = '3' WHERE key = 'schema_version';
     `)
     db.close()

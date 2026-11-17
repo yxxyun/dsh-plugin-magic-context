@@ -32,6 +32,7 @@ import type { AdapterStores, BaselineState } from '../core/stores.ts'
 import { errText } from '../core/types.ts'
 import { reclaimForEmergency } from './emergency.ts'
 import { runHistorian, type HistorianDeps, type HistorianLlm } from './historian.ts'
+import type { CompartmentLease } from '../core/compartment-lease.ts'
 import {
   dropPlaceholderContent,
   enumerateSurfaceNodes,
@@ -159,6 +160,13 @@ export interface ManagementPassInput {
     readonly compartmentStart: number | null
     readonly compartmentEnd: number | null
   }) => { readonly inserted: number; readonly skipped: number } | void
+  /**
+   * Cross-process lease on compartment state, handed to the historian. The
+   * in-process `inFlight` guard cannot see a second process (HMR remount, or
+   * another session sharing this database), so a lost race would let two passes
+   * publish compartments against the same baseline.
+   */
+  readonly lease?: CompartmentLease
   readonly now?: () => number
 }
 
@@ -878,6 +886,7 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
         ...input.historian.route === undefined ? {} : { route: input.historian.route },
         ...input.historian.now === undefined ? {} : { now: input.historian.now },
         ...input.profileCollect === undefined ? {} : { profileCollect: input.profileCollect },
+        ...input.lease === undefined ? {} : { lease: input.lease },
       }
       void runHistorian(deps, {
         sessionId: input.sessionId,

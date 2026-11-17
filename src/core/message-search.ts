@@ -95,6 +95,13 @@ export async function searchMessageHistory(
     readonly limit?: number
     /** Seqs still visible on the surface; hits inside this set are dropped. */
     readonly liveSeqs?: ReadonlySet<number>
+    /**
+     * Inclusive epoch-ms bounds (upstream `ctx_search` `from`/`to`). Applied
+     * here rather than at the host index: the host's searchEvents accepts no
+     * date filter, so a range can only be enforced on the returned rows.
+     */
+    readonly from?: number
+    readonly to?: number
     readonly signal?: AbortSignal
   },
 ): Promise<MessageSearchOutcome> {
@@ -117,6 +124,10 @@ export async function searchMessageHistory(
     for (const item of page.items) {
       const isLive = live?.has(item.seq) === true
       if (isLive) continue
+      // Date range narrows the survivors, so the over-fetch above still has to
+      // yield `limit` in-range rows rather than silently returning fewer.
+      if (request.from !== undefined && item.time < request.from) continue
+      if (request.to !== undefined && item.time > request.to) continue
       hits.push({
         seq: item.seq,
         type: item.type,

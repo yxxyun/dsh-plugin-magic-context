@@ -32,6 +32,26 @@ export function liveNumber(value: unknown, fallback: number): number {
   return typeof resolved === 'number' && Number.isFinite(resolved) ? resolved : fallback
 }
 
+/**
+ * Same as {@link liveString} for a list.
+ *
+ * A volatile array arrives wrapped like every other volatile field, and the
+ * wrapper chain can be nested (`config.a?.b?.list`), so `liveValue` does the
+ * unwrapping. Anything that is not an array of strings falls back wholesale
+ * rather than being coerced element by element: a half-readable list is worse
+ * than the default, because it silently searches the wrong trees.
+ */
+export function liveStringArray(value: unknown, fallback: readonly string[]): string[] {
+  const resolved = liveValue(value)
+  if (!Array.isArray(resolved)) return [...fallback]
+  const out: string[] = []
+  for (const entry of resolved) {
+    if (typeof entry !== 'string') return [...fallback]
+    out.push(entry)
+  }
+  return out
+}
+
 /** Same as {@link liveNumber} for booleans (volatile toggles). */
 export function liveBoolean(value: unknown, fallback: boolean): boolean {
   if (typeof value === 'boolean') return value

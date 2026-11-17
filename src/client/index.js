@@ -291,6 +291,41 @@ window.__ModuleLoader__.load({
         path: ['registerCompactionEngine'], kind: 'boolean', label: 'Register compaction engine',
         hint: 'Register the adapter as the compaction engine seam. Mounts or unmounts on the next agent step — disable the host compaction row first.',
       },
+      // ── Background tasks (the dreamer lane) ───────────────────────────────
+      // These are the fields whose values a user actually changes as their setup
+      // evolves; the rest of `dream` keeps its defaults and stays in the patch.
+      {
+        path: ['dream', 'verifyExtraRoots'], kind: 'lines', fallback: [],
+        label: 'Verify: extra roots to search',
+        hint: 'One directory per line. `verify` looks for the files a memory cites here as well as '
+          + 'in the project itself — needed when work in one project touches another repository. '
+          + 'Point these at PARENT directories (`C:/data/code`), not at each checkout. Keep each root '
+          + 'small enough to index fully (~20k source files); a root that truncates makes real files '
+          + 'read as missing.',
+      },
+      {
+        path: ['dream', 'curateDryRun'], kind: 'boolean', fallback: true,
+        label: 'Curate: dry run only',
+        hint: 'On (default) means consolidate only reports what it would merge. Turning it off lets '
+          + 'curate archive source rows — irreversible from the task.',
+      },
+      {
+        path: ['dream', 'classifyBatchSize'], kind: 'number', label: 'Classify batch size',
+        hint: 'Memories re-ranked per call (default 16). Larger risks a truncated manifest.',
+      },
+      {
+        path: ['dream', 'verifyBatchSize'], kind: 'number', label: 'Verify batch size',
+        hint: 'Memories checked per call (default 8). Each row carries its file evidence, so this is smaller than classify.',
+      },
+      {
+        path: ['dream', 'curateMaxPairs'], kind: 'number', label: 'Curate: pairs per run',
+        hint: 'Candidate pairs examined per run (default 6).',
+      },
+      {
+        path: ['dream', 'profileReviewBatch'], kind: 'number', label: 'Review: candidates per call',
+        hint: 'User-memory candidates judged per call (default 12). Lower it if the review log says '
+          + '"finish max-tokens" — a big batch makes the model think until it exhausts its budget.',
+      },
       {
         path: ROUTES[0].providerPath, kind: 'route-provider', routeId: 'maintenance', label: 'Verify provider',
         hint: 'Provider for the maintenance verify lane. “Auto” leaves the pin off and follows the session route.',
@@ -612,6 +647,23 @@ window.__ModuleLoader__.load({
               overridden: draft === undefined ? stored : (draft.clear ? false : value !== asBool(baseValue)),
             }
           }
+          if (spec.kind === 'lines') {
+            // A list field renders as one path per line. The draft holds the raw
+            // text so an empty line the user typed mid-edit is not silently
+            // dropped; `plan()` does the filtering on save.
+            const asList = (value) => Array.isArray(value)
+              ? value.filter((entry) => typeof entry === 'string')
+              : []
+            const baseList = asList(baseValue)
+            const text = draft === undefined
+              ? (sectionValue === undefined ? asList(spec.fallback) : asList(sectionValue)).join('\n')
+              : (draft.clear ? baseList.join('\n') : draft.text)
+            return {
+              text,
+              invalid: false,
+              overridden: draft === undefined ? stored : (draft.clear ? false : text !== baseList.join('\n')),
+            }
+          }
           if (spec.kind === 'number') {
             const text = draft === undefined
               ? formatNumber(sectionValue)
@@ -788,6 +840,18 @@ window.__ModuleLoader__.load({
               ops.push({ op: 'set', path: spec.path.slice(), value: draft.bool === true })
               continue
             }
+            if (spec.kind === 'lines') {
+              // Blank lines are dropped and an empty result UNSETS the key, so
+              // clearing the box restores the default rather than writing `[]`
+              // into the profile as an explicit (and redundant) value.
+              const list = String(draft.text ?? '')
+                .split('\n')
+                .map((line) => line.trim())
+                .filter((line) => line.length > 0)
+              if (list.length === 0) ops.push({ op: 'unset', path: spec.path.slice() })
+              else ops.push({ op: 'set', path: spec.path.slice(), value: list })
+              continue
+            }
             const write = parseNumberText(draft.text)
             if (write === undefined) {
               blocked = true
@@ -900,6 +964,21 @@ window.__ModuleLoader__.load({
             if (spec.kind === 'route-provider' || spec.kind === 'route-model') {
               return renderRouteField(spec, state, false)
             }
+            if (spec.kind === 'lines') {
+              return el('div', { key: id, style: { margin: '6px 0' } }, [
+                el('label', { key: 'label', htmlFor: id, style: { display: 'block', fontSize: 12 } }, spec.label),
+                el('textarea', {
+                  key: 'input',
+                  id,
+                  rows: Math.max(2, String(state.text).split('\n').length + 1),
+                  value: state.text,
+                  disabled: !shell.writable,
+                  style: { width: '100%', fontFamily: 'monospace', fontSize: 12, boxSizing: 'border-box' },
+                  onChange: (event) => stage(fieldKey(spec.path), { clear: false, text: event.target.value }),
+                }),
+                spec.hint ? el('span', { key: 'hint', style: { display: 'block', fontSize: 11, opacity: 0.7 } }, spec.hint) : null,
+              ])
+            }
             return el('div', { key: id, style: { margin: '6px 0' } }, [
               el('label', { key: 'label', htmlFor: id, style: { display: 'block', fontSize: 12 } }, spec.label),
               el('input', {
@@ -959,6 +1038,25 @@ window.__ModuleLoader__.load({
           }
           if (spec.kind === 'route-provider' || spec.kind === 'route-model') {
             return renderRouteField(spec, state, true)
+          }
+          if (spec.kind === 'lines') {
+            return el('div', { key: id, style: { margin: '10px 0' } }, [
+              el('span', { key: 'label', style: { display: 'block', fontSize: 12, marginBottom: 4 } }, spec.label),
+              el('textarea', {
+                key: 'input',
+                id,
+                rows: Math.max(2, String(state.text).split('\n').length + 1),
+                value: state.text,
+                disabled: !shell.writable,
+                style: { width: '100%', fontFamily: 'monospace', fontSize: 12, boxSizing: 'border-box' },
+                onChange: (event) => stage(fieldKey(spec.path), { clear: false, text: event.target.value }),
+              }),
+              el('span', { key: 'hint', style: { display: 'block', fontSize: 11, opacity: 0.7, marginTop: 4 } },
+                spec.hint === undefined ? '' : spec.hint),
+              state.overridden
+                ? el('button', { key: 'reset', type: 'button', disabled: !shell.writable, onClick: () => stage(fieldKey(spec.path), { clear: true }) }, 'Reset')
+                : null,
+            ])
           }
           return el(SettingsValueField, {
             key: id,

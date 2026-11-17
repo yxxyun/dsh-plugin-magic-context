@@ -15,6 +15,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type { AdapterStores } from '../core/stores.ts'
+import type { CompartmentLease } from '../core/compartment-lease.ts'
 import type { Journal } from '../core/journal.ts'
 import { decidePass, pressurePercent, pressureWindowTokens, withTokenThreshold, type PressurePolicy } from '../core/policy.ts'
 import { machineDomainConfigOf } from './machine-domain-config.ts'
@@ -63,6 +64,13 @@ export interface PreStepDeps {
   ctx: Context
   config: MagicContextDshConfig
   stores: AdapterStores
+  /**
+   * Cross-process lease on compartment state. The in-process `inFlight` guard
+   * covers one process; this covers an HMR remount or a second session sharing
+   * the same database. Optional so tests and stand-alone constructions are
+   * unchanged.
+   */
+  lease?: CompartmentLease
   journal: Journal | undefined
   /** The LLM seam (declared inject); the historian's auxiliary call uses it. */
   llm: HistorianLlm | undefined
@@ -82,6 +90,15 @@ export interface PreStepDeps {
    */
   noteSessionRoute?: (route: { provider: string; model: string }) => void
   /**
+   * The current turn's working directory, recorded so filesystem lanes (git
+   * commit indexing) know which project to read. Optional for the same reason.
+   */
+  noteSessionCwd?: (cwd: string) => void
+  /**
+   * Record one user question as primer evidence. Absent = no primer lane.
+   */
+  recordQuestion?: MemoryLane['recordQuestion']
+  /**
    * Compaction-engine mount/unmount, invoked at EVERY pre-step so the live
    * `registerCompactionEngine` flag follows a settings-form toggle without a
    * restart (volatile commits never remount the plugin, so the old
@@ -89,6 +106,20 @@ export interface PreStepDeps {
    * same reason as {@link noteSessionRoute}. Must not throw.
    */
   reconcileEngine?: () => void
+  /**
+   * Register a project with the background-task scheduler.
+   *
+   * Called once per project identity per process. The scheduler needs to know
+   * WHO to serve before it can run anything, and this is the one place that
+   * already resolves the identity from `config.memory.project ?? session cwd`.
+   * Idempotent and must never throw — a scheduling nicety cannot fail a turn.
+   *
+   * `root` is the unresolved spec (a directory path). The identity is a hash for
+   * a plain directory, so it cannot be turned back into a path later; tasks that
+   * read files (`verify`) need the original string, and this is the only place
+   * that still has both forms at once.
+   */
+  ensureDreamSchedules?: (projectIdentity: string, now: number, root?: string) => void
 }
 
 /**
@@ -210,6 +241,40 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
       }
     }
 
+    // Primer evidence: record the user's question so the maintenance tick can see
+    // that it recurs.
+    //
+    // Recording is deliberately narrow. A primer answers "have we answered this
+    // before", which only makes sense for a real question — so the gate is a
+    // question mark or an interrogative opener, and the text has to be long enough
+    // to be a question rather than a "?" ping. Everything else is conversation.
+    // Fail-open: evidence collection must never cost a turn.
+    if (deps.recordQuestion !== undefined && liveBoolean(config.memory?.promotePrimers, true)) {
+      try {
+        const prompt = latestUserPromptText(messages)
+        const cwd = payload.agent.session.header?.cwd
+        if (prompt !== undefined && cwd !== undefined && looksLikeQuestion(prompt.text)) {
+          const lastMessage = messages.at(-1)
+          const messageId = String((lastMessage as { id?: unknown } | undefined)?.id ?? prompt.turnKey)
+          // Same key the reader uses. `promotePrimers` is handed the project
+          // IDENTITY (from the dream runner), so writing the raw cwd here left
+          // every candidate unreachable: measured 2026-11-17, three candidate
+          // rows sat under `C:\Users\…\default-workspace` while the runner
+          // looked for `dir:af36666a8eb6` and promoted nothing.
+          deps.recordQuestion({
+            projectPath: resolveIdentitySpec(config.memory?.project ?? cwd) ?? cwd,
+            sessionId,
+            question: prompt.text,
+            sourceMessageTime: Date.now(),
+            sourceStartMessageId: messageId,
+            sourceEndMessageId: messageId,
+          })
+        }
+      } catch {
+        // evidence is advisory; never fail the turn for it
+      }
+    }
+
     // Cross-project drift observation: the turn's own text is the only signal
     // DSH gives about WHERE work is happening (there is no per-turn working
     // directory). Foreign git roots in the newest message get one warn-level
@@ -250,6 +315,11 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
           const oldest = sessionIdentity.keys().next().value
           if (oldest !== undefined) sessionIdentity.delete(oldest)
         }
+        // The scheduler serves projects it has been told about, and this is the
+        // only place that resolves an identity. Registering here means a project
+        // becomes schedulable the first time it is opened — no separate config,
+        // and no boot-time scan of every project on disk.
+        deps.ensureDreamSchedules?.(memoryIdentity, Date.now(), projectSpec)
       }
     } catch {
       // registration is advisory; never fail the turn for it
@@ -307,6 +377,8 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
       if (context.provider !== undefined && context.model !== undefined) {
         deps.noteSessionRoute?.({ provider: context.provider, model: context.model })
       }
+      const sessionCwd = payload.agent.session.header?.cwd
+      if (sessionCwd !== undefined) deps.noteSessionCwd?.(sessionCwd)
       const basePassData = {
         reason: pass.reason,
         pressure: pressure === undefined ? undefined : Number(pressure.toFixed(1)),
@@ -530,6 +602,7 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
               },
             },
           ...profile === undefined ? {} : { profile },
+          ...deps.lease === undefined ? {} : { lease: deps.lease },
           // `cursor` is deliberately the CURRENT max mutation id, not the paged
           // read cursor: on a HARD rebuild m[0] swallows everything up to now,
           // so freezing a partial page would re-render rows it already folded.
@@ -706,4 +779,28 @@ export function injectReduceGuidance(deps: PreStepDeps): void {
       },
     }))
   })
+}
+
+/**
+ * Does this user text look like a question worth remembering?
+ *
+ * A primer exists to answer "have we answered this before", which needs a real
+ * question. The gate is intentionally loose-but-not-empty:
+ *
+ *  - a question mark anywhere (covers CJK `？` and `?`);
+ *  - or an interrogative opener, which is how Chinese questions usually start
+ *    even though they often carry no mark at all;
+ *  - and at least a few characters, so "?" and "ok" never become evidence.
+ *
+ * Slash commands are excluded: `/ctx-status` is an instruction to the adapter,
+ * not a question about the project.
+ *
+ * @param text - the user's message text.
+ */
+function looksLikeQuestion(text: string): boolean {
+  const trimmed = text.trim()
+  if (trimmed.length < 6) return false
+  if (trimmed.startsWith('/')) return false
+  if (/[?？]/.test(trimmed)) return true
+  return /^(?:how|what|why|when|where|which|who|can|should|is|are|does|do|did|will|would|has|have|能否|怎么|怎样|如何|为什么|为何|什么|哪些|哪个|哪里|是否|能不能|可不可以|有没有)/i.test(trimmed)
 }

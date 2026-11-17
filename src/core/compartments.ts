@@ -80,11 +80,18 @@ export function compactedPlaceholder(compartmentId: number): string {
   return `[compacted §C${compartmentId}§]`
 }
 
-/** Rough token estimate used for triggering and budgets (chars/4, min 1). */
-export function estimateTokens(text: string): number {
-  return Math.max(1, Math.ceil(text.length / 4))
-}
-
+/**
+ * Token estimate used for triggering and budgets.
+ *
+ * Re-exported from `token-estimate.ts`, which charges ASCII, CJK and "other"
+ * characters at their measured rates instead of assuming 4 characters per token
+ * everywhere. Measured on this install, the old `chars/4` under-counted the
+ * provider's own numbers by 31% (CJK is roughly one token per character); the
+ * per-class estimate lands within 5%. Every caller keeps using this name, so the
+ * improvement arrives everywhere at once rather than at one call site at a time.
+ */
+export { estimateTokens } from './token-estimate.ts'
+import { estimateTokens as estimateTokensImpl } from './token-estimate.ts'
 /**
  * Pick the detail tier for one compartment from its importance and its
  * POSITIONAL age (0 = newest), never its wall-clock age.
@@ -449,14 +456,14 @@ export function renderBaseline(input: {
     for (const [index, compartment] of ordered.entries()) {
       const age = newest - index
       const full = renderCompartment(compartment, age)
-      const fullCost = estimateTokens(full)
+      const fullCost = estimateTokensImpl(full)
       if (used + fullCost <= input.budgetTokens) {
         rendered.push(full)
         used += fullCost
         continue
       }
       const compressed = renderCompartment(compartment, age, 'p4')
-      const compressedCost = estimateTokens(compressed)
+      const compressedCost = estimateTokensImpl(compressed)
       if (used + compressedCost <= input.budgetTokens) {
         rendered.push(compressed)
         used += compressedCost

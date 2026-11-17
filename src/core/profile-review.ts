@@ -75,9 +75,41 @@ export const PROFILE_REVIEW_INTERVAL_MS = 24 * 60 * 60 * 1000
 /** MC's candidate TTL, enforced by expiry regardless of the switch. */
 export const PROFILE_CANDIDATE_TTL_MS = 30 * 24 * 60 * 60 * 1000
 /** Candidates read per review — bounded so one tick cannot become a batch job. */
-export const PROFILE_REVIEW_BATCH = 40
+/**
+ * Candidates per review call.
+ *
+ * 12, not 40. Measured 2026-11-17 against a real profile with 40 waiting: every
+ * run finished with `finish max-tokens` and ZERO text deltas at an 8192 ceiling —
+ * the reasoning phase consumed the entire output budget before emitting any
+ * verdict. The prompt was ~10k tokens of candidate text and the model was asked
+ * to weigh all 40 at once, so it thought until it ran out. A smaller batch both
+ * shortens the reasoning and gives the verdicts room; the pool drains over
+ * several daily runs instead of one.
+ */
+export const PROFILE_REVIEW_BATCH = 12
 /** Output cap for the verdict. */
-export const PROFILE_REVIEW_MAX_TOKENS = 4_096
+/**
+ * Output ceiling for one review call.
+ *
+ * 8192, not 4096: this lane writes a JSON verdict per candidate, and it is the
+ * only model call in the adapter that was still at 4096 while `classify-memories`
+ * and `curate` had both moved to 8192. Measured 2026-11-17 on a real profile —
+ * 40 candidates waiting, two consecutive runs failing with "no text deltas" —
+ * the stream finished without emitting a single text chunk, which is what a
+ * reasoning model running out of budget inside its reasoning phase looks like.
+ * The failure was silent in a way that mattered: it is retried each tick, so the
+ * pool simply never drains.
+ */
+/**
+ * Output ceiling for one review call.
+ *
+ * Raised from 4096 to 16384 after the fix above landed and still truncated:
+ * `finish max-tokens` with zero text deltas means the budget went entirely to
+ * reasoning. 16384 covers a 12-candidate judgement plus its thinking; if a future
+ * model thinks longer, the diagnostic now names the finish reason so the next
+ * adjustment is a one-line change rather than a mystery.
+ */
+export const PROFILE_REVIEW_MAX_TOKENS = 16_384
 /**
  * Wall-clock budget for the review round trip, for the same reason the verify
  * lane has one: the review rides the maintenance tick, and a stream that never
@@ -232,6 +264,17 @@ export interface ProfileReviewOutcome {
   readonly attempted?: boolean
   readonly promoted: number
   readonly consumed: number
+  /**
+   * Candidates the model looked at and left alone.
+   *
+   * Reported separately from `promoted`/`consumed` because "0 promoted" alone is
+   * ambiguous in a way that matters operationally: it reads the same whether the
+   * model judged twelve candidates and kept every one, or never called the model
+   * at all. Measured 2026-11-17 — a run reported `promoted 0, consumed 0` after a
+   * successful call, and the only way to tell it apart from the earlier failures
+   * was the absence of a warn line.
+   */
+  readonly kept?: number
   readonly reason?:
     | 'writer-unavailable'
     | 'no-candidates'
@@ -281,6 +324,7 @@ async function collectText(
       purpose: 'compaction',
       signal,
     })
+    let finishKind: string | undefined
     for await (const raw of chunks) {
       const chunk = raw as { type?: string; index?: number; text?: string; reason?: { kind?: string; failure?: { message?: string } } }
       if (chunk.type === 'text-delta' && typeof chunk.index === 'number' && typeof chunk.text === 'string') {
@@ -294,13 +338,27 @@ async function collectText(
         usage = numeric
       } else if (chunk.type === 'finish') {
         const kind = chunk.reason?.kind
+        finishKind = kind
         if (kind === 'error' || kind === 'aborted') {
           return { ok: false, why: `stream finished (${kind})${chunk.reason?.failure?.message === undefined ? '' : `: ${chunk.reason.failure.message}`}` }
         }
       }
     }
     const text = [...byIndex.entries()].sort(([a], [b]) => a - b).map(([, value]) => value).join('')
-    if (text.trim().length === 0) return { ok: false as const, why: 'stream produced no text deltas' }
+    if (text.trim().length === 0) {
+      // Naming the finish reason is the difference between "the model said
+      // nothing" and "the stream ended before it could": `length` means the
+      // maxTokens ceiling cut it off, `stop` with no deltas means an empty reply.
+      // Measured 2026-11-17: this lane failed with a bare "no text deltas" and 40
+      // candidates waiting, and the reason was not observable.
+      const chunks = byIndex.size
+      return {
+        ok: false as const,
+        why: `stream produced no text deltas`
+          + (finishKind === undefined ? ' (stream never reported finish)' : ` (finish ${finishKind})`)
+          + `, ${String(chunks)} text index(es), maxTokens ${String(PROFILE_REVIEW_MAX_TOKENS)}`,
+      }
+    }
     return { ok: true as const, text, ...usage === undefined ? {} : { usage } }
     }, budgetMs)
   } catch (error) {
@@ -334,7 +392,7 @@ export async function runProfileReview(deps: ProfileReviewDeps): Promise<Profile
   const expired = writer.expireCandidates(now - PROFILE_CANDIDATE_TTL_MS)
 
   if (deps.llm === undefined || deps.route === undefined) {
-    deps.journal.info('maintenance', `profile review skipped (no llm route); expired ${String(expired)}`, {
+    deps.journal.info('profile-review', `profile review skipped (no llm route); expired ${String(expired)}`, {
       expired,
       reason: 'llm-off',
     })
@@ -347,7 +405,7 @@ export async function runProfileReview(deps: ProfileReviewDeps): Promise<Profile
   const batch = Math.max(threshold, deps.batch ?? PROFILE_REVIEW_BATCH)
   const candidates = writer.listCandidates(batch)
   if (candidates.length === 0) {
-    deps.journal.info('maintenance', `profile review skipped (no candidates); expired ${String(expired)}`, {
+    deps.journal.info('profile-review', `profile review skipped (no candidates); expired ${String(expired)}`, {
       expired,
       reason: 'no-candidates',
     })
@@ -355,7 +413,7 @@ export async function runProfileReview(deps: ProfileReviewDeps): Promise<Profile
   }
   if (candidates.length < threshold) {
     deps.journal.info(
-      'maintenance',
+      'profile-review',
       `profile review skipped (${String(candidates.length)} candidate(s) below threshold ${String(threshold)}); expired ${String(expired)}`,
       { expired, candidates: candidates.length, threshold, reason: 'too-few' },
     )
@@ -369,7 +427,7 @@ export async function runProfileReview(deps: ProfileReviewDeps): Promise<Profile
   const sessions = new Set(candidates.map(row => row.sessionId))
   if (sessions.size < minSessions) {
     deps.journal.info(
-      'maintenance',
+      'profile-review',
       `profile review skipped (candidates span ${String(sessions.size)} session(s), need ${String(minSessions)}); expired ${String(expired)}`,
       { candidates: candidates.length, sessions: sessions.size, reason: 'too-few-sessions' },
     )
@@ -380,7 +438,7 @@ export async function runProfileReview(deps: ProfileReviewDeps): Promise<Profile
     + candidates.map(row => renderCandidate(row, now)).join('\n')
   const call = await collectText(deps.llm, deps.route, deps.sessionId, prompt, deps.reviewTimeoutMs ?? PROFILE_REVIEW_TIMEOUT_MS)
   if (!call.ok) {
-    deps.journal.warn('maintenance', `profile review call failed (retried next tick): ${call.why}`, {
+    deps.journal.warn('profile-review', `profile review call failed (retried next tick): ${call.why}`, {
       candidates: candidates.length,
       why: call.why,
       route: `${deps.route.provider}/${deps.route.model}`,
@@ -391,7 +449,7 @@ export async function runProfileReview(deps: ProfileReviewDeps): Promise<Profile
   // (2) Fail closed on the whole verdict: nothing promoted, nothing consumed.
   const verdict = parseProfileReviewOutput(call.text)
   if (verdict === undefined) {
-    deps.journal.warn('maintenance', 'profile review answer rejected (invalid JSON); candidates kept', {
+    deps.journal.warn('profile-review', 'profile review answer rejected (invalid JSON); candidates kept', {
       candidates: candidates.length,
       outputChars: call.text.length,
       outputTail: call.text.slice(-400),
@@ -427,7 +485,7 @@ export async function runProfileReview(deps: ProfileReviewDeps): Promise<Profile
   }
   if (heldBack.length > 0) {
     deps.journal.info(
-      'maintenance',
+      'profile-review',
       `profile review held back ${String(heldBack.length)} candidate(s): a promotion needs observations from ${String(minSessions)} session(s)`,
       { heldBack: [...new Set(heldBack)].sort((left, right) => left - right), reason: 'too-few-sessions' },
     )
@@ -453,12 +511,21 @@ export async function runProfileReview(deps: ProfileReviewDeps): Promise<Profile
   const toDelete = [...new Set([...landed, ...rejected])]
   const consumed = toDelete.length === 0 ? 0 : writer.deleteCandidates(toDelete)
 
+  // Stamp every candidate this pass judged — kept ones included. A "keep" is not
+  // consumption, so without the stamp the same rows return to the head of the
+  // queue on the next run and the ones behind them are never reached.
+  const judged = candidates.map(row => row.id)
+  const stamped = writer.markCandidatesReviewed(judged, now)
   const usage = call.usage !== undefined
     ? { inputTokens: call.usage.inputTokens ?? 0, outputTokens: call.usage.outputTokens ?? 0 }
     : undefined
+  // Candidates the model saw and left alone: neither promoted nor rejected. This
+  // is the number that makes "0 promoted" readable.
+  const leftAlone = candidates.length - new Set([...landed, ...rejected]).size
   deps.journal.info(
-    'maintenance',
+    'profile-review',
     `profile review: ${String(promotedIds.length)} promoted, ${String(consumed)} candidate(s) consumed`
+      + `, ${String(leftAlone)} kept`
       + `${expired > 0 ? `, ${String(expired)} expired` : ''}`,
     {
       ran: true,
@@ -468,8 +535,10 @@ export async function runProfileReview(deps: ProfileReviewDeps): Promise<Profile
       promotedIds,
       consumed,
       rejected: rejected.length,
+      kept: leftAlone,
+      reviewed: stamped,
       ...usage === undefined ? {} : { usage },
     },
   )
-  return { expired, ran: true, attempted: true, promoted: promotedIds.length, consumed }
+  return { expired, ran: true, attempted: true, promoted: promotedIds.length, consumed, kept: leftAlone }
 }

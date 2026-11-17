@@ -77,9 +77,17 @@ export function protectionWindowTokens(contextWindow: number | undefined): numbe
   return Math.min(64_000, Math.max(8_000, Math.round(contextWindow * 0.05)))
 }
 
-/** MC's token estimate for a text length in characters (≈4 chars/token). */
+/**
+ * Token estimate for a text length already reduced to characters.
+ *
+ * The callers here only kept the LENGTH (the node's text is gone by the time a
+ * drop decision is made), so this cannot classify characters. It therefore takes
+ * the conservative direction: budget as if the text were CJK (1 token/char) is
+ * wrong in the other direction, so it keeps 4 chars/token for the ASCII bulk and
+ * relies on `estimateTokens` everywhere the text itself is available.
+ */
 function tokensFor(textLength: number): number {
-  return Math.ceil(textLength / 4)
+  return Math.max(1, Math.ceil(textLength / 4))
 }
 
 /**
@@ -99,20 +107,30 @@ export function reclaimForEmergency(
   const tagged = nodes.filter(node => node.tagNumber !== undefined && !node.isPlaceholder)
   const windowTokens = protectionWindowTokens(contextWindow)
 
-  // Walk newest → oldest: inside the token window, or within the count floor,
-  // a node is protected; the first node past both bounds ends the window.
+  // Which nodes survive. Two independent floors, and the WIDER one wins:
+  //
+  //  - mass window: newest results whose cumulative estimate fits windowTokens
+  //    (upstream `mass_cutoff`);
+  //  - count floor: the newest `policy.protectedToolResults` results
+  //    (upstream's structural `newest3_cutoff`, exposed here as a policy knob).
+  //
+  // Upstream computes this as `cutoff = min(mass_cutoff, newest3_cutoff)` over
+  // tag numbers, i.e. the more conservative of the two. Keeping them separate and
+  // taking the union is the same rule for a surface where every row carries its
+  // own tag, and it preserves the property the count floor exists for: a single
+  // result larger than the whole window must not evict everything.
   const protectedSeqs = new Set<SessionSeq>()
   let protectedTokens = 0
+  let mass = 0
   for (let index = tagged.length - 1; index >= 0; index -= 1) {
     const node = tagged[index] as SurfaceToolNode
     const cost = tokensFor(node.textLength)
-    const withinWindow = windowTokens !== undefined && protectedTokens + cost <= windowTokens
-    if (withinWindow || tagged.length - 1 - index < policy.protectedToolResults) {
-      protectedSeqs.add(node.seq)
-      protectedTokens += cost
-      continue
-    }
-    break
+    const withinMassWindow = windowTokens !== undefined && mass + cost <= windowTokens
+    const withinCountFloor = tagged.length - 1 - index < policy.protectedToolResults
+    if (!withinMassWindow && !withinCountFloor) break
+    protectedSeqs.add(node.seq)
+    protectedTokens += cost
+    if (withinMassWindow) mass += cost
   }
 
   // Drop order: worst tier first, oldest first inside a tier.

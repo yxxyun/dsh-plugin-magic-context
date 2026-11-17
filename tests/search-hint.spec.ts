@@ -49,7 +49,10 @@ describe('buildSearchHint', () => {
     expect(hint).toContain('<ctx-search-hint>')
     expect(hint).toContain('Your memory may contain 2 related fragments:')
     expect(hint).toContain('- [PROJECT_RULES] tenant checks fail closed')
-    expect(hint).toContain('run ctx_memory')
+    // The footer must name the tool that actually exists as a standalone tool.
+    // It once said `ctx_memory with action "search"`, while ctx_search was
+    // registered separately — a decode step between the hint and the action.
+    expect(hint).toContain('run ctx_search')
     expect(hint?.endsWith('</ctx-search-hint>')).toBe(true)
   })
 
