@@ -1636,7 +1636,15 @@ export const Config = z.object({
      * window, clamped to 90% of it. 0 = disabled.
      */
     executeThresholdTokens: z.number().min(0).default(0).volatile(),
-    /** Usage percent (0-100) at which reclaim becomes unconditional. */
+    /**
+     * Usage percent (0-100) at which reclaim becomes unconditional.
+     *
+     * A FLOOR, not a free setting. The band actually in force is
+     * `max(85, executeThreshold + 2)` (upstream `escalationBands`), so a value
+     * below the derivation is ignored — raise it to buy more headroom, but
+     * lowering it below 85 has no effect. The status line prints the effective
+     * value, not this one.
+     */
     forceThreshold: z.number().min(0).max(100).default(85).volatile(),
     /**
      * Window assumed for scheduling when the routed model discloses none.

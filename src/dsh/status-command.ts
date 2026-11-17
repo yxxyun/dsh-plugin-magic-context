@@ -5,6 +5,7 @@
  */
 import { overheadFor } from '../core/token-estimate.ts'
 import type { Context } from '@deepseek-ai/cordis'
+import { effectiveForceThreshold } from '../core/escalation-bands.ts'
 import { decidePass, pressurePercent, pressureWindowTokens } from '../core/policy.ts'
 import type { PressurePolicy } from '../core/policy.ts'
 import type { AdapterStores } from '../core/stores.ts'
@@ -146,7 +147,14 @@ export function registerCtxStatusCommand(ctx: Context, deps: StatusDeps): void {
           + (policy.executeThresholdTokens > 0
             ? `execute-tokens ${String(policy.executeThresholdTokens)} tok (overrides the %), `
             : '')
-          + `force ≥ ${String(policy.forceThreshold)}%, `
+          // The configured value is a floor: the band in force is
+          // max(85, execute + 2), so print the effective one and flag when the
+          // configuration is being raised (a stale lower setting is the
+          // configuration error that produced an empty execute band for hours).
+          + `force ≥ ${String(effectiveForceThreshold(policy))}%`
+          + (effectiveForceThreshold(policy) !== policy.forceThreshold
+            ? ` (configured ${String(policy.forceThreshold)}, derived up), `
+            : ', ')
           // `ttl` is the idle execute band (MC `ttl_execute_fired`): a
           // permission, never a rebuild reason — a pass with nothing to reclaim
           // re-renders byte-identical bytes. 0 = off.
