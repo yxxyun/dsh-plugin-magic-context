@@ -150,11 +150,7 @@ const SCHEMA_DDL = `
     session_id TEXT NOT NULL,
     source_compartment_start INTEGER,
     source_compartment_end INTEGER,
-    created_at INTEGER NOT NULL,
-    -- v14: last time a review pass judged this row. Kept because a "keep"
-    -- verdict does not consume the candidate, so without a stamp the same rows
-    -- return to the head of the queue forever.
-    reviewed_at INTEGER
+    created_at INTEGER NOT NULL
   );
 `
 

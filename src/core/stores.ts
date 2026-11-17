@@ -1063,24 +1063,21 @@ const MIGRATIONS: readonly Migration[] = [
     },
   },
   {
-    // v14: remember which candidates a review pass has already judged.
+    // v14: NO SCHEMA CHANGE. Kept as a numbered placeholder.
     //
-    // `review-user-memories` reads its batch oldest-first, and a candidate the
-    // model answers "keep" for is deliberately not consumed — it may become
-    // promotable once another session corroborates it. Without a
-    // last-looked-at stamp those rows never leave the head of the queue: measured
-    // 2026-11-17, 141 candidates waiting, the same first 12 offered on every run,
-    // and the 129 behind them unreachable forever.
+    // It was written to add `reviewed_at` to `user_memory_candidates`, and that
+    // was a mistake worth recording: this migration runs against the ADAPTER
+    // store (journal, compartments, dream_*), while the candidates table lives in
+    // the upstream MEMORY store — a different file that this adapter reads but
+    // never migrates. The ALTER found no table, the guard returned quietly, and
+    // the version still advanced, so the change looked applied and never was.
+    //
+    // The queue-advance problem it was meant to solve is handled instead by a
+    // cursor in the adapter's `meta` table (`profile:review:cursor`), which needs
+    // no column and no cooperation from the upstream schema.
     version: 14,
-    up: (db) => {
-      // Guarded rather than bare: `ALTER TABLE` has no `IF NOT EXISTS`, and a
-      // migration chain that throws here leaves every later table uncreated. The
-      // candidates table is created by an earlier migration in a real store, but
-      // fixture stores and downgrade replays can reach this point without it.
-      const columns = db.prepare('PRAGMA table_info(user_memory_candidates)').all() as Array<{ name: string }>
-      if (columns.length === 0) return
-      if (columns.some(column => column.name === 'reviewed_at')) return
-      db.exec('ALTER TABLE user_memory_candidates ADD COLUMN reviewed_at INTEGER')
+    up: () => {
+      /* no-op by design — see above */
     },
   },
 ]

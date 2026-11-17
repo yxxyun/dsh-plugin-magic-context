@@ -14,7 +14,8 @@
 import { rmSync } from 'node:fs'
 import { afterEach, describe, expect, it } from 'vitest'
 import { buildReviewUserMemoriesHandler } from '../src/dsh/dream-handlers.ts'
-import { PROFILE_CANDIDATE_TTL_MS, PROFILE_REVIEW_META_KEY } from '../src/core/profile-review.ts'
+import { PROFILE_CANDIDATE_TTL_MS, PROFILE_REVIEW_CURSOR_KEY, PROFILE_REVIEW_META_KEY } from '../src/core/profile-review.ts'
+import { DEFAULT_DREAM_CONFIG } from '../src/dsh/dream-config.ts'
 import { openProfileWriter } from '../src/core/profile-write.ts'
 import type { AdapterStores } from '../src/core/stores.ts'
 import type { Journal } from '../src/core/journal.ts'
@@ -159,11 +160,12 @@ describe('review-user-memories handler', () => {
     }
   })
 
-  it('stamps the rows it judged so the queue advances', async () => {
+  it('advances a cursor so the queue moves on', async () => {
     // The defect this covers: a "keep" verdict does not consume the candidate, so
-    // ordering by `created_at` alone offered the same 12 rows on every run and the
-    // 129 behind them were unreachable. `reviewed_at` is what lets the next pass
-    // move on.
+    // ordering by `created_at` alone offered the same rows on every run and the
+    // rest of the pool was unreachable. The cursor is what lets the next pass
+    // continue — a column was the first attempt and could not work, because the
+    // candidates table lives in the memory store this adapter never migrates.
     const writer = makeWriter()
     try {
       // Three, not two: PROFILE_REVIEW_THRESHOLD is 3, and a two-row batch returns
@@ -176,21 +178,68 @@ describe('review-user-memories handler', () => {
           yield { type: 'text-delta', index: 0, text: '{"promote":[],"reject":[]}' }
         },
       }
+      const meta = new Map<string, string>()
       const handler = buildReviewUserMemoriesHandler({
         reviewUserMemories: {
-          profileWriter: writer, stores: fakeStores(), journal, llm,
+          profileWriter: writer, stores: fakeStores(meta), journal, llm,
           route: () => ({ provider: 'p', model: 'm' }),
         },
       })
       await handler({ projectPath: 'dir:test', now: NOW, tokenBudget: 0, log: () => {} })
 
-      // Read through the writer itself: a second connection would need to see
-      // through whatever transaction discipline the writer uses, and what matters
-      // here is the row as the next pass will read it.
-      const rows = writer.listCandidates(10)
-      expect(rows).toHaveLength(3)
-      // Still present (a keep is not consumption) but stamped.
-      expect(rows.every(row => row.reviewedAt === NOW)).toBe(true)
+      // The rows are still there (a keep is not consumption); what moved is the
+      // cursor, which is what the next pass reads.
+      expect(writer.listCandidates(10)).toHaveLength(3)
+      const cursor = Number(meta.get(PROFILE_REVIEW_CURSOR_KEY) ?? '')
+      expect(Number.isFinite(cursor)).toBe(true)
+      expect(cursor).toBeGreaterThan(0)
+      // And paging past it yields nothing left in this pool.
+      expect(writer.listCandidatesAfter(cursor, 10)).toHaveLength(0)
+    } finally {
+      writer.close()
+    }
+  })
+
+  it('offers a different batch on the next pass', async () => {
+    // The whole point of the cursor: with a batch of 2 and 5 candidates, the
+    // second pass must not see the same two rows again.
+    const writer = makeWriter()
+    try {
+      // Six candidates and a batch of 3: two full passes with no wrap, so the
+      // cursor movement is unambiguous. (The batch is floored at
+      // PROFILE_REVIEW_THRESHOLD = 3.)
+      for (let index = 0; index < 6; index += 1) {
+        seedCandidate(writer, {
+          content: `fact ${String(index)}`,
+          createdAt: NOW - 10_000 + index * 100,
+          sessionId: index % 2 === 0 ? 'a' : 'b',
+        })
+      }
+      const seen: string[] = []
+      const llm = {
+        stream: async function* () {
+          yield { type: 'text-delta', index: 0, text: '{"promote":[],"reject":[]}' }
+        },
+      }
+      const meta = new Map<string, string>()
+      const handler = buildReviewUserMemoriesHandler({
+        reviewUserMemories: {
+          profileWriter: writer, stores: fakeStores(meta), journal, llm,
+          route: () => ({ provider: 'p', model: 'm' }),
+          config: () => ({ ...DEFAULT_DREAM_CONFIG, profileReviewBatch: 3 }),
+        },
+      })
+      // One pass per day: the handler stamps a daily throttle, so the second call
+      // must be a full interval later or it returns `throttled` without touching
+      // the pool — which would make this test pass for the wrong reason.
+      const DAY = 24 * 60 * 60 * 1000
+      for (let pass = 0; pass < 2; pass += 1) {
+        await handler({ projectPath: 'dir:test', now: NOW + pass * DAY, tokenBudget: 0, log: () => {} })
+        seen.push(meta.get(PROFILE_REVIEW_CURSOR_KEY) ?? '')
+      }
+      // Two different cursors: the second pass advanced past the first batch.
+      expect(seen[0]).toBe('3')
+      expect(seen[1]).toBe('6')
     } finally {
       writer.close()
     }

@@ -87,6 +87,18 @@ export const PROFILE_CANDIDATE_TTL_MS = 30 * 24 * 60 * 60 * 1000
  * several daily runs instead of one.
  */
 export const PROFILE_REVIEW_BATCH = 12
+
+/**
+ * The meta key holding the last candidate id a pass judged.
+ *
+ * The queue has to advance even though a "keep" does not consume the row: with
+ * 141 candidates waiting and a 12-row batch, ordering by position and always
+ * starting at the beginning offered the same 12 every run and left the rest
+ * unreachable. `reviewed_at` was the first attempt; it failed because the
+ * candidates table lives in the memory store, which this adapter never migrates,
+ * so the ALTER hit nothing while the schema version still advanced.
+ */
+export const PROFILE_REVIEW_CURSOR_KEY = 'profile:review:cursor'
 /** Output cap for the verdict. */
 /**
  * Output ceiling for one review call.
@@ -290,6 +302,15 @@ export interface ProfileReviewDeps {
   readonly writer: ProfileWriter | undefined
   readonly llm?: ProfileReviewLlm
   readonly route?: { readonly provider: string; readonly model: string }
+  /**
+   * Adapter store, for the review cursor only.
+   *
+   * The candidates table belongs to the upstream memory store, which this adapter
+   * reads but does not migrate — so "which rows has a pass already judged" cannot
+   * be a column here. It is a single `meta` key in the adapter's own store
+   * instead: the id of the last candidate a pass looked at.
+   */
+  readonly stores?: { getMeta(key: string): string | undefined; setMeta(key: string, value: string): void }
   readonly sessionId: string
   readonly journal: Journal
   readonly now?: () => number
@@ -403,7 +424,17 @@ export async function runProfileReview(deps: ProfileReviewDeps): Promise<Profile
   }
   const threshold = Math.max(1, deps.threshold ?? PROFILE_REVIEW_THRESHOLD)
   const batch = Math.max(threshold, deps.batch ?? PROFILE_REVIEW_BATCH)
-  const candidates = writer.listCandidates(batch)
+  // Paged by id, wrapping at the end: a pass that reaches the tail starts over at
+  // the head, so a small pool is re-examined rather than starved.
+  const cursorRaw = Number(deps.stores?.getMeta(PROFILE_REVIEW_CURSOR_KEY) ?? '')
+  const cursor = Number.isFinite(cursorRaw) && cursorRaw > 0 ? cursorRaw : 0
+  let candidates = writer.listCandidatesAfter(cursor, batch)
+  let wrapped = false
+  if (candidates.length < batch && cursor > 0) {
+    const head = writer.listCandidatesAfter(0, batch - candidates.length)
+    candidates = [...candidates, ...head]
+    wrapped = true
+  }
   if (candidates.length === 0) {
     deps.journal.info('profile-review', `profile review skipped (no candidates); expired ${String(expired)}`, {
       expired,
@@ -511,11 +542,12 @@ export async function runProfileReview(deps: ProfileReviewDeps): Promise<Profile
   const toDelete = [...new Set([...landed, ...rejected])]
   const consumed = toDelete.length === 0 ? 0 : writer.deleteCandidates(toDelete)
 
-  // Stamp every candidate this pass judged — kept ones included. A "keep" is not
-  // consumption, so without the stamp the same rows return to the head of the
-  // queue on the next run and the ones behind them are never reached.
-  const judged = candidates.map(row => row.id)
-  const stamped = writer.markCandidatesReviewed(judged, now)
+  // Advance the cursor past the last row this pass judged. A "keep" is not
+  // consumption, so this is the only thing that keeps the queue moving.
+  const lastJudged = candidates[candidates.length - 1]?.id
+  if (lastJudged !== undefined) {
+    deps.stores?.setMeta(PROFILE_REVIEW_CURSOR_KEY, String(wrapped ? 0 : lastJudged))
+  }
   const usage = call.usage !== undefined
     ? { inputTokens: call.usage.inputTokens ?? 0, outputTokens: call.usage.outputTokens ?? 0 }
     : undefined
@@ -536,7 +568,7 @@ export async function runProfileReview(deps: ProfileReviewDeps): Promise<Profile
       consumed,
       rejected: rejected.length,
       kept: leftAlone,
-      reviewed: stamped,
+      cursor: lastJudged ?? 0, wrapped,
       ...usage === undefined ? {} : { usage },
     },
   )

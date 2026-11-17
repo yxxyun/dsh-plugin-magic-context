@@ -118,6 +118,20 @@ for (const kind of kinds) {
   else info(kind, 'none yet since boot (a daily cron may not have come due)')
 }
 
+console.log('\n4b. the review cursor advances (queue does not stall)')
+try {
+  const mem = new DatabaseSync('C:/Users/yxx/.local/share/cortexkit/magic-context-dsh-poc/memories.db', { readOnly: true })
+  const total = (mem.prepare('SELECT COUNT(*) AS n FROM user_memory_candidates').get() as { n: number }).n
+  mem.close()
+  const cursorRow = db.prepare("SELECT value FROM meta WHERE key = 'profile:review:cursor'").get() as { value: string } | undefined
+  const runs = db.prepare("SELECT COUNT(*) AS n FROM dream_runs WHERE task = 'review-user-memories' AND status = 'ok'").get() as { n: number }
+  if (runs.n === 0) info('review has not run yet', `${String(total)} candidates waiting`)
+  else if (cursorRow === undefined) info('no cursor yet', `${String(total)} candidates, ${String(runs.n)} successful run(s) — the first pass may have been throttled`)
+  else info('cursor present', `${cursorRow.value} (pool ${String(total)})`)
+} catch (error) {
+  info('cursor check skipped', String(error).slice(0, 80))
+}
+
 console.log('\n5. the RSS series continues under backfill-vectors')
 const sample = db.prepare("SELECT COUNT(*) AS n, MAX(at) AS last FROM journal WHERE kind = 'memory-sample' AND at > ?").get(afterBoot) as { n: number; last: number | null }
 if (sample.n > 0) ok('memory-sample rows present', `${String(sample.n)} since boot`)
