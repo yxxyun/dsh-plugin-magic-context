@@ -137,7 +137,9 @@ function stateOf(id: number): { status: string; verification: string | null; con
 }
 
 /** Records the prompt and answers with whatever the test hands back. */
-function fakeLlm(answer: (prompt: string) => string | { fail: 'error' }): { llm: VerifyLlm; prompts: string[] } {
+function fakeLlm(
+  answer: (prompt: string) => string | { fail: 'error' } | { empty: 'max-tokens' | 'stop' | 'silent' },
+): { llm: VerifyLlm; prompts: string[] } {
   const prompts: string[] = []
   const llm: VerifyLlm = {
     stream(options) {
@@ -146,6 +148,12 @@ function fakeLlm(answer: (prompt: string) => string | { fail: 'error' }): { llm:
       const reply = answer(text)
       return (async function* () {
         if (typeof reply !== 'string') {
+          if ('empty' in reply) {
+            // A stream that ends with NO text delta — what a reasoning model
+            // spending its whole budget thinking looks like on the wire.
+            if (reply.empty !== 'silent') yield { type: 'finish', reason: { kind: reply.empty } }
+            return
+          }
           yield { type: 'finish', reason: { kind: reply.fail, failure: { message: 'stand-in' } } }
           return
         }
@@ -522,3 +530,42 @@ describe('buildVerifyHandler', () => {
   })
 })
 
+
+
+// Measured 2026-11-17: four consecutive verify runs failed with a bare
+// "stream produced no text deltas" and tokensUsed 24188 (input ~16k + a fully
+// spent 8192 output budget). The cause was inferable only from that number —
+// the failure string did not name the finish reason, so "the model said nothing"
+// and "the ceiling cut it off mid-reasoning" read identically.
+describe('runVerifyTick — a silent stream names its finish reason', () => {
+  it('reports finish max-tokens when the output ceiling cut the reply off', async () => {
+    makeFile('a.py', 5)
+    insertMemory({ id: 1, content: 'a.py:2 is right' })
+    const { llm } = fakeLlm(() => ({ empty: 'max-tokens' }))
+    const calls: Array<{ summary: string; data?: Record<string, unknown> }> = []
+    const outcome = await runVerifyTick({
+      ...baseDeps(),
+      llm,
+      journal: { ...journal, warn: (kind: string, summary: string, data?: Record<string, unknown>) => calls.push({ summary, data }) } as never,
+    })
+    expect(outcome.reason).toBe('llm-failed')
+    const warn = calls.find(call => call.summary.includes('no text deltas'))
+    expect(warn?.summary).toContain('finish max-tokens')
+    expect(warn?.summary).toContain('maxTokens 16384')
+  })
+
+  it('says the stream never reported finish at all', async () => {
+    makeFile('a.py', 5)
+    insertMemory({ id: 1, content: 'a.py:2 is right' })
+    const { llm } = fakeLlm(() => ({ empty: 'silent' }))
+    const calls: Array<{ summary: string }> = []
+    const outcome = await runVerifyTick({
+      ...baseDeps(),
+      llm,
+      journal: { ...journal, warn: (kind: string, summary: string) => calls.push({ summary }) } as never,
+    })
+    expect(outcome.reason).toBe('llm-failed')
+    expect(calls.find(call => call.summary.includes('no text deltas'))?.summary)
+      .toContain('stream never reported finish')
+  })
+})

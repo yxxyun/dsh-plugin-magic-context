@@ -93,8 +93,38 @@ export interface VerifyOutcome {
 }
 
 const DEFAULT_BATCH = 8
-const VERIFY_MAX_TOKENS = 8192
-const VERIFY_TIMEOUT_MS = 120_000
+/**
+ * Output ceiling for one verify call.
+ *
+ * 16384, not 8192. Measured 2026-11-17 on this machine: four consecutive runs
+ * ended `nothing applied: llm-failed` with `tokensUsed: 24188` — input ~16k plus
+ * a fully spent 8192 output budget — and zero text deltas. That is the same
+ * failure `profile-review` had at 8192 (fixed the same way, and it now returns
+ * 5,691 output tokens on a 12-candidate batch): a reasoning model that spends
+ * the whole budget thinking emits nothing, so the lane retries forever and the
+ * pool never drains.
+ *
+ * This lane asks for more per candidate than review does — a verdict AND a
+ * rewritten `content` for every `stale` row, over up to 16 candidates with file
+ * evidence attached — so it needs the larger ceiling, not merely review's.
+ */
+const VERIFY_MAX_TOKENS = 16_384
+/**
+ * Wall-clock ceiling for one verify call.
+ *
+ * 300s, not 120s. Measured 2026-11-17, the run right after the output ceiling
+ * went 8192 → 16384: `deadline no terminal event within 120000ms`, `tokensUsed 0`
+ * — the stream never even reached its `finish` chunk, so not one usage report
+ * arrived. A reasoning model that now has 16,384 tokens to spend spends them:
+ * at this lane's generation rate two minutes is roughly 8-10k tokens, so the
+ * deadline cut the reply before it could finish. The two ceilings have to move
+ * together — raising the output budget alone just moved the failure from
+ * "no text deltas" to "deadline".
+ *
+ * Still under the 5-minute dream tick, so a slow run cannot stack up behind the
+ * next one (and the lease would refuse it anyway).
+ */
+const VERIFY_TIMEOUT_MS = 300_000
 /** How many unverified rows to examine when looking for ones that cite files. */
 const SCAN = 200
 const CONTENT_PREVIEW = 700
@@ -197,6 +227,7 @@ async function collectText(
     return await withDeadline(async (signal) => {
       const byIndex = new Map<number, string>()
       let tokensUsed = 0
+      let finishKind: string | undefined
       const chunks = deps.llm!.stream({
         provider: deps.route!.provider,
         model: deps.route!.model,
@@ -217,6 +248,7 @@ async function collectText(
           }
         } else if (chunk.type === 'finish') {
           const reason = (raw as { reason?: { kind?: string; failure?: { message?: string; code?: string } } }).reason
+          finishKind = reason?.kind
           if (reason !== undefined && (reason.kind === 'error' || reason.kind === 'aborted')) {
             const detail = reason.failure?.message ?? reason.failure?.code
             return {
@@ -228,7 +260,20 @@ async function collectText(
         }
       }
       const text = [...byIndex.entries()].sort(([a], [b]) => a - b).map(([, value]) => value).join('')
-      if (text.length === 0) return { ok: false as const, why: 'stream produced no text deltas', tokensUsed }
+      if (text.length === 0) {
+        // Naming the finish reason is the difference between "the model said
+        // nothing" and "the stream ended before it could": `max-tokens` means
+        // the ceiling cut it off mid-reasoning, `stop` with no deltas means an
+        // empty reply. Without it the only visible symptom was a bare
+        // "no text deltas" and the cause had to be inferred from `tokensUsed`.
+        return {
+          ok: false as const,
+          why: `stream produced no text deltas`
+            + (finishKind === undefined ? ' (stream never reported finish)' : ` (finish ${finishKind})`)
+            + `, maxTokens ${String(VERIFY_MAX_TOKENS)}`,
+          tokensUsed,
+        }
+      }
       return { ok: true as const, text, tokensUsed }
     }, budgetMs)
   } catch (error) {
