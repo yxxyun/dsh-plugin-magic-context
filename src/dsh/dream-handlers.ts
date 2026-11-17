@@ -577,7 +577,9 @@ export function buildReviewUserMemoriesHandler(deps: DreamHandlerDeps): DreamTas
         ? {}
         : { llm: seam.llm, route },
       ...Number.isFinite(lastRaw) && lastRaw > 0 ? { lastReviewAt: lastRaw } : {},
-      ...seam.config === undefined ? {} : { batch: seam.config().profileReviewBatch },
+      ...seam.config === undefined
+        ? {}
+        : { batch: seam.config().profileReviewBatch, minSessions: seam.config().profileReviewMinSessions },
       stores: seam.stores,
     })
     // Stamped only when a call was ATTEMPTED, so a failure is retried rather than

@@ -68,6 +68,15 @@ export const PROFILE_REVIEW_THRESHOLD = 3
  * the symmetric gate (`distinct_identities >= 2`), while this pass only counted
  * the pool size — three near-identical observations from ONE session could
  * promote. Counting distinct sessions closes that hole symmetrically.
+ *
+ * This is the CORE default, not necessarily the running one: the shipped
+ * config sets `profileReviewMinSessions: 1` (see dream-config). Measured
+ * 2026-11-17 on the real pool — 147 candidates over 6 sessions, 83 of them from
+ * one long-running session, and no two candidates normalizing to the same
+ * content — the guard held back all 12 promotions of a successful call. On a
+ * single-operator machine the precondition it demands (the same preference
+ * observed in two DIFFERENT sessions) is not a thing that happens, so `2` makes
+ * the lane pay for a model call every day and promote nothing.
  */
 export const PROFILE_REVIEW_MIN_SESSIONS = 2
 /** At most one review per day (MC's cadence, without MC's scheduler). */

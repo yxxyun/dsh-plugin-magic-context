@@ -563,4 +563,31 @@ describe('runProfileReview', () => {
     expect(profiles(path)).toHaveLength(1)
     expect(candidateContents(path)).toEqual([])
   })
+
+  // The shipped config sets minSessions to 1 (single operator), and that value
+  // has to actually reach the gate — the default 2 held back every promotion of
+  // a successful call on the real pool (measured 2026-11-17).
+  it('promotes from one session when minSessions is lowered to 1', async () => {
+    const path = makeDb()
+    seedCandidate(path, 'prefers terse answers', T0)
+    seedCandidate(path, 'wants numbers not adjectives', T0)
+    seedCandidate(path, 'reads Chinese by default', T0)
+    const fake = answerLlm(JSON.stringify({
+      promote: [{ content: 'prefers terse answers', consume_candidate_ids: [1] }],
+      reject: [3],
+    }))
+    const outcome = await withWriter(path, writer => runProfileReview({
+      writer,
+      llm: fake.llm as never,
+      route: { provider: 'mock', model: 'mock' },
+      sessionId: 'mc-dreamer',
+      journal: recordingJournal([]),
+      now: () => T0,
+      minSessions: 1,
+    }))
+    expect(outcome.promoted).toBe(1)
+    expect(profiles(path).map(row => row.content)).toEqual(['prefers terse answers'])
+    // The rejected one is consumed, the untouched one is not.
+    expect(candidateContents(path)).toEqual(['wants numbers not adjectives'])
+  })
 })

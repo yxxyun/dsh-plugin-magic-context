@@ -33,6 +33,19 @@ export interface DreamRuntimeConfig {
   readonly retrospectiveWindowMs: number
   /** Candidates per `review-user-memories` call (see PROFILE_REVIEW_BATCH). */
   readonly profileReviewBatch: number
+  /**
+   * Distinct sessions a single promotion must rest on (see
+   * PROFILE_REVIEW_MIN_SESSIONS).
+   *
+   * Exposed because the guard can only pass where the same preference was
+   * observed twice in DIFFERENT sessions. Measured 2026-11-17 on the real pool:
+   * 147 candidates across 6 sessions, 83 of them from one long-running session,
+   * and ZERO pairs that normalize to the same content — so every promotion was
+   * held back and the lane burned a call a day to promote nothing. On a
+   * single-operator machine `2` is therefore a permanent stall; `1` promotes
+   * from one session's evidence and trusts the model's own judgement instead.
+   */
+  readonly profileReviewMinSessions: number
   /** Additional trees `verify` may search, always starting with none. */
   readonly verifyExtraRoots: readonly string[]
 }
@@ -54,6 +67,10 @@ export const DEFAULT_DREAM_CONFIG: DreamRuntimeConfig = {
   curateMaxPairs: 6,
   retrospectiveWindowMs: 7 * DAY,
   profileReviewBatch: 12,
+  // 1, not the core default of 2: see the field's docstring. The cross-session
+  // guard stays available for anyone running several sessions per day, but the
+  // shipped default must not be a state machine that never advances.
+  profileReviewMinSessions: 1,
   verifyExtraRoots: [],
 }
 
@@ -67,6 +84,7 @@ const LIMITS = {
   curateMaxPairs: { min: 1, max: 50 },
   retrospectiveWindowMs: { min: 60 * 60 * 1000, max: 365 * DAY },
   profileReviewBatch: { min: 1, max: 60 },
+  profileReviewMinSessions: { min: 1, max: 5 },
 } as const
 
 function clamp(value: number, bounds: { min: number; max: number }): number {
@@ -112,6 +130,10 @@ export function resolveDreamConfig(configured: unknown): DreamRuntimeConfig {
     profileReviewBatch: Math.round(clamp(
       liveNumber(raw.profileReviewBatch, DEFAULT_DREAM_CONFIG.profileReviewBatch),
       LIMITS.profileReviewBatch,
+    )),
+    profileReviewMinSessions: Math.round(clamp(
+      liveNumber(raw.profileReviewMinSessions, DEFAULT_DREAM_CONFIG.profileReviewMinSessions),
+      LIMITS.profileReviewMinSessions,
     )),
     // Empty entries are dropped: an empty string would resolve to the process
     // cwd inside `buildFileIndex` and index the entire working tree by accident.

@@ -1443,6 +1443,15 @@ export const Config = z.object({
      *  makes the model think until it exhausts its output budget. */
     profileReviewBatch: z.number().min(1).max(60).default(12).volatile(),
     /**
+     * Distinct sessions one promotion must rest on.
+     *
+     * Measured 2026-11-17: the real pool had 147 candidates from 6 sessions and
+     * not one cross-session duplicate, so the old fixed 2 held back every
+     * promotion, every day, forever. 1 is the single-operator default; raise it
+     * only if this machine runs several independent sessions per day.
+     */
+    profileReviewMinSessions: z.number().min(1).max(5).default(1).volatile(),
+    /**
      * Extra trees `verify` may search for cited files, e.g. `C:/data/code`.
      *
      * Point these at PARENT directories of your checkouts, not at each project:
