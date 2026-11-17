@@ -347,11 +347,15 @@ export const PHASES = [
     specs: PHASE_E,
     checks: [],
     blind: [
-      'promote-primers 与 classify-memories 有 handler；verify / curate / retrospective '
-      + '在 registry 里有名字与预算，但无 handler，跑起来记 skipped 而非失败——'
-      + '这是阶段顺序的显式事实，不是缺陷',
-      'classify 只重排 importance：scope / shareable 有意不写（分享范围归人工发布闸门，'
-      + '不能让夜间模型调用悄悄扩大可见性）；上游 classify 三个字段全写，这里是有意收窄',
+      '全部十个任务都有 handler（dream-handlers.ts）：promote-primers / classify-memories / '
+      + 'verify(316) / curate(383) / retrospective(490) / auto-stage(632) / index-commits(715) / '
+      + 'evaluate-smart-notes / review-user-memories / backfill-vectors。'
+      + '本阶段只验证调度骨架（时钟、lease、预算、失败隔离），不验证各 handler 的判定质量——'
+      + '那属于各自模块的 spec，2026-11-17 已实测 verify 在真机跑通（158s / 36,902 tokens）',
+      'classify 会写 scope / shareable（CLASSIFY_SHARING），但只有一个方向：语句带 '
+      + 'AND shareable = 0，已共享的行被排除，所以能「私有→共享」、不能撤回也不能二次扩大；'
+      + 'blocked 由 shareable-guard 判定并强制回写为私有。早期文档写「有意完全不写」，'
+      + '2026-11-17 代码分析（P1-9）指出与实现相反，已按实际行为改正',
       'cron 只在本地墙钟时区验证；跨时区（同一 db 被不同 TZ 的进程打开）未测，'
       + '结论是 next_due_at 是绝对 epoch，跨时区不会重复触发但触发时刻跟随写入方',
       'lease 的跨进程互斥用同一 db 文件的第二个 openStores 模拟，'

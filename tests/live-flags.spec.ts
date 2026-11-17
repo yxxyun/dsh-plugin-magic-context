@@ -39,6 +39,20 @@ describe('memoryLaneEnabled', () => {
     expect(memoryLaneEnabled({ memoryLive: { get: () => undefined } })).toBe(true)
   })
 
+  it('unwraps a nested volatile getter instead of falling back', () => {
+    // `config.a?.b?.enabled` arrives as a wrapper of a wrapper. Resolving one
+    // layer fell straight through to the default, and the boot line printed that
+    // default as if it were the configured value (code analysis 2026-11-17,
+    // P1-13: `liveBoolean` did not go through `liveValue` like its siblings).
+    const nested = (inner: unknown) => ({ get: () => ({ get: () => inner }) })
+    expect(memoryLaneEnabled({ memoryLive: nested(false) })).toBe(false)
+    expect(memoryLaneEnabled({ memoryLive: nested(true) })).toBe(true)
+    // Deep nesting is the same rule, and a non-boolean at the bottom still
+    // cannot turn the lane off.
+    expect(memoryLaneEnabled({ memoryLive: { get: () => nested(false) } })).toBe(false)
+    expect(memoryLaneEnabled({ memoryLive: nested('nope') })).toBe(true)
+  })
+
   it('cannot turn on a lane the mount switch closed', () => {
     expect(memoryLaneEnabled({ memoryEnabled: false, memoryLive: true })).toBe(false)
   })

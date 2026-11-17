@@ -159,6 +159,11 @@ export function ensureDreamSchedules(
  * Compute the next due instant after a run.
  *
  * Success → the next natural cron slot.
+ * Skipped → the next natural cron slot, UNLESS the skip named a cause that
+ * resolves itself (no LLM route yet, project root not registered yet). Those
+ * carry `retryInMs` and get `min(cron slot, now + retry)`, because burning a
+ * whole day on a condition that clears in minutes is how a remount silently
+ * lost `verify` and `index-commits` for a day (measured 2026-11-17).
  * Failure → the earlier of (cron slot, exponential backoff), so a transient
  * failure retries soon while a persistent one settles back onto the cron
  * cadence after {@link BACKOFF_MAX_ATTEMPTS}.

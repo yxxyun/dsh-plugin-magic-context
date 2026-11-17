@@ -52,14 +52,19 @@ export function liveStringArray(value: unknown, fallback: readonly string[]): st
   return out
 }
 
-/** Same as {@link liveNumber} for booleans (volatile toggles). */
+/**
+ * Same as {@link liveNumber} for booleans (volatile toggles).
+ *
+ * Unwrapping goes through {@link liveValue} like every other reader here, because
+ * the wrapper chain can be nested (`config.a?.b?.enabled`). Resolving only one
+ * `.get()` — which this function did until 2026-11-17 (code analysis P1-13) —
+ * silently fell through to the default on a nested toggle, and the boot line then
+ * reported the fallback as if it were the configured value, so nothing pointed at
+ * the bug.
+ */
 export function liveBoolean(value: unknown, fallback: boolean): boolean {
-  if (typeof value === 'boolean') return value
-  if (value !== null && typeof value === 'object' && typeof (value as { get?: unknown }).get === 'function') {
-    const current = (value as { get(): unknown }).get()
-    if (typeof current === 'boolean') return current
-  }
-  return fallback
+  const resolved = liveValue(value)
+  return typeof resolved === 'boolean' ? resolved : fallback
 }
 
 /**

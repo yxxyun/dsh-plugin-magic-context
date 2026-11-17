@@ -22,12 +22,28 @@
  * an edit, so the mutation log, the §4.5 clears and `updated_at` all stay out of
  * it.
  *
- * ## What it deliberately does NOT do
+ * ## Scope and sharing: one direction, never the other
  *
- * Upstream's classify also rewrites `scope` and `shareable`. This adapter keeps
- * those out: `classifyMemories` (the only writer here) banks importance plus the
- * `classified_at` stamp, and the sharing decision belongs to the human publish
- * gate, not to a nightly model call that could quietly widen visibility.
+ * This file used to say the adapter kept `scope` and `shareable` out entirely,
+ * "the sharing decision belongs to the human publish gate". That stopped being
+ * true and the paragraph was never revised — code analysis 2026-11-17
+ * (docs/reports/code-analysis-2026-11-17.md, P1-9) flagged the contradiction
+ * against `CLASSIFY_SHARING` in `memory-write.ts:709-713`. What actually happens:
+ *
+ *  - `classifyMemories` DOES write `shareable`/`scope`, but only when the entry
+ *    carries a `shareable` verdict, and always through a separate statement whose
+ *    `AND shareable = 0` guard excludes every row that is already shared. So the
+ *    lane can only ever move a row **private → shared**; it cannot withdraw a
+ *    share, and it cannot re-widen one either. Withdrawal stays a human act,
+ *    which is the half of the original claim that survived.
+ *  - `shareable-guard.assessShareability` is consulted in this file before the
+ *    verdict is applied, and `blocked` overrides the model: a blocked entry is
+ *    written back as private rather than skipped, so an earlier permissive score
+ *    cannot stand (`memory-write.ts:1882-1887`).
+ *
+ * The honest summary is "one-way promotion under a guard", not "no sharing
+ * writes". Narrowing it further would mean dropping `CLASSIFY_SHARING`
+ * altogether; until then the docstring has to describe the code that runs.
  */
 
 import type { Journal } from './journal.ts'
