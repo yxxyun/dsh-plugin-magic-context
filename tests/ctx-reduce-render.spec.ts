@@ -41,6 +41,21 @@ function reduceRender(): Render {
 const renderText = (value: unknown): string =>
   reduceRender()({ drop: '1' }, value).map(block => block.text ?? '').join('\n')
 
+/** Capture the whole registered definition, for the description itself. */
+function reduceDefinition(): {
+  readonly description: string
+  readonly parameters: Record<string, { readonly description?: string }>
+} {
+  const holder: { options?: { description: string; parameters: Record<string, { readonly description?: string }> } } = {}
+  const defineTool = ((options: unknown) => {
+    holder.options = options as typeof holder.options
+    return options
+  }) as unknown as LocalDefineTool
+  defineCtxReduceTool({ stores: {} as AdapterStores, defineTool })
+  if (holder.options === undefined) throw new Error('ctx_reduce did not register a definition')
+  return holder.options
+}
+
 describe('ctx_reduce reply is a count (MC 0.49.1 parity)', () => {
   it('positive: a 3-tag batch renders one count line, and no tag handles', () => {
     const text = renderText({ ok: true, queued: [3, 4, 5], refused: [] })
@@ -72,5 +87,51 @@ describe('ctx_reduce reply is a count (MC 0.49.1 parity)', () => {
   it('nothing queued and nothing refused says so once', () => {
     expect(renderText({ ok: true, queued: [], refused: [] })).toBe('Nothing queued.')
     expect(renderText({})).toBe('Nothing queued.')
+  })
+})
+
+
+// The description is the only place an agent learns WHAT to stamp and what to
+// leave alone. The port had shipped 324 chars (25% of upstream) — the queue
+// mechanics without the judgement — and a tool that only says "mark things you
+// no longer need" produces either timidity or blanket sweeps.
+describe('ctx_reduce description carries the stamp/keep judgement', () => {
+  it('states the two lists verbatim from upstream', () => {
+    const description = reduceDefinition().description
+    expect(description).toContain('Stamp: file reads, search results and tool outputs')
+    expect(description).toContain('build/test output after you acted on it')
+    expect(description).toContain('Keep: user messages (never stamp one for its directive)')
+    expect(description).toContain('raw evidence you have not extracted yet')
+  })
+
+  it('forbids blanket ranges and prefers many small stamps', () => {
+    const description = reduceDefinition().description
+    expect(description).toContain('never blanket-stamp a range like "1-50"')
+    expect(description).toContain('Many small targeted stamps beat one sweep')
+  })
+
+  it('reframes the question as "what comes next", not "have I read it"', () => {
+    expect(reduceDefinition().description)
+      .toContain('does this need to stay on my desk for what comes next?')
+  })
+
+  it('names BOTH recovery channels instead of promising nothing is lost', () => {
+    // Upstream promises "the newest tags are protected so stamping recent output
+    // is harmless". This host has no such floor for a MANUAL stamp (it lands the
+    // next time the execute band opens), so the honest claim is recoverability:
+    // tag while the placeholder lives, event seq after the fold.
+    const description = reduceDefinition().description
+    expect(description).toContain('[dropped §N§]')
+    expect(description).toContain('message=<seq>')
+    expect(description).toContain('folded into a compartment')
+    expect(description).not.toContain('the newest tags are protected')
+  })
+
+  it('advertises the range syntax the parser actually accepts', () => {
+    // parseTagRanges handles "3-5", "1,2,9" and the mixed "1-5,8,12-15"; a
+    // description that showed only single numbers would hide the batch form.
+    const definition = reduceDefinition()
+    expect(definition.description).toContain('"3-5", "1,2,9", "1-5,8,12-15"')
+    expect(definition.parameters.drop?.description).toContain('1-5,8,12-15')
   })
 })

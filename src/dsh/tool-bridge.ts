@@ -148,13 +148,32 @@ export function defineCtxReduceTool(deps: ToolBridgeDeps): unknown {
   const defineTool = deps.defineTool
   return defineTool<{ readonly drop: string }>({
     name: 'ctx_reduce',
+    // Ported from upstream `ctx-reduce/constants.ts` (1292 chars) with two
+    // platform corrections, both measured here rather than assumed:
+    //   - upstream promises "the newest tags are protected so stamping recent
+    //     output is harmless". This host protects the newest
+    //     `policy.protectedToolResults` (8) nodes from the AUTOMATIC reclaim, but
+    //     a manual stamp has no such floor: it lands the next time the execute
+    //     band opens. So the promise is not "it will not be cleared" but "it is
+    //     recoverable when it is", which is what the text now says.
+    //   - the way back is two channels here, not one: the tag while the
+    //     placeholder lives, the event seq after the message is folded away.
     description:
-      'Mark conversation items you no longer need so their tokens are reclaimed. '
-        + 'Pass tag IDs you saw on tool outputs: drop: "3-5, 1, 9". '
-        + 'Marks are queued and land when the context manager opens its reclaim band; '
-        + 'dropped tool outputs become `[dropped §N§]` placeholders. Nothing is lost: '
-        + 'ctx_expand restores any original.',
-    parameters: { drop: { type: 'string', required: true } },
+      'Stamp an item on your desk as no longer needed for the work ahead. '
+        + 'Not a delete: stamping QUEUES it, and the item stays fully readable until the context manager clears stamped items in one sweep. '
+        + 'A cleared item goes to the archive — a recent one leaves a `[dropped §N§]` placeholder, an older one leaves nothing — and `ctx_expand` is the way back either way: by tag while the placeholder is on your desk, by `message=<seq>` once the message has been folded into a compartment. '
+        + 'So the question before stamping is not "have I finished reading this?" but "does this need to stay on my desk for what comes next?" — a file you read and will keep editing stays; the grep that found it goes. '
+        + 'Stamp: file reads, search results and tool outputs the work ahead no longer needs; build/test output after you acted on it; repeated or redundant dumps; data written to disk; status/log output that only confirmed what you expected; a large block pasted inside a user message once you have used it. '
+        + 'Keep: user messages (never stamp one for its directive), your own conversation text, unresolved errors, raw evidence you have not extracted yet, and outputs whose exact wording may still matter. '
+        + 'Look at each tag before stamping it; never blanket-stamp a range like "1-50". Many small targeted stamps beat one sweep. '
+        + '`drop` accepts "3-5", "1,2,9", "1-5,8,12-15".',
+    parameters: {
+      drop: {
+        type: 'string',
+        required: true,
+        description: 'Tag numbers from §N§ tags on your surface. Ranges and lists mix: "3-5, 1, 9" or "1-5,8,12-15".',
+      },
+    },
     output: {
       schema: { type: 'json' },
       render: (_args, value) => {
