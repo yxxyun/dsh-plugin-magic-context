@@ -718,6 +718,36 @@ describe('#802: a run that published nothing waits for a newer message', () => {
     })
   }
 
+  it('still runs when the span cap equals the trigger budget', async () => {
+    // Regression, 2026-11-18: capping the span and then comparing the CAPPED
+    // size against the trigger budget disabled the historian outright. With
+    // historianMaxSpanTokens = historianTriggerBudget, every eligible span
+    // arrived already cut to <= the threshold that justifies running, so the
+    // RCC session escalated on every pass from 07:13 on and never started a run.
+    // The trigger must read the BACKLOG; the cap only sizes the RUN.
+    await withStore(async (stores) => {
+      const calls: Call[] = []
+      const journal = recordingJournal(calls)
+      const budget = 1_000
+      const cappedPolicy = {
+        ...DEFAULT_POLICY,
+        historianProtectedNodes: 0,
+        historianMinNodes: 1,
+        historianMinBudgetTokens: budget,
+        historianMaxSpanTokens: budget, // equal on purpose
+      }
+      const llm = answerLlm(digest())
+      await runHistorian(
+        { stores, policy: cappedPolicy, llm: llm.llm as HistorianLlm, logger: silent, journal, route },
+        { sessionId: SESSION, session: stub(40), nodes: wideNodes(40), contextWindow: 10_000 },
+      )
+      // A run happened: the cap must not be read as "too small to bother".
+      expect(phases(calls)).toContain('start')
+      // And it stayed inside one call: the span was cut, not chunked.
+      expect(calls.some(call => call.summary.includes('chunks'))).toBe(false)
+    })
+  })
+
   it('skips the same span after a failed run and resumes on a newer node', async () => {
     await withStore(async (stores) => {
       const calls: Call[] = []

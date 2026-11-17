@@ -1041,9 +1041,15 @@ async function runHistorianExclusive(
     deps.policy.historianAssumedWindow,
     deps.policy.historianMinBudgetTokens,
   )
-  if (input.forcedRange === undefined && cappedRange.tokens < budget) {
+  // The trigger is about the BACKLOG, the cap is about the RUN. Comparing the
+  // capped size here would make a cap equal to the budget disable the historian
+  // entirely — every span would arrive already cut down to less than the
+  // threshold that justifies running. Measured 2026-11-18: with
+  // historianMaxSpanTokens = 13107 = the trigger budget, the RCC session
+  // escalated on every pass from 07:13 onward and never started a single run.
+  if (input.forcedRange === undefined && range.tokens < budget) {
     deps.logger.info(
-      `magic-context historian: eligible span ${String(cappedRange.tokens)} tokens is below the ${String(budget)}-token trigger`,
+      `magic-context historian: eligible span ${String(range.tokens)} tokens is below the ${String(budget)}-token trigger`,
     )
     return undefined
   }
