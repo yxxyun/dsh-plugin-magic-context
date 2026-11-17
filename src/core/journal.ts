@@ -31,6 +31,10 @@ export type JournalKind =
   | 'session-first-seen'
   | 'pass'
   | 'drop-landed'
+  /** Rolling drain budget accounting (upstream a1ca346 `protectedTailDrain*`).
+   *  Emitted only when a pass actually reclaimed tokens, so the row count is
+   *  the number of productive drains, not the number of execute attempts. */
+  | 'drain'
   /** A queued drop retired without landing: its target left the surface
    *  (compacted into a compartment, or the call id no longer maps to a tag).
    *  Kept separate from `drop-landed` because it reclaims no tokens — counting

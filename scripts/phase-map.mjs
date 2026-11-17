@@ -22,6 +22,15 @@
 const PHASE_BASE = [
   'tests/phase-map.spec.ts',
   'tests/client-pure.spec.ts',
+  // Anti-idle gates ported from upstream mc-upstream a1ca346: the derived force
+  // band, the rolling drain budget, the emergency latch, and the post-drop
+  // projection that decides when summarisation is the only lever left.
+  'tests/escalation-bands.spec.ts',
+  'tests/drain-budget.spec.ts',
+  'tests/drain-latch.spec.ts',
+  'tests/drop-projection.spec.ts',
+  'tests/starved-registry.spec.ts',
+  'tests/starved-escalation.spec.ts',
   // `ctx_search`'s from/to contract: a date-only `to` must cover the whole day,
   // and an impossible date must be refused rather than normalised by Date.UTC.
   'tests/date-range.spec.ts',

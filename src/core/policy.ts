@@ -167,7 +167,14 @@ export type PassDecision =
   // produced; the band is back as `cache-ttl-idle`. Historic journal rows still
   // carry the old string, so readers of stored data must keep tolerating it.
   | { readonly kind: 'execute'; readonly reason: 'execute-threshold' | 'wire-repair' | 'cache-ttl-idle' }
-  | { readonly kind: 'defer'; readonly reason: 'no-usage' | 'no-window' | 'below-threshold' }
+  | {
+      readonly kind: 'defer'
+      readonly reason: 'no-usage' | 'no-window' | 'below-threshold'
+        /** The rolling drain budget for this window is spent (upstream
+         * `getProtectedTailDrainBudgetSkip`). A hold, not a stop: nothing is
+         * charged and the window resets on its own. */
+        | 'drain-budget-exhausted'
+    }
 
 /**
  * One pass decision. Mirrors MC's scheduler (`scheduler.ts:116-119`): execute

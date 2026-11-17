@@ -23,7 +23,7 @@ import { openCompartmentLease, type CompartmentLease, type LeaseDatabase } from 
 import { openDreamLease, type DreamLease, type DreamLeaseOptions } from './dream-lease.ts'
 import type { TagRecord, TagTarget, UsageRecord } from './types.ts'
 
-export const SCHEMA_VERSION = 14
+export const SCHEMA_VERSION = 15
 
 /** The m[0]/m[1] baseline identity for one session. */
 export interface BaselineState {
@@ -322,6 +322,17 @@ export interface AdapterStores {
    * pass that just landed it from ever reclaiming again.
    */
   latestHistoryChangeAt(sessionId: string): number | undefined
+  /**
+   * Drain accounting for one session: the rolling budget window and the
+   * emergency latch. Mirrors upstream mc-upstream a1ca346's per-session
+   * `protectedTailDrain*` / `emergencyDrainActive` / `historianDrainFailureAt`.
+   *
+   * A missing row is the neutral state (no window, no latch, no failure), never
+   * an error: a session that has never drained has no accounting to report.
+   */
+  getDrainState(sessionId: string): DrainStateRow
+  /** Persist drain accounting. Upsert — one row per session, last writer wins. */
+  putDrainState(sessionId: string, state: DrainStateRow): void
   queueDrop(sessionId: string, tagNumber: number, now: number): void
   /** Pending (not yet landed) drop tag numbers, oldest first. */
   listPendingDrops(sessionId: string): number[]
@@ -1089,7 +1100,62 @@ const MIGRATIONS: readonly Migration[] = [
       /* no-op by design — see above */
     },
   },
+  {
+    // v15: per-session drain accounting — the rolling budget window and the
+    // emergency latch. Both are derived from upstream mc-upstream a1ca346
+    // (`protectedTailDrainWindowStartedAt` / `protectedTailDrainTokens` /
+    // `emergencyDrainActive` / `historianDrainFailureAt`), which store them in
+    // its `session_meta` table; this adapter keeps one row per session here.
+    //
+    // Why it must be persisted rather than held in memory: the budget is a
+    // 10-minute window and the latch a 30-minute backstop. Both outlive a
+    // process restart far more often than not, and an in-memory latch would
+    // silently re-admit the drain exactly when the irreducible floor is what
+    // keeps pressure high.
+    //
+    // `IF NOT EXISTS` matches v13: a migration chain replayed against a database
+    // that was rewound by hand (the schema tests do exactly this) must not abort
+    // on a table an earlier pass already created.
+    version: 15,
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS drain_state(
+          session_id TEXT PRIMARY KEY,
+          window_started_at INTEGER NOT NULL DEFAULT 0,
+          spent_tokens INTEGER NOT NULL DEFAULT 0,
+          latch_active_since INTEGER NOT NULL DEFAULT 0,
+          failure_at INTEGER NOT NULL DEFAULT 0
+        );
+      `)
+    },
+  },
 ]
+
+/**
+ * Per-session drain accounting (schema v15). Mirrors the four columns upstream
+ * mc-upstream a1ca346 keeps in `session_meta`.
+ *
+ * All four are epoch ms or token counts; 0 always means "unset" so a missing
+ * row and a cleared row are indistinguishable, which is what lets the latch and
+ * the window be reset by writing zeros.
+ */
+export interface DrainStateRow {
+  /** Epoch ms the rolling drain budget window opened; 0 = none. */
+  readonly windowStartedAt: number
+  /** Tokens reclaimed inside the current window. */
+  readonly spentTokens: number
+  /** Epoch ms the emergency latch engaged; 0 = released. */
+  readonly latchActiveSince: number
+  /** Epoch ms of the last failed drain run; 0 = none. */
+  readonly failureAt: number
+}
+
+export const EMPTY_DRAIN_STATE: DrainStateRow = {
+  windowStartedAt: 0,
+  spentTokens: 0,
+  latchActiveSince: 0,
+  failureAt: 0,
+}
 
 export class StoreAheadOfAdapterError extends Error {
   // Declared explicitly rather than as constructor parameter properties: the
@@ -1306,8 +1372,39 @@ export function openStores(dataDir: string): AdapterStores {
     }
   }
 
-  const queueDrop = (sessionId: string, tagNumber: number, now: number): void => {
+  const getDrainState = (sessionId: string): DrainStateRow => {
+    try {
+      const row = db.prepare(
+        'SELECT window_started_at, spent_tokens, latch_active_since, failure_at '
+          + 'FROM drain_state WHERE session_id = ?',
+      ).get(sessionId) as
+        | { window_started_at?: number; spent_tokens?: number; latch_active_since?: number; failure_at?: number }
+        | undefined
+      if (row === undefined) return EMPTY_DRAIN_STATE
+      return {
+        windowStartedAt: typeof row.window_started_at === 'number' ? row.window_started_at : 0,
+        spentTokens: typeof row.spent_tokens === 'number' ? row.spent_tokens : 0,
+        latchActiveSince: typeof row.latch_active_since === 'number' ? row.latch_active_since : 0,
+        failureAt: typeof row.failure_at === 'number' ? row.failure_at : 0,
+      }
+    } catch {
+      // Accounting must never fail the turn that asked for it. A neutral state
+      // admits the pass, which is the pre-latch behaviour.
+      return EMPTY_DRAIN_STATE
+    }
+  }
+
+  const putDrainState = (sessionId: string, state: DrainStateRow): void => {
     db.prepare(
+      'INSERT INTO drain_state(session_id, window_started_at, spent_tokens, latch_active_since, failure_at) '
+        + 'VALUES(?, ?, ?, ?, ?) '
+        + 'ON CONFLICT(session_id) DO UPDATE SET window_started_at = excluded.window_started_at, '
+        + 'spent_tokens = excluded.spent_tokens, latch_active_since = excluded.latch_active_since, '
+        + 'failure_at = excluded.failure_at',
+    ).run(sessionId, state.windowStartedAt, state.spentTokens, state.latchActiveSince, state.failureAt)
+  }
+
+  const queueDrop = (sessionId: string, tagNumber: number, now: number): void => {    db.prepare(
       'INSERT INTO pending_drops(session_id, tag_number, queued_at) VALUES(?, ?, ?) '
         + 'ON CONFLICT(session_id, tag_number) DO UPDATE SET queued_at = excluded.queued_at '
         + 'WHERE landed_event_seq IS NOT NULL',
@@ -2317,6 +2414,8 @@ export function openStores(dataDir: string): AdapterStores {
     workMetrics,
     compartmentLease,
     latestHistoryChangeAt,
+    getDrainState,
+    putDrainState,
     queueDrop,
     listPendingDrops,
     markDropLanded,
