@@ -706,10 +706,25 @@ const CLASSIFY_MEMORY = `
  *    columns only. Putting it on the combined statement would silently freeze the
  *    importance of every shared row.
  */
+/**
+ * Sharing columns, writable in BOTH directions.
+ *
+ * The `AND shareable = 0` guard that used to be here made this a one-way
+ * promotion: a row could go private → shared, never back. Upstream has no such
+ * guard — `setMemoryClassification` (storage-memory.ts:1134+) updates whichever
+ * columns actually changed, so a later run that scores a row private takes the
+ * share away. The guard was this adapter's own invention, and it is the reason
+ * `CLASSIFY_SHARING` could leave a row shared forever while its content drifted
+ * toward something the guard would now block.
+ *
+ * Safety does not depend on the guard: `assessShareability` (shareable-guard.ts,
+ * ported from upstream `shared/redaction.ts`) runs in classify-memories.ts
+ * before any verdict is applied, and a `blocked` entry is forced private. That
+ * is the same fail-closed rule upstream enforces at classify.ts:762-766.
+ */
 const CLASSIFY_SHARING = `
   UPDATE memories SET shareable = ?, scope = ?
    WHERE project_path = ? AND id = ? AND status IN ('active','permanent')
-     AND shareable = 0
 `
 
 /** Merge target (canonical) aggregation (§11.4). */

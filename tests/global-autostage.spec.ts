@@ -140,6 +140,80 @@ describe('autoStageGlobalCandidates', () => {
     expect(candidate?.suggestionReason).toBe('machine env')
   })
 
+  /**
+   * Staging now publishes when the gate accepts it.
+   *
+   * The approval card is gone from this path: the standing rule is to follow
+   * upstream, and upstream decides sharing through classify with no human step.
+   * `approvalGate` survives as the mechanical half (credential scan, domain and
+   * category allowlist, domain cap) — a candidate it refuses stays pending and
+   * is still approvable by hand.
+   */
+  it('publishes a gated candidate straight into the domain', async () => {
+    const s = storeWithDomains(true, true)
+    const contract = makeContract([
+      { id: 21, content: '本机 Python 统一走 uv。', category: 'CONSTRAINTS', seen: 2 },
+    ])
+    const published: Array<{ identity: string; content: string }> = []
+    const result = await autoStageGlobalCandidates({
+      store: s,
+      corpusDbPath: contract,
+      now: NOW,
+      llm: classifyLlm({ '本机 Python 统一走 uv。': { domain: 'machine', reason: 'machine env' } }),
+      route: { provider: 'mock', model: 'mock' },
+      writer: {
+        publishDomainMemory: (input) => { published.push({ identity: input.identity, content: input.content }); return { ok: true as const, id: 900, created: true } },
+        countDomainMemories: () => 0,
+      },
+    })
+    expect(result.published).toHaveLength(1)
+    expect(result.refused).toHaveLength(0)
+    expect(published).toEqual([{ identity: 'dir:global:machine', content: '本机 Python 统一走 uv。' }])
+    expect(s.getGlobalCandidate(result.staged[0]!.candidateId)?.state).toBe('approved')
+  })
+
+  it('leaves a gate-refused candidate pending for manual review', async () => {
+    const s = storeWithDomains(true, true)
+    const contract = makeContract([
+      // A credential in the body is exactly what `approvalGate` scans for.
+      { id: 22, content: 'Deploy key: ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', category: 'CONSTRAINTS', seen: 2 },
+    ])
+    const result = await autoStageGlobalCandidates({
+      store: s,
+      corpusDbPath: contract,
+      now: NOW,
+      llm: classifyLlm({ 'Deploy key: ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa': { domain: 'machine', reason: 'machine env' } }),
+      route: { provider: 'mock', model: 'mock' },
+      writer: {
+        publishDomainMemory: () => ({ ok: true as const, id: 901, created: true }),
+        countDomainMemories: () => 0,
+      },
+    })
+    expect(result.staged).toHaveLength(1)
+    expect(result.published).toHaveLength(0)
+    expect(result.refused).toHaveLength(1)
+    // The gate names the scanner that fired, not a generic word.
+    expect(result.refused[0]!.reason).toContain('github')
+    expect(s.getGlobalCandidate(result.staged[0]!.candidateId)?.state).toBe('pending')
+  })
+
+  it('without a writer, staging parks the candidate as before', async () => {
+    const s = storeWithDomains(true, true)
+    const contract = makeContract([
+      { id: 23, content: '本机 Python 统一走 uv。', category: 'CONSTRAINTS', seen: 2 },
+    ])
+    const result = await autoStageGlobalCandidates({
+      store: s,
+      corpusDbPath: contract,
+      now: NOW,
+      llm: classifyLlm({ '本机 Python 统一走 uv。': { domain: 'machine', reason: 'machine env' } }),
+      route: { provider: 'mock', model: 'mock' },
+    })
+    expect(result.published).toEqual([])
+    expect(result.refused).toEqual([])
+    expect(s.getGlobalCandidate(result.staged[0]!.candidateId)?.state).toBe('pending')
+  })
+
   it('routes an org-classified candidate into the org pool', async () => {
     const s = storeWithDomains(true, true)
     const contract = makeContract([

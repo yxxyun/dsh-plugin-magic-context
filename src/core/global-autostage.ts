@@ -28,6 +28,7 @@ import { DatabaseSync } from 'node:sqlite'
 import type { LlmSeamMessage } from './types.ts'
 import { withDeadline } from './llm-deadline.ts'
 import type { AdapterStores } from './stores.ts'
+import { publishGlobalCandidate, type DomainWritePort } from './global-domains.ts'
 
 /** The narrow LLM seam classification needs (same shape maintenance uses). */
 export interface AutoStageLlm {
@@ -51,6 +52,23 @@ export interface AutoStageOutcome {
   }>
   /** Memories examined and refused, one readable reason each (deduplicated). */
   readonly skipped: ReadonlyArray<{ readonly memoryId: number; readonly reason: string }>
+  /**
+   * Candidates this pass published straight into their domain.
+   *
+   * There is no human approval step here — the standing rule is to follow
+   * upstream, and upstream has no approval card in this lane at all (it shares
+   * via `shareable` + `scope`, decided by classify). What replaces the card is
+   * `approvalGate`: credential scan, domain allowlist, category allowlist and
+   * the domain cap, all mechanical. A candidate that fails the gate stays
+   * `pending` and can still be approved by hand through `review_global`.
+   */
+  readonly published: ReadonlyArray<{
+    readonly candidateId: number
+    readonly memoryId: number
+    readonly domainId: string
+  }>
+  /** Candidates the gate refused, with the reason the gate gave. */
+  readonly refused: ReadonlyArray<{ readonly candidateId: number; readonly reason: string }>
   /** Set instead of scanning when the preconditions fail (no domain, no LLM, every pool full). */
   readonly reason?: 'domain-missing' | 'llm-unavailable' | 'queue-full'
 }
@@ -146,15 +164,22 @@ export async function autoStageGlobalCandidates(input: {
   /** Absent or route absent → NOTHING is staged (project-level stays, never a guessed domain). */
   llm?: AutoStageLlm
   route?: { readonly provider: string; readonly model: string }
+  /**
+   * Where a published candidate lands. Absent → candidates are staged and left
+   * pending, which is the old behaviour: this is a capability the host injects,
+   * not a config switch, so a test double that omits it keeps every existing
+   * assertion valid.
+   */
+  writer?: DomainWritePort
 }): Promise<AutoStageOutcome> {
   const enabled = input.store.listDomains()
     .filter(domain => domain.enabled && (domain.kind === 'machine' || domain.kind === 'org'))
-  if (enabled.length === 0) return { staged: [], skipped: [], reason: 'domain-missing' }
+  if (enabled.length === 0) return { staged: [], skipped: [], published: [], refused: [], reason: 'domain-missing' }
   if (input.llm === undefined || input.route === undefined) {
     // The user's fail-closed direction: without a classifier nothing moves —
     // the memories stay at project level instead of being silently guessed
     // into a domain.
-    return { staged: [], skipped: [], reason: 'llm-unavailable' }
+    return { staged: [], skipped: [], published: [], refused: [], reason: 'llm-unavailable' }
   }
   const limit = input.limit ?? DEFAULT_LIMIT
   const maxPending = input.maxPending ?? DEFAULT_MAX_PENDING
@@ -165,7 +190,7 @@ export async function autoStageGlobalCandidates(input: {
   const queueGuard = (domainId: string): boolean =>
     input.store.listGlobalCandidates({ state: 'pending', domainId }).length >= maxPending
   if (enabled.every(domain => queueGuard(domain.domainId))) {
-    return { staged: [], skipped: [], reason: 'queue-full' }
+    return { staged: [], skipped: [], published: [], refused: [], reason: 'queue-full' }
   }
 
   interface ScanRow {
@@ -197,7 +222,7 @@ export async function autoStageGlobalCandidates(input: {
       db.close()
     }
   } catch {
-    return { staged: [], skipped: [], reason: 'domain-missing' }
+    return { staged: [], skipped: [], published: [], refused: [], reason: 'domain-missing' }
   }
 
   const staged: Array<{ candidateId: number; memoryId: number; domainId: string }> = []
@@ -260,7 +285,39 @@ export async function autoStageGlobalCandidates(input: {
       seenRefusals.add(key)
     }
   }
-  return { staged, skipped }
+  // Publish what the gate accepts, right away.
+  //
+  // The approval card (`global-review.ts`, `ctx_memory action=review_global`)
+  // is not on this path any more: the standing rule is to follow upstream, and
+  // upstream decides sharing via classify (`shareable` + `scope`) with no human
+  // step. The gate below is the mechanical half that must survive — credential
+  // scan, domain/category allowlist, domain cap — and a candidate that fails it
+  // is left `pending`, so the card remains a fallback for exactly those.
+  const published: Array<{ candidateId: number; memoryId: number; domainId: string }> = []
+  const refused: Array<{ candidateId: number; reason: string }> = []
+  if (input.writer !== undefined) {
+    for (const entry of staged) {
+      const candidate = input.store.getGlobalCandidate(entry.candidateId)
+      if (candidate === undefined || candidate.state !== 'pending') continue
+      const result = publishGlobalCandidate(input.store, {
+        candidateId: entry.candidateId,
+        writer: input.writer,
+        now: input.now,
+      })
+      if (result.ok) {
+        published.push(entry)
+      } else {
+        // `approvalGate` refuses before touching state, so the candidate is
+        // still pending and still approvable by hand. Recording the reason here
+        // is what makes "why did nothing reach the domain" answerable.
+        refused.push({
+          candidateId: entry.candidateId,
+          reason: result.error,
+        })
+      }
+    }
+  }
+  return { staged, skipped, published, refused }
 }
 
 function promoteMemoryToCandidate(

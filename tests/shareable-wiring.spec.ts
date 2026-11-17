@@ -236,9 +236,16 @@ describe('classify writes the sharing verdict', () => {
     expect(stateOf(1)?.importance).toBe(77)
   })
 
-  it('does not disturb a row that is already shared', async () => {
-    // A published row: `shareable = 1` was decided when it was published, and a
-    // later re-score must not withdraw it.
+  it('withdraws a share when a later re-score says private', async () => {
+    // Upstream has no human approval step in this lane: `setMemoryClassification`
+    // (storage-memory.ts:1134+) writes whichever of importance/scope/shareable
+    // actually changed, so a re-score CAN take a share away. This adapter used to
+    // refuse that via `AND shareable = 0` on CLASSIFY_SHARING — its own addition,
+    // removed 2026-11-17 (code analysis P1-9, standing rule: follow upstream).
+    //
+    // A pre-existing share is not evidence of a past human decision here: the
+    // row was shared by an earlier classify verdict, and the pool has since
+    // changed. Leaving it shared would mean the newest verdict never applied.
     insertMemory({
       id: 1, content: 'A fact already published to the machine domain.',
       shareable: 1, scope: 'universe', classifiedAt: NOW - 30 * DAY,
@@ -247,11 +254,24 @@ describe('classify writes the sharing verdict', () => {
       ...baseDeps(),
       llm: fakeLlm('{"scores":[{"id":1,"importance":95,"scope":"project","shareable":false}]}'),
     })
-    // Importance still moves; visibility does not.
     expect(stateOf(1)?.importance).toBe(95)
+    expect(stateOf(1)?.shareable).toBe(0)
+    expect(stateOf(1)?.scope).toBe('project')
+    expect(outcome.scored).toBe(1)
+  })
+
+  it('still promotes a private row when the verdict says shareable', async () => {
+    // The other direction, to prove the withdrawal above is not "always private".
+    insertMemory({
+      id: 1, content: 'Sourdough starter needs feeding every twelve hours.',
+      shareable: 0, classifiedAt: NOW - 30 * DAY,
+    })
+    await runClassifyTick({
+      ...baseDeps(),
+      llm: fakeLlm('{"scores":[{"id":1,"importance":70,"scope":"universe","shareable":true}]}'),
+    })
     expect(stateOf(1)?.shareable).toBe(1)
     expect(stateOf(1)?.scope).toBe('universe')
-    expect(outcome.scored).toBe(1)
   })
 })
 

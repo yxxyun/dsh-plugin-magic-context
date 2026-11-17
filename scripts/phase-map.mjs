@@ -179,7 +179,10 @@ const PHASE_C = [
   // endpoint or a credential, and one of those was already published.
   'tests/shareable-guard.spec.ts',
   // The judgement wired into the two places a row can become shared: the
-  // automatic path (classify, upstream's model) and the manual one (publish).
+  // automatic path (classify, upstream's model) and the gated one (publish —
+  // which since 2026-11-17 also runs automatically from auto-stage, with
+  // `approvalGate` as its only veto; the approval CARD is a fallback for
+  // gate refusals, not the normal route).
   'tests/shareable-wiring.spec.ts',
   'tests/org-domain.spec.ts',
   'tests/domain-publish.spec.ts',
@@ -352,10 +355,12 @@ export const PHASES = [
       + 'evaluate-smart-notes / review-user-memories / backfill-vectors。'
       + '本阶段只验证调度骨架（时钟、lease、预算、失败隔离），不验证各 handler 的判定质量——'
       + '那属于各自模块的 spec，2026-11-17 已实测 verify 在真机跑通（158s / 36,902 tokens）',
-      'classify 会写 scope / shareable（CLASSIFY_SHARING），但只有一个方向：语句带 '
-      + 'AND shareable = 0，已共享的行被排除，所以能「私有→共享」、不能撤回也不能二次扩大；'
-      + 'blocked 由 shareable-guard 判定并强制回写为私有。早期文档写「有意完全不写」，'
-      + '2026-11-17 代码分析（P1-9）指出与实现相反，已按实际行为改正',
+      'classify 会写 scope / shareable（CLASSIFY_SHARING），双向：私有→共享、共享→私有都能发生，'
+      + '与上游 setMemoryClassification 一致（上游没有 AND shareable = 0 那道单向守卫，那是本地自加的，'
+      + '2026-11-17 按「跟随上游、不要人工审批」的既定方针删掉）；'
+      + '唯一的否决权在 shareable-guard：blocked 强制回写为私有，对应上游 classify.ts:762-766 的 '
+      + 'hasShareabilitySensitiveText 守卫。早期文档写「有意完全不写、共享归人工闸门」，'
+      + '2026-11-17 代码分析（P1-9）指出与实现相反，现按上游行为定稿',
       'cron 只在本地墙钟时区验证；跨时区（同一 db 被不同 TZ 的进程打开）未测，'
       + '结论是 next_due_at 是绝对 epoch，跨时区不会重复触发但触发时刻跟随写入方',
       'lease 的跨进程互斥用同一 db 文件的第二个 openStores 模拟，'

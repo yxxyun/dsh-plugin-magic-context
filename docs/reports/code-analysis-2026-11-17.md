@@ -9,15 +9,15 @@
 
 ## 0. 一页结论
 
-这是一份**工程纪律明显高于平均线**的适配器代码：每个非显然的决定都写了「为什么」和实测日期（注释里上百条 2026-xx-xx 的现场记录），契约文档（PARITY.md / NOTICE / docs 25 篇）与测试门禁（118 spec / 1419 用例 / 相位映射全覆盖）都在，写作风格统一，失败方向几乎都是 fail-closed 而不是 fail-silent。
+这是一份**工程纪律明显高于平均线**的适配器代码：每个非显然的决定都写了「为什么」和实测日期（注释里上百条 2026-xx-xx 的现场记录），契约文档（PARITY.md / NOTICE / docs 25 篇）与测试门禁（118 spec / 1424 用例 / 相位映射全覆盖）都在，写作风格统一，失败方向几乎都是 fail-closed 而不是 fail-silent。
 
 真正的风险不在「算法写错了」，而在**三处结构性问题**：
 
 1. **装配层 `src/index.ts`（1609 行、20 多个接缝/工具/命令的接线）零测试**。仓库自己在 `scripts/phase-map.mjs:361-364` 记了 2026-11-17 的事故：`ensureDreamSchedules` 传给了错误的接线函数，`dream_schedule` 一直 0 行、journal 零 `dream-*`，而全部单测 + 五个验收脚本全绿。这是当前最大的单点风险，且已有前科。**（2026-11-17 已补一段自检：挂载 2 分钟后仍无排程即 warn，见 §7.1；完整 smoke spec 按数据判缓。）**
 2. **后台调度（dream）的边界处理不完整**：一个没有 deadline 的 LLM 车道能锁死整个调度器；租约只发不续（可被合法夺取后双写）；`dream_runs` 无裁剪、journal 只在挂载时裁剪（**后者已改为每日任务 `prune-journal`，见 §7.2**）；两条模型车道谎报 `tokensUsed: 0`，使预算闸形同虚设。
-3. **记忆的可见性边界靠「身份字符串」承担**：写路径只校验 identity 非空（`memory-write.ts:1266`），`dir:` / `git:` 前缀原样放行（`tool-bridge.ts:706-712`），因此 `dir:global:org` 可以被直接写入，绕过发布闸门与域 cap；同时 classify 夜间调用会写 `shareable/scope`（`memory-write.ts:1881-1894`），与自己文档声明的「共享归人工闸门」相反。
+3. **记忆的可见性边界靠「身份字符串」承担**：写路径只校验 identity 非空（`memory-write.ts:1266`），`dir:` / `git:` 前缀原样放行（`tool-bridge.ts:706-712`），因此 `dir:global:org` 可以被直接写入，绕过发布闸门与域 cap；classify 夜间调用会写 `shareable/scope`（`memory-write.ts:1881-1894`）——这一点本身是对的（上游同形），错的是文档；而「共享归人工闸门」这个说法已按既定方针作废，共享改为双向且自动（§7.3）。
 
-代码本身是健康的：`tsc --noEmit` 零错误（`strict` + `noUncheckedIndexedAccess`），`vitest run` 118/118 文件、1419/1419 用例通过（墙钟 14s）。线上库 schema v14、语料 v95，运行正常，最近一次 `verify` 在 14:32（本地）成功。
+代码本身是健康的：`tsc --noEmit` 零错误（`strict` + `noUncheckedIndexedAccess`），`vitest run` 118/118 文件、1424/1424 用例通过（墙钟 14s）。线上库 schema v14、语料 v95，运行正常，最近一次 `verify` 在 14:32（本地）成功。
 
 ---
 
@@ -86,7 +86,7 @@ cron 是自研 5 字段求值器，按本地墙钟、Vixie 的 DOM/DOW 取或规
 
 ## 3. 运行时实证（本机）
 
-门禁：`npx tsc --noEmit -p tsconfig.json` → exit 0；`npx vitest run` → **118 files / 1419 tests passed**。
+门禁：`npx tsc --noEmit -p tsconfig.json` → exit 0；`npx vitest run` → **118 files / 1424 tests passed**。
 
 线上库（2026-11-17 15:08 快照，13 MB）：
 
@@ -127,7 +127,7 @@ journal 里读到的真实故障轨迹（这条最能说明这套代码的诚实
 |---|---|---|---|
 | 7 | `src/index.ts:304-308, 347-355` | `engineFailed` 一旦置真**无复位路径**：unmount 分支要求 `engineHandle !== undefined`，而失败恰恰使它为 `undefined`。宿主 compaction 服务晚到一次，本进程终生装不上引擎，meta 只留 `unavailable:`，读起来像「配置关了」。 | unmount 分支在 `wanted === false` 时无条件 `engineFailed = false`。 |
 | 8 | `src/core/curate-memories.ts:484-496` | `skip` 分支在 `dryRun` 判断**之前**调 `writer.recordCurateSkip`，dry run 实际写了状态（跳过哈希），改变后续轮次的候选集。与文件头「dry run writes nothing」相反。 | 把 `recordCurateSkip` 移到 `dryRun` 之后，或 dry run 下只计数。 |
-| 9 | `src/core/classify-memories.ts:26-31` vs `src/core/memory-write.ts:1871-1894, 709-713` | 文档与实现正面矛盾：`classify-memories.ts` 文件头写「upstream 会重写 scope/shareable，本适配器**有意不写**，共享决定归人工闸门」（`scripts/phase-map.mjs` 阶段 E blind 也这么记），但 `writer.classifyMemories` 里确实按 `entry.shareable` / `entry.blocked` 更新 `shareable/scope`，且 `blocked` 分支写明「保留上一轮分数会让人误读」，说明这是后来有意实现。结果是**文档错**（或实现回退），并且可见性可被夜间模型调用单向扩大——`CLASSIFY_SHARING` 的 `AND shareable = 0` 又使已共享行无法被撤回（该守卫本身在 `memory-write.ts:703-712` 里被声明为有意）。 | 二选一：删掉 classify 的共享写入，或更新两处文档并为扩权补审计行与撤回通道。 |
+| 9 | `src/core/classify-memories.ts:26-31` vs `src/core/memory-write.ts:1871-1894, 709-713` | 文档与实现正面矛盾：`classify-memories.ts` 文件头写「upstream 会重写 scope/shareable，本适配器**有意不写**，共享决定归人工闸门」（`scripts/phase-map.mjs` 阶段 E blind 也这么记），但 `writer.classifyMemories` 里确实按 `entry.shareable` / `entry.blocked` 更新 `shareable/scope`，且 `blocked` 分支写明「保留上一轮分数会让人误读」，说明这是后来有意实现。结果是**文档错**（或实现回退），并且可见性可被夜间模型调用单向扩大——`CLASSIFY_SHARING` 的 `AND shareable = 0` 又使已共享行无法被撤回（该守卫本身在 `memory-write.ts:703-712` 里被声明为有意）。 | 二选一：删掉 classify 的共享写入，或更新两处文档并为扩权补审计行与撤回通道。**状态（2026-11-17）：按「跟随上游、不要人工审批」处理完毕**——删掉单向守卫使共享双向可撤，auto-stage 改走 `approvalGate` 自动发布，卡片降为兜底，见 §7.3。 |
 | 10 | `src/dsh/tool-bridge.ts:706-712` + `src/core/memory-write.ts:1266-1268` | 身份即信任边界：`dir:` / `git:` 前缀原样接受，写路径只校验「非空」。`ctx_memory write project="dir:global:org"` 可直接落到全局域，绕过 `publishDomainMemory` 的分享评估、审批卡与域 cap。 | 写路径校验身份形状（`dir:<12hex>`），全局域只允许走 publish 通道。 |
 | 11 | `src/index.ts:653-664` | `tools/post-execute` 的标签分配无 `try/catch`、无 `adapterDisposed` 守卫，而 `allocateTag` 是真实写事务；HMR 重挂载后异常会直抛宿主瀑布。同仓 `compaction-engine.ts:160-163` 已有 `usable()` 的范式可抄。 | 包一层 fail-open：失败就原样返回 `decision`。 |
 | 12 | `src/index.ts:213-221` | §N§ 标签注册表按**全库 30 天**剪枝，而会话按设计可活数月。剪掉的编号会让旧占位符的 `tagNumber` 变 `undefined`：`ctx_reduce` 回 "no such tool-output tag"，emergency 的 `tagged` 过滤把它排除，但 `§N§` 仍在线上。 | 剪枝按「会话最后活跃时间 + 大于会话跨度」或与 tag 引用计数联动。 |
@@ -176,7 +176,7 @@ journal 里读到的真实故障轨迹（这条最能说明这套代码的诚实
 4. **P0-5 记账真实化**，再顺手把 P0-6 的增长收敛（retention 任务 + skip 上限）。
    *P0-5 已完成；P0-6 只做了 journal 一项（§7.2），skip 上限与 `dream_runs` 裁剪经上游对照后不做。*
 5. **P1-10 身份形状校验**（安全边界）、**P1-8/P1-9**（dry-run 副作用、classify 越界写共享）。
-   *P1-8、P1-10 已完成；P1-9（classify 共享写入与文档矛盾）仍待裁决。*
+   *P1-8、P1-10 已完成；P1-9 按「跟随上游、不要人工审批」处理完毕（§7.3）——共享双向、auto-stage 自动发布。*
 6. 性能三项（P1-16/17）与 chunk 轨的去留（P1-15），放在功能稳定之后。
 
 ---
@@ -276,6 +276,77 @@ db 13.2 MB
 
 `dream_runs` 保留 N 条、跳过次数上限——上游无先例、本地实测无痛感，属于「按推测修」，不做。
 真要动，触发条件写清楚：`dream_runs` 超过 5 万行，或 `status='skipped'` 占到 20% 以上。
+
+### 7.3 P1-9 与「人工审批」：按既定方针全部对齐上游
+
+裁决依据是项目一开始的决定——**跟随上游，不要人工审批**。查了上游 `mc-upstream @ a1ca346` 的实际行为后，本地有两处偏离，都已改掉。
+
+#### 偏离一：`CLASSIFY_SHARING` 的单向守卫
+
+上游 `setMemoryClassification`（`storage-memory.ts:1134+`）对 `importance` / `scope` / `shareable` 一律「值变了就写」，没有任何方向限制。所以 classify 的一次重判**可以把已经共享的行改回私有**。
+
+本地这条 SQL 带着 `AND shareable = 0`：
+
+```sql
+UPDATE memories SET shareable = ?, scope = ?
+ WHERE ... AND shareable = 0        -- 已共享的行被排除
+```
+
+结果是一条只能「私有 → 共享」的单行道。它带来两个具体后果：
+1. 内容漂移后重判为「不该共享」，旧的共享标记撤不掉；
+2. `tests/shareable-wiring.spec.ts` 里有一条用例把这个行为固化成了契约（`does not disturb a row that is already shared`），等于把偏离写成了规范。
+
+**改法**：删掉守卫。安全不依赖它——`shareable-guard.assessShareability`（移植自上游 `shared/redaction.ts` 的 `hasShareabilitySensitiveText`）在 verdict 应用前运行，`blocked` 强制回写私有，对应上游 `classify.ts:762-766` 的守卫。这一层是**自动**的 fail-closed，不是人工闸门，保留。
+
+那条固化旧行为的用例改写成双向断言，并补了一条反向用例（私有 → 共享仍然工作），避免「撤回」被实现成「永远是私有」。
+
+#### 偏离二：auto-stage 停在候选池，等人工点卡片
+
+`global-review.ts` 的注释写着「Publishing stays a human act — the card IS the human act」。上游没有这个东西：它靠 `shareable` + `scope` 表达可见性，classify 决定，无人工步骤。
+
+实测这条链路的用量：
+
+| 指标 | 值 |
+|---|---|
+| `global-review` journal 记录 | 4 条（3 天内） |
+| 结果分布 | **4/4 全部 approved** |
+| 已发布的域行 | 4 行（`dir:global:machine` id 590/765/766/767） |
+
+也就是说：卡片从来没有拦下过任何一条，它只让每一次发布都要等我在会话里点一下。
+
+**改法**：`autoStageGlobalCandidates` 接受一个 `writer`，候选入库后立刻走 `approvalGate` + `publishGlobalCandidate`。
+
+`approvalGate` 是机械闸，不是人工闸，它检查：
+- 凭据扫描（`scanForCredentials`）
+- 域是否启用、category 是否在域的 `shareCategories` 白名单里
+- 域 cap
+
+被 gate 拒绝的候选**留在 `pending`**，`review_global` 卡片对它仍然可用——所以卡片从「唯一通路」降级为「拒绝项的兜底出口」。
+
+outcome 增加了 `published` / `refused` 两个字段，handler 的 `itemsChanged` 从「staged 数」改为「published 数」——staged 只是入池，published 才是真的发生了什么。summary 里 `refused` 非零时明确写「refusals stay pending for review_global」。
+
+无 `writer` 时行为完全不变（候选停在 pending），所以 1,421 条既有断言一条没动。
+
+#### 数据
+
+```
+tsc      clean
+vitest   118 files / 1424 tests   (1421 → 1424)
+phase    PASSED
+```
+
+新增用例（`tests/global-autostage.spec.ts` 3 条 + `tests/maintenance.spec.ts` 1 条 + `tests/shareable-wiring.spec.ts` 1 条改 2 条）：
+- gate 通过 → 直接发布，候选变 `approved`
+- gate 拒绝（凭据）→ 留 pending，`refused` 带扫描器名字
+- 无 writer → 停在 pending（旧行为不变）
+- 已共享行可被撤回
+- 私有行仍可被共享
+
+#### 顺带记录：`review_global` 未被拆除
+
+它是备用通路，不是死代码——gate 拒绝的候选要靠它处理。不删的理由写进 `global-review.ts` 的用法里，而不是靠「暂时留着」。
+
+---
 
 ---
 

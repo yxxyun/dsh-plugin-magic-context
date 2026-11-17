@@ -188,6 +188,44 @@ describe('classifyMemories — metadata-only scoring slice', () => {
     }
   })
 
+  /**
+   * Sharing is bidirectional, like upstream.
+   *
+   * `CLASSIFY_SHARING` used to carry `AND shareable = 0`, which made this lane a
+   * one-way promotion: a row that had once been shared could never be withdrawn.
+   * Upstream's `setMemoryClassification` has no such guard — it writes whichever
+   * columns actually changed. Withdrawal now works here too, and the only veto
+   * left is `shareable-guard` (tested in shareable-guard.spec.ts).
+   */
+  it('withdraws a share that a later run scores private', () => {
+    const path = createDb()
+    const writer = openMemoryWriter({ dbPath: path, logger: silentLogger, now: () => T0 })
+    const readShare = (id: number): { shareable: number; scope: string } => {
+      const db = new DatabaseSync(path)
+      try {
+        return db.prepare('SELECT shareable, scope FROM memories WHERE id = ?').get(id) as {
+          shareable: number
+          scope: string
+        }
+      } finally {
+        db.close()
+      }
+    }
+    try {
+      const row = seedRow(path, { category: 'ARCHITECTURE', content: 'shared row' })
+      // Seed a row that is already shared, the state the old guard locked in place.
+      const db = new DatabaseSync(path)
+      try { db.prepare('UPDATE memories SET shareable = 1, scope = ? WHERE id = ?').run('workspace', row) } finally { db.close() }
+      expect(readShare(row)).toEqual({ shareable: 1, scope: 'workspace' })
+
+      writer.classifyMemories(OWN, [{ id: row, importance: 60, shareable: false }], T0 + 1)
+
+      expect(readShare(row)).toEqual({ shareable: 0, scope: 'project' })
+    } finally {
+      writer.close()
+    }
+  })
+
   it('skips archived rows and yields zero on a fenced writer', async () => {
     const path = createDb()
     const dead = seedRow(path, { category: 'ARCHITECTURE', content: 'archived row', status: 'archived' })

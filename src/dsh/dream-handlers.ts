@@ -179,6 +179,22 @@ export interface HousekeepingHandlerDeps {
   /** Wall-clock budget for one `git log` read (default 20s); injectable for tests. */
   readonly indexCommitsTimeoutMs?: number
   readonly projectRootOf?: (identity: string) => string | undefined
+  /**
+   * `auto-stage-global`: where a gated candidate is published.
+   *
+   * Present → staging publishes immediately (upstream's shape: no approval
+   * card). Absent → candidates stay pending, the old behaviour.
+   */
+  readonly domainWriter?: {
+    publishDomainMemory(input: {
+      readonly identity: string
+      readonly category: string
+      readonly content: string
+      readonly importance?: number
+    }): { readonly ok: true; readonly id: number; readonly created: boolean; readonly revived?: boolean }
+      | { readonly ok: false; readonly detail: string }
+    countDomainMemories(identity: string): number
+  }
   /** `prune-journal`: the store call that does the DELETE. */
   readonly pruneJournal?: (cutoff: number) => number
   /** `prune-journal`: retention window in days, live-read from config. */
@@ -653,15 +669,23 @@ export function buildAutoStageHandler(deps: DreamHandlerDeps): DreamTaskHandler 
       now: context.now,
       llm: seam.llm as unknown as AutoStageLlm,
       route,
+      ...seam.domainWriter === undefined ? {} : { writer: seam.domainWriter },
     })
+    const publishedCount = outcome.published.length
+    const refusedCount = outcome.refused.length
     return {
       status: 'ok',
       itemsProcessed: outcome.staged.length + outcome.skipped.length,
-      itemsChanged: outcome.staged.length,
+      // Publishing is the change that matters: a staged candidate sitting in a
+      // pool changes nothing visible until it lands. Counting only `staged`
+      // made this lane look idle on a night when rows did reach the domain.
+      itemsChanged: publishedCount,
       tokensUsed: 0,
       summary: outcome.staged.length === 0
         ? `nothing staged${outcome.reason === undefined ? '' : ` (${outcome.reason})`}`
-        : `staged ${String(outcome.staged.length)}, skipped ${String(outcome.skipped.length)}`,
+        : `staged ${String(outcome.staged.length)}, published ${String(publishedCount)}, `
+          + `refused ${String(refusedCount)}, skipped ${String(outcome.skipped.length)}`
+          + (refusedCount === 0 ? '' : ` (refusals stay pending for review_global)`),
     }
   }
 }

@@ -439,6 +439,10 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
     ...lane.promotePrimers === undefined ? {} : { promotePrimers: lane.promotePrimers },
     classify: {
       ...memoryWriter === undefined ? {} : { writer: memoryWriter },
+      // Auto-staging publishes through the gate instead of parking a card:
+      // upstream has no approval step in this lane (code analysis P1-9 /
+      // standing rule "follow upstream, no human approval").
+      ...memoryWriter === undefined ? {} : { domainWriter: memoryWriter },
       ...llm === undefined ? {} : { llm: llm as unknown as import('./core/classify-memories.ts').ClassifyLlm },
       route: () => lastSessionRoute === undefined
         ? undefined
