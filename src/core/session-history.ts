@@ -74,7 +74,16 @@ export interface SessionQueryReadLike {
       readonly before?: number
       readonly after?: number
     },
-    exec?: unknown,
+    /**
+     * An `AbortSignal`, NOT the tool run context.
+     *
+     * The host's signature is `readEvent(request, signal)` and its body calls
+     * `signal?.throwIfAborted()`. Passing the run context here fails at runtime
+     * with "signal?.throwIfAborted is not a function" — measured 2026-11-17 on
+     * the first live call, after every unit test passed against a fake that
+     * ignored the argument. Omitted entirely when there is no signal to give.
+     */
+    signal?: AbortSignal,
   ): Promise<{
     readonly target?: SessionEventLike
     readonly events?: readonly SessionEventLike[]
@@ -211,10 +220,9 @@ export async function readEventBySeq(
   query: SessionQueryReadLike,
   sessionId: string,
   seq: number,
-  exec?: unknown,
 ): Promise<SessionEventLike | undefined> {
   try {
-    const result = await query.readEvent({ sessionId, seq }, exec)
+    const result = await query.readEvent({ sessionId, seq })
     const target = result.target
     return target === undefined ? undefined : target
   } catch (error) {
@@ -248,7 +256,7 @@ export async function readEventRange(
   start: number,
   end: number,
   budget: number,
-  options: { readonly verbose?: boolean; readonly exec?: unknown } = {},
+  options: { readonly verbose?: boolean } = {},
 ): Promise<RangeReadResult> {
   const blocks: string[] = []
   let usedTokens = 0
@@ -263,14 +271,13 @@ export async function readEventRange(
     try {
       const result = await query.readEvent(
         { sessionId, seq: cursor + want - 1, before: want - 1 },
-        options.exec,
       )
       window = result.events ?? []
     } catch (error) {
       if (codeOf(error) !== EVENT_NOT_FOUND_CODE) throw error
       // The window tail is past the end of the log; retry the single seq so a
       // range that runs off the history still renders what exists.
-      const single = await readEventBySeq(query, sessionId, cursor, options.exec)
+      const single = await readEventBySeq(query, sessionId, cursor)
       window = single === undefined ? [] : [single]
     }
     if (window.length === 0) break

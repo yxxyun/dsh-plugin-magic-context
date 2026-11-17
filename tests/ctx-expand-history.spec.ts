@@ -54,7 +54,12 @@ const exec = { agent: { session: { id: 'sess-1' } } }
 function fakeQuery(events: readonly SessionEventLike[]): SessionQueryReadLike {
   const bySeq = new Map(events.map(event => [event.seq, event] as const))
   return {
-    async readEvent(request) {
+    async readEvent(request, signal) {
+      // See session-history.spec.ts: the host's second argument is an
+      // AbortSignal, and a fake that ignores it let a run context through.
+      if (signal !== undefined && typeof (signal as { throwIfAborted?: unknown }).throwIfAborted !== 'function') {
+        throw new TypeError('signal?.throwIfAborted is not a function')
+      }
       const target = bySeq.get(request.seq)
       if (target === undefined) {
         const error = new Error('no such event')

@@ -62,7 +62,17 @@ function fakeQuery(events: readonly SessionEventLike[]): SessionQueryReadLike & 
   const bySeq = new Map(events.map(event => [event.seq, event] as const))
   const query = {
     calls: 0,
-    async readEvent(request: { sessionId: string; seq: number; before?: number; after?: number }) {
+    async readEvent(
+      request: { sessionId: string; seq: number; before?: number; after?: number },
+      // The host's second parameter is an AbortSignal and its body calls
+      // `signal?.throwIfAborted()`. A fake that ignores the argument hides a
+      // run context passed in its place, which is exactly the bug the first live
+      // call hit (2026-11-17) after 24 green unit tests.
+      signal?: unknown,
+    ) {
+      if (signal !== undefined && typeof (signal as { throwIfAborted?: unknown }).throwIfAborted !== 'function') {
+        throw new TypeError('signal?.throwIfAborted is not a function')
+      }
       query.calls += 1
       const before = Math.min(request.before ?? 0, READ_EVENT_WINDOW_MAX)
       const after = Math.min(request.after ?? 0, READ_EVENT_WINDOW_MAX)

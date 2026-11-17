@@ -312,7 +312,7 @@ export function defineCtxExpandTool(deps: ToolBridgeDeps): unknown {
         const budget = CTX_EXPAND_TOKEN_BUDGET
         try {
           if (args.message !== undefined) {
-            const event = await readEventBySeq(query, sessionId, args.message, exec)
+            const event = await readEventBySeq(query, sessionId, args.message)
             if (event === undefined) {
               return {
                 ok: false,
@@ -343,7 +343,6 @@ export function defineCtxExpandTool(deps: ToolBridgeDeps): unknown {
           const end = Math.max(args.start as number, args.end as number)
           const result = await readEventRange(query, sessionId, start, end, budget, {
             ...(args.verbose === true ? { verbose: true } : {}),
-            exec,
           })
           if (result.empty) {
             return {
