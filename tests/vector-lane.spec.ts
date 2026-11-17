@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, expect, it } from 'vitest'
-import { describeVectorLane, measureVectorLane, planBackfill } from '../src/core/vector-lane.ts'
+import { coldStartModelId, describeVectorLane, measureVectorLane, planBackfill } from '../src/core/vector-lane.ts'
 
 const dirs: string[] = []
 
@@ -212,5 +212,46 @@ describe('planning the backfill', () => {
     const plan = planBackfill(makeStore([{ id: 1, spaces: [MODEL_A] }, { id: 2, spaces: [MODEL_A] }]))!
     expect(plan.total).toBe(0)
     expect(plan.reason).toContain('already has a row')
+  })
+})
+
+/**
+ * Cold start (2026-11-13). A brand-new corpus has zero vectors, so "prove the
+ * space against a stored vector" is unsatisfiable rather than failed — and the
+ * lane treated the two as one case, which shut it forever: measured on this
+ * machine, 0 rows in `memory_embeddings` and one `backfill-parity-unproven`
+ * skip every 30 minutes from install to the day it was found. The rule below is
+ * deliberately narrow: a REAL space always wins, and only a store with nothing
+ * in it may be seeded by the process that writes first.
+ */
+describe('cold start: the first writer decides the space', () => {
+  const OWN = 'embedding-provider:own0000'
+
+  it('returns the writer identity only when the store holds no vector at all', () => {
+    expect(coldStartModelId(undefined, OWN)).toBe(OWN)
+    expect(coldStartModelId(MODEL_A, OWN)).toBe(MODEL_A)
+    expect(coldStartModelId(MODEL_B, OWN)).toBe(MODEL_B)
+  })
+
+  it('plans the whole active set into the seeded space', () => {
+    const path = makeStore([{ id: 1 }, { id: 2 }, { id: 3, status: 'archived' }])
+    const plan = planBackfill(path, { limit: 8, spaceWhenEmpty: OWN })!
+    expect(plan.modelId).toBe(OWN)
+    // Newest first, archived rows excluded — the same policy as the seeded case.
+    expect(plan.candidates).toEqual([2, 1])
+    expect(plan.total).toBe(2)
+  })
+
+  it('still refuses to invent one when the caller has no identity to offer', () => {
+    const plan = planBackfill(makeStore([{ id: 1 }]))!
+    expect(plan.modelId).toBe('')
+    expect(plan.candidates).toEqual([])
+  })
+
+  it('never overrides a real dominant space with the caller identity', () => {
+    const path = makeStore([{ id: 1, spaces: [MODEL_A] }, { id: 2, spaces: [MODEL_A] }, { id: 3 }])
+    const plan = planBackfill(path, { limit: 8, spaceWhenEmpty: OWN })!
+    expect(plan.modelId).toBe(MODEL_A)
+    expect(plan.candidates).toEqual([3])
   })
 })

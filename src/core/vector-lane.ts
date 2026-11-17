@@ -183,14 +183,25 @@ export interface BackfillPlan {
  *
  * Writes nothing. The contract write is still ahead.
  */
-export function planBackfill(corpusDbPath: string, options: { limit?: number } = {}): BackfillPlan | undefined {
+export function planBackfill(
+  corpusDbPath: string,
+  options: { limit?: number; spaceWhenEmpty?: string } = {},
+): BackfillPlan | undefined {
   const report = measureVectorLane(corpusDbPath)
   if (report === undefined) return undefined
   const limit = options.limit ?? 64
 
   const db = new DatabaseSync(corpusDbPath, { readOnly: true })
   try {
-    const dominant = report.dominantModelId
+    // COLD START (2026-11-13): `spaceWhenEmpty` is the caller's cold-start
+    // decision — when the store holds NO vectors at all, there is no dominant
+    // space to plan into, and planning returned an empty plan forever. Measured
+    // on this machine: 0 rows in `memory_embeddings` plus one
+    // `backfill-parity-unproven` skip every 30 minutes since install, i.e. the
+    // semantic lane never opened once. With the caller's own identity the first
+    // writer decides the space (the wording above was already the contract;
+    // only the plumbing was missing).
+    const dominant = report.dominantModelId ?? options.spaceWhenEmpty
     if (dominant === undefined) {
       return { modelId: '', candidates: [], total: 0, reason: 'no embedding space exists yet — the first writer decides the space' }
     }
@@ -218,6 +229,21 @@ export function planBackfill(corpusDbPath: string, options: { limit?: number } =
   } finally {
     db.close()
   }
+}
+
+/**
+ * Which space may this process write into?
+ *
+ * A stored dominant space always wins — the process must reproduce the store's
+ * space, never impose its own. Only a store with no vectors at all may be
+ * seeded by the first writer, and that is the one case where "parity against a
+ * stored vector" is unsatisfiable rather than a genuine mismatch.
+ */
+export function coldStartModelId(
+  dominantModelId: string | undefined,
+  embedderModelId: string,
+): string | undefined {
+  return dominantModelId ?? embedderModelId
 }
 
 /** One line for a health report: the shape of the decay, not just a percentage. */
