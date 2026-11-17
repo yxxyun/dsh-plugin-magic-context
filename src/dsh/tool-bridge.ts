@@ -36,6 +36,15 @@ import {
   SurfaceConditionError,
 } from '../core/surface-condition.ts'
 import { previewText } from '../core/memory-search.ts'
+import { errText } from '../core/types.ts'
+import {
+  CTX_EXPAND_TOKEN_BUDGET,
+  eventLabel,
+  readEventBySeq,
+  readEventRange,
+  renderEventFull,
+  type SessionQueryReadLike,
+} from '../core/session-history.ts'
 import {
   enumerateSurfaceNodes,
   enumerateSurfaceToolResults,
@@ -95,6 +104,15 @@ export interface ToolBridgeDeps {
   readonly defineTool: LocalDefineTool
   /** Validation-period activity journal (optional). */
   readonly journal?: Journal
+  /**
+   * `ctx.sessionQuery`, resolved per call.
+   *
+   * Soft on purpose: the host mounts the service but ships its search index with
+   * `openAt: never`, and a composition without the query backend has no history
+   * to read at all. Declaring it in `inject` would pend the whole plugin on it;
+   * asking per call degrades to the tag channel instead.
+   */
+  readonly sessionQueryOf?: () => SessionQueryReadLike | undefined
 }
 
 /** Probe for the loading-mode diagnostics: resolves the dynamic-import constructor. */
@@ -192,18 +210,73 @@ export function defineCtxReduceTool(deps: ToolBridgeDeps): unknown {
   })
 }
 
+/**
+ * Arguments `ctx_expand` accepts.
+ *
+ * Two number spaces, never interchangeable — upstream states the same boundary
+ * because conflating them is the one mistake that makes recovery useless:
+ *   - `tags` are the numbers on §N§ tags and `[dropped §N§]` placeholders;
+ *   - `message` / `start` / `end` are event seqs, the numbers `ctx_search`
+ *     message hits carry.
+ */
+export interface CtxExpandArgs {
+  readonly tags?: string
+  readonly message?: number
+  readonly start?: number
+  readonly end?: number
+  readonly verbose?: boolean
+}
+
 export function defineCtxExpandTool(deps: ToolBridgeDeps): unknown {
   const defineTool = deps.defineTool
-  return defineTool<{ readonly tags: string }>({
+  return defineTool<CtxExpandArgs>({
     name: 'ctx_expand',
+    // Ported from upstream `ctx-expand/constants.ts` (1585 chars) with the two
+    // changes this host forces: `<session-history>` is a compartment summary
+    // here (§C1§, §C2§…), and an ordinal is an event seq rather than a raw
+    // message ordinal. The tag half of the contract is unchanged — it is the
+    // channel that only works while the placeholder is still on the surface.
     description:
-      'Restore previously dropped items in full. Pass tag IDs: tags: "3, 7". '
-        + 'The original content returns to the conversation exactly as it was.',
-    parameters: { tags: { type: 'string', required: true } },
+      'Recover original content that is no longer on your desk. It takes two kinds of number, and they are never interchangeable: '
+        + '- `tags`: the number from a §N§ tag or a `[dropped §N§]` placeholder. Returns those items whole: a text, or a tool call with its full input and output. '
+        + '- `message=N`, `start`/`end`: event seqs, the positions `ctx_search` message hits report. An event seq counts single events; a tag counts each text and tool result separately, so the same number points at different things. '
+        + 'Older turns are filed as compartment summaries (§C1§, §C2§…) and the raw events behind them stay in stored history. When the summary is not enough — exact wording, a value, an error message, the reasoning behind a decision — expand the range: ctx_expand(start=120, end=245). Also works around a ctx_search message hit: start=N-10, end=N+5. Ranges after the last compartment are your live tail — already visible, not expandable. '
+        + 'Returns the transcript as [seq] U:/A: lines, capped at ~15K tokens; an oversized range returns the head and says where to continue. '
+        + 'Finer recovery: '
+        + '- verbose=true lists each event separately with its seq and a per-part preview (tool calls with output sizes) so you can pick one. '
+        + '- message=N returns that one event in full — every text part and every tool call\'s complete input and output — from stored history. This is the way back to a tool output you released with ctx_reduce once its message has been folded into a compartment; if the event was deleted from history it says so.',
+    parameters: {
+      tags: {
+        type: 'string',
+        description: 'Tag numbers from §N§ tags or [dropped §N§] placeholders, not event seqs. e.g. "3, 7" or "3-5".',
+      },
+      message: {
+        type: 'number',
+        description: 'One event seq from a ctx_search message hit. Returns that event in full. Use alone.',
+      },
+      start: {
+        type: 'number',
+        description: 'First event seq of a range, not a tag number.',
+      },
+      end: {
+        type: 'number',
+        description: 'Last event seq of the range, inclusive, not a tag number.',
+      },
+      verbose: {
+        type: 'boolean',
+        description: 'With start/end: one entry per event with its seq and a per-part preview instead of the transcript.',
+      },
+    },
     output: {
       schema: { type: 'json' },
       render: (_args, value) => {
-        const payload = value as { restored?: number[]; refused?: TagVerdict[] }
+        const payload = value as {
+          text?: string
+          restored?: number[]
+          refused?: TagVerdict[]
+        }
+        // History recovery returns rendered text, not a tag verdict list.
+        if (typeof payload.text === 'string') return ackText([payload.text])
         const lines: string[] = []
         if (payload.restored !== undefined && payload.restored.length > 0) {
           lines.push(`Restored in full: ${payload.restored.map(tag => `§${tag}§`).join(', ')}.`)
@@ -219,7 +292,99 @@ export function defineCtxExpandTool(deps: ToolBridgeDeps): unknown {
       const startedAt = Date.now()
       const sessionId = sessionIdOf(exec)
       if (sessionId === undefined) return { ok: false, restored: [], refused: [], reason: 'no-session' }
-      const requested = parseTagRanges(args.tags)
+
+      // ── History channel: message / start+end ────────────────────────────
+      // Tried before the tag channel when no tags were named, so a range call
+      // that also carries a stray `tags` field still reaches history. A named
+      // tag always wins: the caller explicitly asked for the surface item.
+      const wantsHistory = (args.tags === undefined || args.tags.trim().length === 0)
+        && (args.message !== undefined || (args.start !== undefined && args.end !== undefined))
+      if (wantsHistory) {
+        const query = deps.sessionQueryOf?.()
+        if (query === undefined) {
+          return {
+            ok: false,
+            text: 'Stored history is unavailable in this deployment, so nothing can be recovered by event seq. '
+              + 'The session index is a soft service the host may not have mounted; use the tag channel '
+              + '(ctx_expand with tags) while the item is still on your desk.',
+          }
+        }
+        const budget = CTX_EXPAND_TOKEN_BUDGET
+        try {
+          if (args.message !== undefined) {
+            const event = await readEventBySeq(query, sessionId, args.message, exec)
+            if (event === undefined) {
+              return {
+                ok: false,
+                text: `No event at seq ${String(args.message)} in this session's stored history — it was deleted `
+                  + '(session prune/revert) or the seq is wrong, so it cannot be recovered. Re-run the tool if you '
+                  + 'still need the data.',
+              }
+            }
+            const body = renderEventFull(event)
+            if (body === null) {
+              return {
+                ok: false,
+                text: `Event ${String(args.message)} (${eventLabel(event)}) carries no recoverable content — it had only `
+                  + 'structural or reasoning parts.',
+              }
+            }
+            const header = `[${String(event.seq)}] ${eventLabel(event)} — full recovery:`
+            deps.journal?.info('tool-call', `ctx_expand: recovered event ${String(event.seq)}`, {
+              tool: 'ctx_expand',
+              channel: 'message',
+              seq: event.seq,
+              ms: Date.now() - startedAt,
+            }, sessionId)
+            return { ok: true, text: `${header}\n\n${body}` }
+          }
+
+          const start = Math.min(args.start as number, args.end as number)
+          const end = Math.max(args.start as number, args.end as number)
+          const result = await readEventRange(query, sessionId, start, end, budget, {
+            ...(args.verbose === true ? { verbose: true } : {}),
+            exec,
+          })
+          if (result.empty) {
+            return {
+              ok: false,
+              text: `No recoverable events in range ${String(start)}-${String(end)}. The range may be outside this `
+                + "session's history, or every event in it was structural.",
+            }
+          }
+          const lines: string[] = [
+            `Events ${String(start)}-${String(result.lastSeq)}${args.verbose === true ? ' (verbose)' : ''}. `
+              + 'Recover any one in full with ctx_expand(message=<seq>):',
+            '',
+            result.blocks.join('\n\n'),
+          ]
+          if (result.truncated) {
+            lines.push('')
+            lines.push(
+              `Truncated at seq ${String(result.lastSeq)} (budget: ~${String(budget)} tokens). `
+                + `Call again with start=${String(result.lastSeq + 1)} end=${String(end)} for more.`,
+            )
+          }
+          deps.journal?.info('tool-call', `ctx_expand: recovered range ${String(start)}-${String(result.lastSeq)}`, {
+            tool: 'ctx_expand',
+            channel: 'range',
+            start,
+            end,
+            lastSeq: result.lastSeq,
+            blocks: result.blocks.length,
+            truncated: result.truncated,
+            ms: Date.now() - startedAt,
+          }, sessionId)
+          return { ok: true, text: lines.join('\n') }
+        } catch (error) {
+          // A host read failure is reported, never thrown: the tool boundary is
+          // the agent's only handle on recovery, and a throw reads as "this tool
+          // is broken" rather than "history could not be read just now".
+          return { ok: false, text: `History read failed: ${errText(error)}` }
+        }
+      }
+
+      const requested = parseTagRanges(args.tags ?? '')
       const session = exec.agent!.session
       const nodes = enumerateSurfaceToolResults(session, callId =>
         deps.stores.getTag(sessionId, { kind: 'tool-result', callId }))
@@ -228,7 +393,18 @@ export function defineCtxExpandTool(deps: ToolBridgeDeps): unknown {
       for (const tag of requested) {
         const placeholder = nodes.find(candidate => candidate.isPlaceholder && candidate.droppedTag === tag)
         if (placeholder === undefined) {
-          refused.push({ tag, ok: false, reason: 'no dropped item carries this tag' })
+          // The tag channel dies with the placeholder: once the message carrying
+          // it was folded into a compartment, management-pass retires the drop
+          // and no surface node knows the number any more. Saying only "not
+          // found" leaves the agent stuck on a dead end it cannot diagnose, so
+          // the refusal names the channel that still works.
+          refused.push({
+            tag,
+            ok: false,
+            reason: 'no dropped item carries this tag on the current surface — its message was '
+              + 'folded into a compartment. Recover it from stored history instead: '
+              + 'ctx_search for the content, then ctx_expand(message=<seq>) or ctx_expand(start, end)',
+          })
           continue
         }
         const original = originalContentOfPlaceholder(session, placeholder.seq)

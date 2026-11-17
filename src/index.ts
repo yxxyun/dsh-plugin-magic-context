@@ -67,6 +67,7 @@ import {
   type LocalDefineTool,
 } from './dsh/tool-bridge.ts'
 import type { SessionQueryLike } from './core/message-search.ts'
+import type { SessionQueryReadLike } from './core/session-history.ts'
 import { ReduceNudgeTracker } from './dsh/reduce-guidance.ts'
 import { registerCtxStatusCommand } from './dsh/status-command.ts'
 import { registerCtxRecompCommand } from './dsh/recomp.ts'
@@ -784,7 +785,27 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
       // The host's `defineTool` takes a wider option type than the subset this
       // package authors; `tool-bridge`'s seam names that subset so the three
       // tool bodies keep their argument types (see `LocalDefineTool`).
-      const deps = { stores, defineTool: defineTool as LocalDefineTool, ...journal === undefined ? {} : { journal } }
+      // The session lane is OPTIONAL: `ctx.sessionQuery` is a soft service (the
+      // host mounts it, but ships its search index with `openAt: never`), so it
+      // is read per call through `ctx.get` rather than declared in `inject` —
+      // declaring it would pend this whole plugin on a service that is only
+      // present in compositions that opted into the query backend. Two tools
+      // ride it now: ctx_search (message lane) and ctx_expand (history channel,
+      // the only way back to an output whose placeholder left the surface).
+      const sessionQueryOf = (): SessionQueryLike | undefined => {
+        try {
+          const query = (ctx as unknown as { get?: (name: string) => unknown }).get?.('sessionQuery')
+          return query as SessionQueryLike | undefined
+        } catch {
+          return undefined
+        }
+      }
+      const deps = {
+        stores,
+        defineTool: defineTool as LocalDefineTool,
+        ...journal === undefined ? {} : { journal },
+        sessionQueryOf: sessionQueryOf as unknown as () => SessionQueryReadLike | undefined,
+      }
       registrar.register(defineCtxReduceTool(deps))
       registrar.register(defineCtxExpandTool(deps))
       // One registration object serves both ctx_memory and ctx_search's memory
@@ -865,20 +886,6 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
         })
       if (memoryRegistration !== undefined) {
         registrar.register(defineCtxMemoryTool(memoryRegistration))
-      }
-      // ctx_search — one query across memory / session history / notes. The
-      // session lane is OPTIONAL: `ctx.sessionQuery` is a soft service (the
-      // host mounts it, but ships its search index with `openAt: never`), so it
-      // is read per call through `ctx.get` rather than declared in `inject` —
-      // declaring it would pend this whole plugin on a service that is only
-      // present in compositions that opted into the query backend.
-      const sessionQueryOf = (): SessionQueryLike | undefined => {
-        try {
-          const query = (ctx as unknown as { get?: (name: string) => unknown }).get?.('sessionQuery')
-          return query as SessionQueryLike | undefined
-        } catch {
-          return undefined
-        }
       }
       registrar.register(defineCtxSearchTool({
         ...deps,

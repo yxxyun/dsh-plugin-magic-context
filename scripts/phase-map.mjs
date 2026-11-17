@@ -98,6 +98,12 @@ const PHASE_BASE = [
   // port lacked (history recall, parked intentions). Gated here because they
   // extend the tool surface the baseline already ships.
   'tests/ctx-search-note.spec.ts',
+  // ctx_expand's history channel: `message=<seq>` / `start,end` read back out of
+  // stored history, so a stamped output stays recoverable after its message is
+  // folded into a compartment (the tag channel dies with the placeholder).
+  // Gated here because it completes an existing tool rather than adding one.
+  'tests/session-history.spec.ts',
+  'tests/ctx-expand-history.spec.ts',
   // /ctx-wrapup + the manual-checkpoint primitives: the one upstream entry
   // point the port could only reach by adopting the adapter as its compaction
   // engine. Gated here because it adds a command to the baseline surface.
