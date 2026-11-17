@@ -75,6 +75,17 @@ export interface PressurePolicy {
   /** Minimum nodes in an eligible span before a historian call is considered. */
   readonly historianMinNodes: number
   /**
+   * Hard cap on the tokens ONE historian run may digest. 0 = uncapped.
+   *
+   * Without it the run size is whatever the backlog happens to be, so a slow
+   * route degrades exactly when it is farthest behind — each bigger run is more
+   * likely to time out, which leaves a bigger backlog. Measured 2026-11-18
+   * (RCC ORC, IQ3_XXS, window 262144): a 211-node / 46,725-token span split into
+   * four 11.7k chunks timed out 21 times out of 27. A backlog should cost more
+   * runs, not bigger ones.
+   */
+  readonly historianMaxSpanTokens: number
+  /**
    * Wall-clock budget for one historian run (including its repair attempt).
    * A provider that never settles must not leave the run unaccounted: the
    * historian journals a terminal `failed` when this budget is spent.
@@ -112,6 +123,7 @@ export const DEFAULT_POLICY: PressurePolicy = {
   protectedToolResults: 8,
   historianProtectedNodes: 8,
   historianMinNodes: 3,
+  historianMaxSpanTokens: 0,
   historianTimeoutMs: 120_000,
   historianMaxTokens: 8192,
   historianMaxTokensCeiling: 32_768,

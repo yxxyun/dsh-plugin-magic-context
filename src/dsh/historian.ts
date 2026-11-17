@@ -502,6 +502,44 @@ function retryCeiling(policy: PressurePolicy, effective: number): number {
 }
 
 /**
+ * Cap one historian run's span to `maxTokens`, keeping the OLDEST nodes.
+ *
+ * Why a cap exists at all: `selectHistorianRange` returns every eligible node,
+ * with no size limit, so a backlog decides the run's size. Measured 2026-11-18
+ * on the RCC ORC session (window 262144, local IQ3_XXS): the span grew to 211
+ * nodes / 46,725 tokens, got split into four ~11.7k chunks, and 21 of 27 runs
+ * timed out — the success rate fell to 22% precisely because the backlog made
+ * each run bigger. A backlog should cost MORE runs, not bigger ones.
+ *
+ * The cut also respects tool-pairing: a span may not END on an assistant that
+ * requested tools (its results would land in the next run), matching the chunk
+ * boundary rule in `planChunkSpans`.
+ *
+ * `maxTokens <= 0` disables the cap (the pre-2026-11-18 behaviour).
+ */
+export function capSpanTokens(
+  nodes: readonly SurfaceNode[],
+  maxTokens: number,
+): readonly SurfaceNode[] {
+  if (!(maxTokens > 0) || nodes.length === 0) return nodes
+  const kept: SurfaceNode[] = []
+  let acc = 0
+  for (const node of nodes) {
+    const cost = estimateTokens(node.text)
+    if (kept.length > 0 && acc + cost > maxTokens) break
+    kept.push(node)
+    acc += cost
+  }
+  // Never end on a dangling tool call: drop trailing assistant nodes that
+  // requested tools until the span closes on a safe boundary.
+  while (kept.length > 1 && (kept[kept.length - 1] as SurfaceNode).hasToolCalls) kept.pop()
+  // Identity when nothing was cut: the caller compares references to decide
+  // whether it needs to re-derive the span token count.
+  if (kept.length === nodes.length) return nodes
+  return kept.length === 0 ? nodes : kept
+}
+
+/**
  * Split an oversized span into contiguous chunks of about `chunkTokens`
  * tokens (never splitting a node, at most 4 chunks, only when the span is at
  * least 4 nodes — smaller spans digest in one call exactly as before).
@@ -987,21 +1025,32 @@ async function runHistorianExclusive(
       minNodes: deps.policy.historianMinNodes,
     })
   if (range === undefined) return undefined
+  // Cap the run's size BEFORE the trigger budget is compared, so a huge backlog
+  // becomes several ordinary runs instead of one oversized one.
+  const cappedNodes = input.forcedRange === undefined
+    ? capSpanTokens(range.nodes, deps.policy.historianMaxSpanTokens)
+    : range.nodes
+  const cappedRange = cappedNodes === range.nodes
+    ? range
+    : {
+        nodes: cappedNodes,
+        tokens: cappedNodes.reduce((total, node) => total + estimateTokens(node.text), 0),
+      }
   const budget = historianTriggerBudget(
     input.contextWindow,
     deps.policy.historianAssumedWindow,
     deps.policy.historianMinBudgetTokens,
   )
-  if (input.forcedRange === undefined && range.tokens < budget) {
+  if (input.forcedRange === undefined && cappedRange.tokens < budget) {
     deps.logger.info(
-      `magic-context historian: eligible span ${String(range.tokens)} tokens is below the ${String(budget)}-token trigger`,
+      `magic-context historian: eligible span ${String(cappedRange.tokens)} tokens is below the ${String(budget)}-token trigger`,
     )
     return undefined
   }
 
   const now = deps.now?.() ?? Date.now()
-  const first = range.nodes[0] as SurfaceNode
-  const last = range.nodes[range.nodes.length - 1] as SurfaceNode
+  const first = cappedRange.nodes[0] as SurfaceNode
+  const last = cappedRange.nodes[cappedRange.nodes.length - 1] as SurfaceNode
   // Cross-process mutual exclusion, taken after the cheap range/budget gates so
   // an ineligible session never touches the lease row. A blocker means another
   // process is digesting this session right now: returning undefined is the same
@@ -1028,7 +1077,7 @@ async function runHistorianExclusive(
     const draft = await callHistorian(deps, {
       sessionId: input.sessionId,
       session: input.session,
-      nodes: range.nodes,
+      nodes: cappedRange.nodes,
       trigger: 'automatic',
       // D1/D3: an oversized span digests in ~budget-token chunks with a merge
       // call; the run budget scales with the chunk count (capped 600s).
@@ -1043,15 +1092,15 @@ async function runHistorianExclusive(
     const compartment = deps.stores.allocateCompartment(input.sessionId, draft, {
       startSeq: first.seq,
       endSeq: last.seq,
-      seqs: range.nodes.map(node => node.seq),
-      tokens: range.tokens,
+      seqs: cappedRange.nodes.map(node => node.seq),
+      tokens: cappedRange.tokens,
     }, baselineEpoch, now)
     // #802: a stored compartment IS progress — release the watermark so the
     // next automatic run is judged on its own merits.
     clearHistorianNoProgress(deps.stores, input.sessionId)
     deps.logger.info(
       `magic-context historian: compartment §C${String(compartment.compartmentId)}§ stored `
-        + `(${String(range.nodes.length)} nodes, ~${String(range.tokens)} tokens, importance ${String(draft.importance)})`,
+        + `(${String(cappedRange.nodes.length)} nodes, ~${String(cappedRange.tokens)} tokens, importance ${String(draft.importance)})`,
     )
     // WP5 — the `user` domain's collection half. This runs AFTER the compartment
     // is durable, so a candidate that cannot be staged never costs the digest.
@@ -1088,12 +1137,12 @@ async function runHistorianExclusive(
     }
     deps.journal?.info(
       'historian',
-      `compartment §C${String(compartment.compartmentId)}§ stored (~${String(range.tokens)} tokens, importance ${String(draft.importance)})`,
+      `compartment §C${String(compartment.compartmentId)}§ stored (~${String(cappedRange.tokens)} tokens, importance ${String(draft.importance)})`,
       {
         phase: 'stored',
         compartmentId: compartment.compartmentId,
-        nodes: range.nodes.length,
-        tokens: range.tokens,
+        nodes: cappedRange.nodes.length,
+        tokens: cappedRange.tokens,
         importance: draft.importance,
         // WP5 observability: without these two fields a missing profile-collect
         // row is ambiguous — "empty observations" and "lane not armed" look

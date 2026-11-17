@@ -10,6 +10,7 @@ import { describe, expect, it } from 'vitest'
 import {
   calibrationAnchors,
   callHistorian,
+  capSpanTokens,
   DEFAULT_HISTORIAN_TIMEOUT_MS,
   historianPromptText,
   planChunkSpans,
@@ -347,3 +348,64 @@ describe('usage landing on the done row', () => {
 function historianFirst(calls: readonly Call[], phase: string): Call | undefined {
   return historianCalls(calls).find(call => call.data?.phase === phase)
 }
+
+describe('capSpanTokens — a backlog must cost more runs, not bigger ones', () => {
+  // Measured 2026-11-18 (RCC ORC, IQ3_XXS, window 262144): the eligible span
+  // grew to 211 nodes / 46,725 tokens, split into four ~11.7k chunks, and
+  // 21 of 27 runs timed out. The cap is what turns that back into ordinary runs.
+  const big = (count: number, charsEach = 400): SurfaceNode[] =>
+    Array.from({ length: count }, (_, i) => node(i + 1, 'x'.repeat(charsEach)))
+
+  it('returns the span untouched when the cap is disabled', () => {
+    const nodes = big(10)
+    expect(capSpanTokens(nodes, 0)).toBe(nodes)
+    expect(capSpanTokens(nodes, -1)).toBe(nodes)
+  })
+
+  it('returns the span untouched when it already fits', () => {
+    const nodes = big(3)
+    expect(capSpanTokens(nodes, 1_000_000)).toBe(nodes)
+  })
+
+  it('keeps the OLDEST nodes and drops the tail', () => {
+    const nodes = big(20, 400) // ~100 tokens each at 4 chars/token
+    const capped = capSpanTokens(nodes, 500)
+    expect(capped.length).toBeLessThan(nodes.length)
+    expect(capped.length).toBeGreaterThan(0)
+    // Oldest kept: the prefix matches.
+    expect(capped.map(n => n.seq)).toEqual(nodes.slice(0, capped.length).map(n => n.seq))
+  })
+
+  it('always keeps at least one node even when it alone exceeds the cap', () => {
+    const nodes = big(5, 4_000)
+    expect(capSpanTokens(nodes, 10).length).toBe(1)
+  })
+
+  it('never ends on an assistant that requested tools', () => {
+    const nodes = [
+      node(1, 'a'.repeat(400)),
+      node(2, 'b'.repeat(400), { role: 'assistant', hasToolCalls: true, type: 'assistant/message' }),
+      node(3, 'c'.repeat(400), { role: 'tool', type: 'tool/result' }),
+    ]
+    const capped = capSpanTokens(nodes, 250)
+    const last = capped[capped.length - 1] as SurfaceNode
+    expect(last.hasToolCalls).toBe(false)
+    expect(capped.map(n => n.seq)).toEqual([1])
+  })
+
+  it('never returns an empty span', () => {
+    const nodes = [
+      node(1, 'a'.repeat(400), { role: 'assistant', hasToolCalls: true, type: 'assistant/message' }),
+    ]
+    expect(capSpanTokens(nodes, 10).length).toBe(1)
+  })
+
+  it('caps a real 211-node backlog into a single chunk-sized run', () => {
+    const nodes = big(211, 880) // ~220 tokens each ≈ 46k total, the measured shape
+    const capped = capSpanTokens(nodes, 13_107)
+    const tokens = capped.reduce((total, n) => total + Math.ceil(n.text.length / 4), 0)
+    expect(tokens).toBeLessThanOrEqual(13_107)
+    expect(capped.length).toBeLessThan(211)
+    expect(capped.length).toBeGreaterThan(50)
+  })
+})

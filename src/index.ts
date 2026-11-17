@@ -1667,6 +1667,15 @@ export const Config = z.object({
     ttlRebuild: z.boolean().default(true).volatile(),    protectedToolResults: z.number().default(8).volatile(),
     historianProtectedNodes: z.number().default(8).volatile(),
     historianMinNodes: z.number().default(3).volatile(),
+    /**
+     * Hard cap on the tokens one historian run may digest (0 = uncapped).
+     *
+     * Leave at 0 unless the route is slow: a backlog then decides the run size,
+     * and bigger runs time out proportionally more often. A cap turns one
+     * oversized run into several ordinary ones, which is what a slow local model
+     * needs. Volatile — a change lands on the next pass.
+     */
+    historianMaxSpanTokens: z.number().min(0).default(0).volatile(),
     /** Wall-clock budget for one historian run; a spent budget journals `failed`.
      *  120s: large backlogs (600+ pending nodes) measured ~60s+ per digest. */
     historianTimeoutMs: z.number().default(120_000).volatile(),

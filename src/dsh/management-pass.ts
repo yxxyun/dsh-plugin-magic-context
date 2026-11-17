@@ -54,6 +54,14 @@ import {
   type SurfaceNode,
 } from './seams.ts'
 
+/**
+ * Runs whose rejection has already been journalled. `runHistorian` hands the
+ * SAME promise back to every pass that asks while it is in flight, so a bare
+ * `.catch()` per pass writes one terminal row per pass — the 2026-11-18 RCC
+ * session turned 21 failures into 60 rows that way.
+ */
+const loggedHistorianRuns = new WeakSet<Promise<unknown>>()
+
 export interface ManagementPassLogger {
   info(message: string): void
   warn(message: string): void
@@ -988,7 +996,12 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
         ...input.profileCollect === undefined ? {} : { profileCollect: input.profileCollect },
         ...input.lease === undefined ? {} : { lease: input.lease },
       }
-      void runHistorian(deps, {
+      // One catch per RUN, not per pass. `runHistorian` reuses the in-flight
+      // promise for a session, so attaching a handler on every pass multiplies
+      // the terminal row: measured 2026-11-18 on the RCC ORC session, 21 failed
+      // runs produced 60 `historian promise rejected` rows (2.86 per failure),
+      // which reads like three times as much breakage as actually happened.
+      const run = runHistorian(deps, {
         sessionId: input.sessionId,
         session: input.session,
         nodes: enumerateSurfaceNodes(input.session),
@@ -997,20 +1010,25 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
           : { baselineNodeSeq: input.stores.baselineState(input.sessionId)?.nodeSeq as SessionSeq },
         ...input.contextWindow === undefined ? {} : { contextWindow: input.contextWindow },
         ...input.route === undefined ? {} : { route: input.route },
-      }).catch((error: unknown) => {
-        const why = errText(error)
-        input.logger.warn(
-          `magic-context historian failed (continuing): ${why}`,
-        )
-        // runHistorian journals its own terminal events; this row fires only
-        // if the promise itself rejects — a bug in the guard plumbing. Better
-        // a phase-less error row than a silent failure.
-        input.journal?.error('error', `historian promise rejected: ${why}`, {
-          scope: 'historian-unhandled',
-          detail: why,
-          errorName: error instanceof Error ? error.name : typeof error,
-        }, input.sessionId)
       })
+      // A reused run already carries its handler; a fresh one needs both (the
+      // silent catch keeps an unhandled rejection from escaping).
+      void (loggedHistorianRuns.has(run)
+        ? run.catch(() => {})
+        : loggedHistorianRuns.add(run) && run.catch((error: unknown) => {
+          const why = errText(error)
+          input.logger.warn(
+            `magic-context historian failed (continuing): ${why}`,
+          )
+          // runHistorian journals its own terminal events; this row fires only
+          // if the promise itself rejects — a bug in the guard plumbing. Better
+          // a phase-less error row than a silent failure.
+          input.journal?.error('error', `historian promise rejected: ${why}`, {
+            scope: 'historian-unhandled',
+            detail: why,
+            errorName: error instanceof Error ? error.name : typeof error,
+          }, input.sessionId)
+        }))
       historianRequested = true
     }
 
