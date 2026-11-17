@@ -1664,7 +1664,8 @@ export const Config = z.object({
      * band. On in DSH on purpose: the provider cache is already dead at that
      * moment, and DSH has no manual flush command — see `PressurePolicy.ttlRebuild`.
      */
-    ttlRebuild: z.boolean().default(true).volatile(),    protectedToolResults: z.number().default(8).volatile(),
+    ttlRebuild: z.boolean().default(true).volatile(),
+    protectedToolResults: z.number().default(8).volatile(),
     historianProtectedNodes: z.number().default(8).volatile(),
     historianMinNodes: z.number().default(3).volatile(),
     /**
@@ -1683,6 +1684,17 @@ export const Config = z.object({
     historianMaxTokens: z.number().default(8_192).volatile(),
     /** Ceiling the historian may escalate to after a token-cap truncation (retry doubling). */
     historianMaxTokensCeiling: z.number().default(32_768).volatile(),
+    /**
+     * Window the historian assumes when the routed model discloses none, used
+     * only for its trigger-budget math (how many tokens one run should target).
+     *
+     * Distinct from `assumedContextWindow`, which sizes the PRESSURE
+     * denominator: the historian may reasonably run on a smaller assumed window
+     * than the pass does. It existed in `DEFAULT_POLICY` without a schema entry,
+     * so it could not be set from the options page at all and a profile value
+     * was silently ignored — the one field in this block that was YAML-only.
+     */
+    historianAssumedWindow: z.number().min(1).default(128_000).volatile(),
     historianMinBudgetTokens: z.number().default(5_000).volatile(),
     baselineTokens: z.number().default(2_000).volatile(),
     memoryBudgetTokens: z.number().default(8_000).volatile(),
