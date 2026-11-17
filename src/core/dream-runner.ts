@@ -22,6 +22,7 @@
  */
 
 import type { AdapterStores, DreamRunStatus } from './stores.ts'
+import { DREAM_LEASE_TTL_MS } from './dream-lease.ts'
 import type { DreamLease } from './dream-lease.ts'
 import {
   CANONICAL_DREAM_TASKS,
@@ -80,6 +81,12 @@ export interface DreamRunnerDeps {
   readonly handlers: Partial<Record<DreamTaskName, DreamTaskHandler>>
   readonly now?: () => number
   readonly log?: (message: string, data?: Record<string, unknown>) => void
+  /**
+   * How often a running task renews its lease. Defaults to a third of
+   * {@link DREAM_LEASE_TTL_MS}; tests shrink it because they cannot wait five
+   * minutes to observe a heartbeat.
+   */
+  readonly leaseHeartbeatMs?: number
 }
 
 export interface DreamRunOutcome {
@@ -282,6 +289,29 @@ export async function runDueDreamTasks(
 
     const startedAt = now()
     let result: DreamTaskResult
+    /**
+     * Keep the lease alive while the handler runs.
+     *
+     * `lease.renew` existed from the start and had ZERO call sites: the row was
+     * acquired, then left to expire after {@link DREAM_LEASE_TTL_MS} no matter how
+     * long the run took. The lease is what makes two processes serialise, so once
+     * it lapsed a second process could legitimately take it over and both would
+     * write the same memory rows — the exact accident the lease module documents.
+     * It is reachable: `verify` now allows 300s of model time, and its
+     * `buildFileIndex` walk is outside that budget (20,001 files on `C:/data/code`
+     * here). A third of the TTL leaves two renewal windows of slack.
+     */
+    const heartbeat = setInterval(() => {
+      try {
+        if (!deps.lease.renew(leaseKey)) {
+          log(`dream[${task}]: lease lost while running; the run continues but its writes are no longer exclusive`, { projectPath })
+        }
+      } catch (error) {
+        log(`dream[${task}]: lease renew failed: ${error instanceof Error ? error.message : String(error)}`, { projectPath })
+      }
+    }, deps.leaseHeartbeatMs ?? Math.max(1_000, Math.floor(DREAM_LEASE_TTL_MS / 3)))
+    // Never hold the event loop open on account of the heartbeat.
+    heartbeat.unref?.()
     try {
       result = await handler({
         projectPath,
@@ -297,6 +327,7 @@ export async function runDueDreamTasks(
         error: error instanceof Error ? error.message : String(error),
       }
     } finally {
+      clearInterval(heartbeat)
       deps.lease.release(leaseKey)
     }
 

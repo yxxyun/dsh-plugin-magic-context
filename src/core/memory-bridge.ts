@@ -387,6 +387,37 @@ export function gitProjectIdentity(directory: string, timeoutMs = 3_000): string
 }
 
 /** The identity Magic Context would use for a directory: git when possible. */
+/**
+ * Whether a string is a project identity an agent-written memory may target.
+ *
+ * Two prefixes are minted here: `dir:<12 hex>` (see {@link directoryIdentity})
+ * and `git:<root commit sha>` (see {@link gitProjectIdentity}). What this
+ * predicate must reject is not a malformed hash but a DOMAIN — `dir:global:<kind>`
+ * is a domain identity, and writing to it directly is what P1-10 was about. The
+ * hash shape is left unchecked on purpose: a legacy or renamed identity must
+ * still be writable, and the domains are the only strings that are privileged.
+ *
+ * The distinction is a trust boundary, not a naming convention. A domain row is
+ * only ever created by `promote` → `publishDomainMemory`, which adds the
+ * shareability evaluation, the approval card and the per-domain cap. The
+ * `ctx_memory` write path accepted any `dir:`/`git:` prefix and passed it
+ * straight through, so `project="dir:global:org"` wrote into the org domain and
+ * skipped all three (code analysis 2026-11-17, P1-10).
+ *
+ * Reads deliberately do NOT use this: recall is scoped BY domain identity, and
+ * refusing to read `dir:global:machine` would hide exactly the rows the feature
+ * exists to surface.
+ */
+export function isProjectIdentity(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length === 0) return false
+  if (!value.startsWith('dir:') && !value.startsWith('git:')) return false
+  // `dir:global:<kind>` / `git:global:<kind>` are domains (domains.ts:85). This is
+  // the same test `global-domains.ts:220` uses to decide a row belongs to a
+  // domain rather than to a project, kept identical on purpose: a second,
+  // differently-spelled rule is how the two would drift apart.
+  return !value.startsWith('dir:global:') && !value.startsWith('git:global:')
+}
+
 export function resolveProjectIdentity(directory: string): string {
   return gitProjectIdentity(directory) ?? directoryIdentity(directory)
 }

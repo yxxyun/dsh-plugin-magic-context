@@ -26,6 +26,7 @@
  */
 import { DatabaseSync } from 'node:sqlite'
 import type { LlmSeamMessage } from './types.ts'
+import { withDeadline } from './llm-deadline.ts'
 import type { AdapterStores } from './stores.ts'
 
 /** The narrow LLM seam classification needs (same shape maintenance uses). */
@@ -57,6 +58,18 @@ export interface AutoStageOutcome {
 const DEFAULT_LIMIT = 3
 const DEFAULT_MAX_PENDING = 10
 const CLASSIFY_MAX_TOKENS = 2048
+/**
+ * Wall-clock ceiling for one classification call.
+ *
+ * 90s, generous for a 600-character prompt with a 2048-token reply, but the
+ * point is that there IS a ceiling: this lane used to call `llm.stream` with no
+ * `signal` and no deadline, making it the only model call in the adapter that a
+ * hung stream could wedge forever. It runs inside the dream tick, so a stream
+ * that never settled left `dreamTickInFlight` true and **no background task in
+ * the process ever started again**, with no error row to show for it (code
+ * analysis 2026-11-17, P0-2).
+ */
+const CLASSIFY_TIMEOUT_MS = 90_000
 
 const CLASSIFY_INSTRUCTION = [
   'You are classifying a recurring project memory for possible global promotion. Judge which audience it belongs to:',
@@ -97,24 +110,29 @@ async function classify(
     + '\nCategory: ' + row.category
   let text = ''
   try {
-    const chunks = llm.stream({
-      provider: route.provider,
-      model: route.model,
-      messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
-      maxTokens: CLASSIFY_MAX_TOKENS,
-      sessionId,
-      purpose: 'compaction',
-    })
-    for await (const raw of chunks) {
-      const chunk = raw as { type: string; index?: number; text?: string }
-      if (chunk.type === 'text-delta' && typeof chunk.index === 'number' && typeof chunk.text === 'string') {
-        text += chunk.text
+    return await withDeadline(async (signal) => {
+      const chunks = llm.stream({
+        provider: route.provider,
+        model: route.model,
+        messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+        maxTokens: CLASSIFY_MAX_TOKENS,
+        sessionId,
+        purpose: 'compaction',
+        signal,
+      })
+      for await (const raw of chunks) {
+        const chunk = raw as { type: string; index?: number; text?: string }
+        if (chunk.type === 'text-delta' && typeof chunk.index === 'number' && typeof chunk.text === 'string') {
+          text += chunk.text
+        }
       }
-    }
+      return parseClassification(text)
+    }, CLASSIFY_TIMEOUT_MS)
   } catch {
+    // Includes a deadline abort: no verdict means the row stays at project
+    // level, which is the fail-closed answer this lane wants anyway.
     return undefined
   }
-  return parseClassification(text)
 }
 
 export async function autoStageGlobalCandidates(input: {

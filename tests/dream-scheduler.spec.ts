@@ -263,6 +263,37 @@ describe('runDueDreamTasks', () => {
     expect(lease.blocker(leaseKeyFor('promote-primers', PROJECT))).toBeNull()
   })
 
+  it('keeps renewing the lease while a slow handler runs', async () => {
+    // `renew` shipped with zero call sites: the row was acquired and left to
+    // expire after 15 minutes however long the run took, so a slow `verify`
+    // (300s of model time, plus a file walk outside that budget) could lapse its
+    // lease and let a second process take over mid-write. Code analysis
+    // 2026-11-17, P0-3.
+    arm('promote-primers', 500)
+    let renewals = 0
+    const counting: DreamLease = {
+      ...lease,
+      renew: (key) => { renewals += 1; return lease.renew(key) },
+    }
+    const outcomes = await runDueDreamTasks({
+      stores,
+      lease: counting,
+      handlers: {
+        'promote-primers': async () => {
+          // Long enough for several heartbeats at the injected 5ms cadence.
+          await new Promise(resolve => setTimeout(resolve, 40))
+          return { status: 'ok', itemsProcessed: 0, itemsChanged: 0, tokensUsed: 0 }
+        },
+      },
+      now: () => 1_000,
+      leaseHeartbeatMs: 5,
+    })
+    expect(outcomes[0]?.status).toBe('ok')
+    expect(renewals).toBeGreaterThan(1)
+    // The heartbeat stops with the run: the lease is released, not left renewed.
+    expect(lease.heldBy(leaseKeyFor('promote-primers', PROJECT))).toBe(false)
+  })
+
   it('does not run a task another holder has leased', async () => {
     arm('promote-primers', 500)
     // A second `openStores` on the SAME database file is the real shape of the

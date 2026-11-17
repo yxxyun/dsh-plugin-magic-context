@@ -21,6 +21,7 @@
  */
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
+import { isProjectIdentity } from '../core/memory-bridge.ts'
 import type { Journal } from '../core/journal.ts'
 import type { MemoryWriter } from '../core/memory-write.ts'
 import { parseTagRanges } from '../core/policy.ts'
@@ -869,6 +870,25 @@ export function defineCtxMemoryTool(deps: MemoryToolDeps): unknown {
           memory: { id: row.id, category: row.category, content: row.content, importance: row.importance ?? 50 },
         })
       }
+      // A memory may only be written into a PROJECT identity. `dir:global:<domain>`
+      // is a domain, and domains are reachable only through `promote` →
+      // `publishDomainMemory`, which is what adds the shareability evaluation, the
+      // approval card and the per-domain cap. Accepting the prefix verbatim here
+      // let an agent mint `project="dir:global:org"` and skip all three (code
+      // analysis 2026-11-17, P1-10). Reads stay unrestricted: recall is scoped BY
+      // domain identity, so refusing them would hide the rows the feature exists
+      // for.
+      const writesIdentity = action === 'write' || action === 'update'
+        || action === 'archive' || action === 'merge'
+      if (writesIdentity && identity !== undefined && !isProjectIdentity(identity)) {
+        return finish({
+          outcome: `"${identity}" is not a writable project identity — writes are scoped to one project `
+            + '(dir:<12 hex> or git:<root commit>). A global domain is only reachable through '
+            + 'action="promote", which goes through the approval gate. Nothing was written.',
+          ok: false,
+        })
+      }
+
       if (action === 'write') {
         if (typeof args.content !== 'string' || typeof args.category !== 'string') {
           return finish({ outcome: 'write needs both category and content.' })

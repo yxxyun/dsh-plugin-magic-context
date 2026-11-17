@@ -304,6 +304,14 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
   let engineFailed = false
   const reconcileEngine = (): void => {
     const wanted = liveBoolean(config.registerCompactionEngine, false)
+    // A failed mount leaves `engineHandle === undefined`, which makes the
+    // consistency check below see "already matches wanted=false" and return
+    // BEFORE the unmount branch that is the only place clearing the latch — so
+    // one transient host failure (e.g. `ctx.compaction` not ready yet) locked the
+    // engine out for the whole process, and the meta row read `unavailable:`
+    // forever as if the feature were switched off. Turning the switch off is the
+    // user's "try again" signal; honour it here, where it is still visible.
+    if (!wanted && engineFailed) engineFailed = false
     if (engineBusy || adapterDisposed || wanted === (engineHandle !== undefined)) return
     if (wanted && engineFailed) return
     engineBusy = true
@@ -655,11 +663,27 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
     if (decision.kind !== 'accept' || 'value' in decision || result.isError) return decision
     const sessionId = exec.agent?.session.id
     if (sessionId === undefined) return decision
-    const tag = ensureTag(stores, sessionId, { kind: 'tool-result', callId: exec.callId })
     const base = decision.content ?? result.content
     // Nothing to tag (a result without content blocks); the decision is
     // already the host's, so it passes through unchanged.
     if (base === undefined) return decision
+    // A §N§ tag is a convenience the reduce/expand loop is built on, not a term
+    // of the host's contract — and `ensureTag` is a real write transaction that
+    // runs here in the host's waterfall, where a throw becomes a visible tool
+    // failure. Fail open: an untagged result is recoverable (`ctx_reduce` later
+    // reports "no such tag"), a thrown waterfall is not. Same discipline as
+    // `compaction-engine.ts`'s `usable()`, which code analysis 2026-11-17 (P1-11)
+    // pointed at as the pattern to copy.
+    let tag: number
+    try {
+      if (adapterDisposed || stores.closed === true) return decision
+      tag = ensureTag(stores, sessionId, { kind: 'tool-result', callId: exec.callId })
+    } catch (error) {
+      journal?.warn('tool-call', `tag allocation failed; result left untagged: ${errText(error)}`, {
+        call: exec.callId,
+      })
+      return decision
+    }
     return { kind: 'accept', content: tagToolResultContent(base, tagPrefix, tag) }
   })
 

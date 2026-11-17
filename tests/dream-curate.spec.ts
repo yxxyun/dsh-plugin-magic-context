@@ -368,12 +368,31 @@ describe('runCurateTick — remembered skips', () => {
     insertMemory({ id: 1, content: 'a fact one', angle: 0 })
     insertMemory({ id: 2, content: 'a fact two', angle: 0.02 })
     const { llm } = fakeLlm(() => '{"decisions":[{"archiveId":1,"keepId":2,"action":"skip"}]}')
-    const first = await runCurateTick({ ...baseDeps(), llm })
+    // Explicit apply mode: remembering a skip is itself a write, and a dry run
+    // must not perform it (see the sibling test below).
+    const first = await runCurateTick({ ...baseDeps(), dryRun: false, llm })
     expect(first.skipped).toBe(1)
 
-    const second = await runCurateTick({ ...baseDeps(), llm })
+    const second = await runCurateTick({ ...baseDeps(), dryRun: false, llm })
     // Both sides remembered, so the pair is gone from the candidate set.
     expect(second.reason).toBe('no-candidates')
+  })
+
+  it('a dry run does not remember the skip it declined', async () => {
+    // The skip hash is the only thing that changes the next round's candidate
+    // set, so writing it under `dryRun` made a "returns the decisions without
+    // writing" mode mutate through a side door (code analysis 2026-11-17, P1-8).
+    insertMemory({ id: 1, content: 'a fact one', angle: 0 })
+    insertMemory({ id: 2, content: 'a fact two', angle: 0.02 })
+    const { llm } = fakeLlm(() => '{"decisions":[{"archiveId":1,"keepId":2,"action":"skip"}]}')
+    const first = await runCurateTick({ ...baseDeps(), dryRun: true, llm })
+    expect(first.skipped).toBe(1)
+    expect(first.dryRun).toBe(true)
+
+    // Nothing was written, so the same pair is offered again.
+    const second = await runCurateTick({ ...baseDeps(), dryRun: true, llm })
+    expect(second.reason).not.toBe('no-candidates')
+    expect(second.skipped).toBe(1)
   })
 })
 

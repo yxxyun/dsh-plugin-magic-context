@@ -302,3 +302,25 @@ describe('memory write path (promotion, watermark, dedup)', () => {
 
 
 
+
+// P1-10 (code analysis 2026-11-17): the identity is a trust boundary, not a
+// label. A domain row may only be minted by `promote` → `publishDomainMemory`,
+// which is what applies the shareability evaluation, the approval card and the
+// per-domain cap. The `ctx_memory` write path accepted any `dir:`/`git:` prefix
+// and passed it straight through.
+describe('write path refuses a domain identity', () => {
+  it('separates project identities from domain identities', async () => {
+    const { isProjectIdentity } = await import('../src/core/memory-bridge.ts')
+    // Real shapes, both writable.
+    expect(isProjectIdentity('dir:af36666a8eb6')).toBe(true)
+    expect(isProjectIdentity('git:2da2d3af25eec194a3e859373bfa56d22d56bb1b')).toBe(true)
+    // Domains: the two spellings `global-domains.ts:220` recognises.
+    expect(isProjectIdentity('dir:global:org')).toBe(false)
+    expect(isProjectIdentity('dir:global:machine')).toBe(false)
+    expect(isProjectIdentity('git:global:anything')).toBe(false)
+    // Not identities at all.
+    expect(isProjectIdentity('C:/data/code/x')).toBe(false)
+    expect(isProjectIdentity('')).toBe(false)
+    expect(isProjectIdentity(undefined)).toBe(false)
+  })
+})

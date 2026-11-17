@@ -19,7 +19,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type { AdapterStores } from '../core/stores.ts'
-import type { Journal } from '../core/journal.ts'
+import type { Journal, JournalEntry } from '../core/journal.ts'
 import { memorySample } from '../core/maintenance.ts'
 import { PROFILE_REVIEW_META_KEY, runProfileReview, type ProfileReviewLlm, type ProfileReviewOutcome } from '../core/profile-review.ts'
 import type { VectorBackfillOutcome } from '../core/vector-backfill.ts'
@@ -59,6 +59,25 @@ export interface MaintenanceLast {
   verified: number
   updated: number
   archived: number
+}
+
+/**
+ * The newest `dream-run` timestamp in a `journal.tail()` window.
+ *
+ * `tail` is `ORDER BY id DESC LIMIT n` — newest first. Scanning from
+ * `rows.length - 1` therefore reaches the OLDEST row the window still holds,
+ * which is what the panel's "last maintenance" used to report: a timestamp up to
+ * a whole window stale, reading as "the sweeper has stopped" while it was
+ * running minutes ago (code analysis 2026-11-17, P0-4).
+ *
+ * Kept as a standalone function because the ordering is the whole bug and it
+ * should be pinned by a test, not by a comment inside a closure.
+ */
+export function newestDreamRunAt(rows: readonly JournalEntry[]): number | undefined {
+  for (const row of rows) {
+    if (row.kind === 'dream-run') return row.at
+  }
+  return undefined
 }
 
 export interface MaintenanceWiring {
@@ -128,20 +147,27 @@ export function wireMaintenance(input: {
    */
   const maintenanceLast = (): MaintenanceLast | undefined => {
     const rows = journal?.tail(200) ?? []
+    // Extracted so the ordering contract is testable without standing up the
+    // whole wiring (see `newestDreamRunAt`).
+
     // `dream-run` rather than `maintenance`: nothing writes a `maintenance` row
     // any more (the sweep is gone), so looking for one would report "never ran"
     // forever. A dream run IS the background work now, so the newest one is both
     // the honest timestamp and the one a reader means by "last maintenance".
     //
+    // `tail` returns newest-first (`ORDER BY id DESC LIMIT n`), so the FIRST
+    // match is the newest. This loop used to walk from `rows.length - 1` down,
+    // which returned the OLDEST `dream-run` in the 200-row window: the panel's
+    // "last maintenance" was systematically stale and read as "the sweeper has
+    // stopped". Code analysis 2026-11-17 picked it up as P0-4.
+    //
     // The per-step counters stay 0: a `dream-run` row carries its own
     // itemsProcessed/itemsChanged, and the panel reads those from its own
     // endpoint. Reporting them here would be a second, differently-rounded copy.
-    for (let k = rows.length - 1; k >= 0; k -= 1) {
-      const row = rows[k]
-      if (row?.kind !== 'dream-run') continue
-      return { at: row.at, expired: 0, verified: 0, updated: 0, archived: 0 }
-    }
-    return undefined
+    const at = newestDreamRunAt(rows)
+    return at === undefined
+      ? undefined
+      : { at, expired: 0, verified: 0, updated: 0, archived: 0 }
   }
   /**
    * No ticker is installed. The dream runner is the only scheduler: every step

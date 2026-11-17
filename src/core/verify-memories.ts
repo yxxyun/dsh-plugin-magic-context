@@ -223,10 +223,18 @@ async function collectText(
   prompt: string,
 ): Promise<{ ok: true; text: string; tokensUsed: number } | { ok: false; why: string; tokensUsed: number }> {
   const budgetMs = deps.timeoutMs ?? VERIFY_TIMEOUT_MS
+  // Hoisted OUT of the deadline callback so the catch below can still report
+  // what the provider already charged. It used to be a closure local, so every
+  // timeout returned `tokensUsed: 0` while the provider had burned a full input
+  // window — measured 2026-11-17 run #41: `deadline no terminal event within
+  // 120000ms`, `tokensUsed 0`, actual input ~16k. `dream-runner.ts:319` decides
+  // whether a run overspent by comparing THIS number to the task's budget, so a
+  // hard 0 does not mean "free", it means "the ceiling cannot trigger" (code
+  // analysis P0-5).
+  let tokensUsed = 0
   try {
     return await withDeadline(async (signal) => {
       const byIndex = new Map<number, string>()
-      let tokensUsed = 0
       let finishKind: string | undefined
       const chunks = deps.llm!.stream({
         provider: deps.route!.provider,
@@ -279,8 +287,13 @@ async function collectText(
   } catch (error) {
     return {
       ok: false,
-      why: error instanceof LlmDeadlineError ? `deadline ${error.message}` : error instanceof Error ? error.message : String(error),
-      tokensUsed: 0,
+      why: error instanceof LlmDeadlineError
+        ? `deadline ${error.message} (after ${String(tokensUsed)} accounting tokens)`
+        : error instanceof Error ? error.message : String(error),
+      // Whatever usage chunks arrived before the abort. Often still 0 (the
+      // provider reports at the end), but a partial stream is not free and
+      // reporting it as such is the bug, not the missing detail.
+      tokensUsed,
     }
   }
 }

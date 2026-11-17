@@ -483,10 +483,18 @@ export async function runCurateTick(deps: CurateDeps): Promise<CurateOutcome> {
     }
     if (decision.action === 'skip') {
       skipped += 1
-      // Remember the skip against BOTH sides: editing either one re-opens the
-      // pair, which is the behaviour a content hash is for.
-      for (const row of [pair.a, pair.b]) {
-        writer.recordCurateSkip({ identity, id: row.id, contentHash: memoryContentHash(row.content), at: now })
+      // A dry run must not write. The skip hash is the ONLY thing that changes
+      // the next round's candidate set, so recording it here made `dryRun` a
+      // mutating mode through a side door — the file header promises "returns
+      // the decisions without writing". The merge and archive branches already
+      // gate on `dryRun`; this one did not (code analysis 2026-11-17, P1-8).
+      //
+      // Remembered against BOTH sides on a real run: editing either one re-opens
+      // the pair, which is the behaviour a content hash is for.
+      if (!dryRun) {
+        for (const row of [pair.a, pair.b]) {
+          writer.recordCurateSkip({ identity, id: row.id, contentHash: memoryContentHash(row.content), at: now })
+        }
       }
       decisions.push({
         archiveId: decision.archiveId, keepId: decision.keepId,
