@@ -16,6 +16,7 @@ import {
   buildAutoStageHandler,
   buildBackfillVectorsHandler,
   buildIndexCommitsHandler,
+  buildPruneJournalHandler,
 } from '../src/dsh/dream-handlers.ts'
 import type { AdapterStores } from '../src/core/stores.ts'
 import type { Journal } from '../src/core/journal.ts'
@@ -144,4 +145,61 @@ describe('index-commits', () => {
     expect(result.status).toBe('skipped')
     expect(result.summary).toContain('timed out')
 })
+})
+
+
+// `prune-journal` exists because retention used to run only when the journal was
+// OPENED (`live-journal.ts`), which for a long-lived process means "almost
+// never": measured 2026-11-17, journal row data + indexes were 47% of the
+// database. A daily task is the primitive this adapter already has.
+describe('prune-journal', () => {
+  it('prunes past the configured retention window', async () => {
+    const cutoffs: number[] = []
+    const handler = buildPruneJournalHandler({
+      housekeeping: {
+        stores,
+        pruneJournal: (cutoff) => { cutoffs.push(cutoff); return 42 },
+        journalRetentionDays: () => 30,
+      },
+    })
+    const result = await handler(context)
+    expect(result.status).toBe('ok')
+    expect(result.itemsChanged).toBe(42)
+    expect(cutoffs).toEqual([NOW - 30 * 24 * 60 * 60_000])
+    expect(result.summary).toContain('pruned 42')
+  })
+
+  it('floors the window at one day so a stray zero cannot empty the table', async () => {
+    const cutoffs: number[] = []
+    const handler = buildPruneJournalHandler({
+      housekeeping: {
+        stores,
+        pruneJournal: (cutoff) => { cutoffs.push(cutoff); return 0 },
+        // The same floor `live-journal.ts` applies to a manual configuration.
+        journalRetentionDays: () => 0,
+      },
+    })
+    const result = await handler(context)
+    expect(result.status).toBe('ok')
+    expect(cutoffs).toEqual([NOW - 24 * 60 * 60_000])
+    expect(result.summary).toContain('nothing past 1d retention')
+  })
+
+  it('reports a failed DELETE as failed rather than retrying sooner', async () => {
+    const handler = buildPruneJournalHandler({
+      housekeeping: {
+        stores,
+        pruneJournal: () => { throw new Error('database is locked') },
+        journalRetentionDays: () => 30,
+      },
+    })
+    const result = await handler(context)
+    expect(result.status).toBe('failed')
+    expect(result.error).toContain('database is locked')
+  })
+
+  it('is skipped when the seam is absent', async () => {
+    const handler = buildPruneJournalHandler({ housekeeping: { stores } })
+    expect((await handler(context)).status).toBe('skipped')
+  })
 })

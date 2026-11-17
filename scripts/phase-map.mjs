@@ -370,6 +370,11 @@ export const PHASES = [
       + '2026-11-17 实测踩过一次——ensureDreamSchedules 传给了 injectReduceGuidance（只做 systemPrompt 注入）'
       + '而不是 preStepListener，结果 dream_schedule 一直是 0 行、journal 零 dream-* 行，而全部单测与五个验收脚本都通过。'
       + '判据只能是重启后查 dream_schedule 行数与 journal，不能靠测试绿灯',
+      '2026-11-17 起补了一段廉价自检：dream tick 里做一次性检查，挂载满 2 分钟后若 dream_schedule 仍为 0 行，'
+      + '就往 journal 与宿主日志各写一条 warn，并点名「通常是 apply() 的接线错误」。'
+      + '它覆盖的只是「播种完全没发生」这一类；播种到了错误身份、或事件接反但仍然写库，它看不出来。'
+      + '完整的装配 smoke test（fake Context 调 apply()，断言事件名集合、五个工具、命令注册、dispose 顺序）仍未做——'
+      + '按 2026-11-17 的实际数据判断优先级：全时段 354 次挂载只出过 1 次装配事故，先把静默变成可见，再谈覆盖',
     ],
   },
 ]

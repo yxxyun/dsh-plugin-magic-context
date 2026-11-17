@@ -179,6 +179,10 @@ export interface HousekeepingHandlerDeps {
   /** Wall-clock budget for one `git log` read (default 20s); injectable for tests. */
   readonly indexCommitsTimeoutMs?: number
   readonly projectRootOf?: (identity: string) => string | undefined
+  /** `prune-journal`: the store call that does the DELETE. */
+  readonly pruneJournal?: (cutoff: number) => number
+  /** `prune-journal`: retention window in days, live-read from config. */
+  readonly journalRetentionDays?: () => number
 }
 
 export interface ReviewUserMemoriesHandlerDeps {
@@ -703,6 +707,56 @@ export function buildBackfillVectorsHandler(deps: DreamHandlerDeps): DreamTaskHa
   }
 }
 
+/**
+ * `prune-journal`: delete journal rows past the retention window.
+ *
+ * Why this is a task and not part of opening the journal: retention used to run
+ * inside `openJournal`'s constructor (and again only when the configured value
+ * changed, see `live-journal.ts`). A long-lived process opens the journal once,
+ * so "prune at open" quietly becomes "prune never" — measured 2026-11-17, the
+ * journal was 4.46 MB of row data plus 1.75 MB of indexes, 17,507 rows over ten
+ * days, 47% of the whole database. A daily task is the scheduling primitive this
+ * adapter already has; adding a second timer for it is the exact pattern the
+ * maintenance sweep was deleted for.
+ *
+ * Kept AFTER the overnight batch (05:07) rather than at midnight: pruning first
+ * would delete the rows the night's tasks are about to write.
+ */
+export function buildPruneJournalHandler(deps: DreamHandlerDeps): DreamTaskHandler {
+  return async (context): Promise<DreamTaskResult> => {
+    const seam = deps.housekeeping
+    if (seam === undefined || seam.pruneJournal === undefined) {
+      return { status: 'skipped', summary: 'journal pruning is not wired in this build' }
+    }
+    // Floored at one day, the same floor `live-journal.ts` applies to a manual
+    // configuration: a stray zero must not be able to empty the table.
+    const days = Math.max(1, Math.floor(seam.journalRetentionDays?.() ?? 30))
+    const cutoff = context.now - days * 24 * 60 * 60_000
+    let removed: number
+    try {
+      removed = seam.pruneJournal(cutoff)
+    } catch (error) {
+      // A failed prune is worth reporting but not worth retrying sooner: the
+      // rows will still be there tomorrow, and the failure is probably SQLite
+      // contention rather than anything the schedule can fix.
+      return {
+        status: 'failed',
+        error: error instanceof Error ? error.message : String(error),
+        summary: `journal prune failed: ${error instanceof Error ? error.message : String(error)}`,
+      }
+    }
+    return {
+      status: 'ok',
+      itemsProcessed: removed,
+      itemsChanged: removed,
+      tokensUsed: 0,
+      summary: removed === 0
+        ? `nothing past ${String(days)}d retention`
+        : `pruned ${String(removed)} journal rows older than ${String(days)}d`,
+    }
+  }
+}
+
 /** `index-commits`: read this project's git history into the search index. */
 export function buildIndexCommitsHandler(deps: DreamHandlerDeps): DreamTaskHandler {
   return async (context): Promise<DreamTaskResult> => {
@@ -749,5 +803,6 @@ export function buildDreamHandlers(deps: DreamHandlerDeps): Record<string, Dream
     'auto-stage-global': buildAutoStageHandler(deps),
     'backfill-vectors': buildBackfillVectorsHandler(deps),
     'index-commits': buildIndexCommitsHandler(deps),
+    'prune-journal': buildPruneJournalHandler(deps),
   }
 }

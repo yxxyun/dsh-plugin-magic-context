@@ -9,15 +9,15 @@
 
 ## 0. 一页结论
 
-这是一份**工程纪律明显高于平均线**的适配器代码：每个非显然的决定都写了「为什么」和实测日期（注释里上百条 2026-xx-xx 的现场记录），契约文档（PARITY.md / NOTICE / docs 25 篇）与测试门禁（118 spec / 1408 用例 / 相位映射全覆盖）都在，写作风格统一，失败方向几乎都是 fail-closed 而不是 fail-silent。
+这是一份**工程纪律明显高于平均线**的适配器代码：每个非显然的决定都写了「为什么」和实测日期（注释里上百条 2026-xx-xx 的现场记录），契约文档（PARITY.md / NOTICE / docs 25 篇）与测试门禁（118 spec / 1419 用例 / 相位映射全覆盖）都在，写作风格统一，失败方向几乎都是 fail-closed 而不是 fail-silent。
 
 真正的风险不在「算法写错了」，而在**三处结构性问题**：
 
-1. **装配层 `src/index.ts`（1609 行、20 多个接缝/工具/命令的接线）零测试**。仓库自己在 `scripts/phase-map.mjs:361-364` 记了 2026-11-17 的事故：`ensureDreamSchedules` 传给了错误的接线函数，`dream_schedule` 一直 0 行、journal 零 `dream-*`，而全部单测 + 五个验收脚本全绿。这是当前最大的单点风险，且已有前科。
-2. **后台调度（dream）的边界处理不完整**：一个没有 deadline 的 LLM 车道能锁死整个调度器；租约只发不续（可被合法夺取后双写）；`dream_runs` 无裁剪、journal 只在挂载时裁剪；两条模型车道谎报 `tokensUsed: 0`，使预算闸形同虚设。
+1. **装配层 `src/index.ts`（1609 行、20 多个接缝/工具/命令的接线）零测试**。仓库自己在 `scripts/phase-map.mjs:361-364` 记了 2026-11-17 的事故：`ensureDreamSchedules` 传给了错误的接线函数，`dream_schedule` 一直 0 行、journal 零 `dream-*`，而全部单测 + 五个验收脚本全绿。这是当前最大的单点风险，且已有前科。**（2026-11-17 已补一段自检：挂载 2 分钟后仍无排程即 warn，见 §7.1；完整 smoke spec 按数据判缓。）**
+2. **后台调度（dream）的边界处理不完整**：一个没有 deadline 的 LLM 车道能锁死整个调度器；租约只发不续（可被合法夺取后双写）；`dream_runs` 无裁剪、journal 只在挂载时裁剪（**后者已改为每日任务 `prune-journal`，见 §7.2**）；两条模型车道谎报 `tokensUsed: 0`，使预算闸形同虚设。
 3. **记忆的可见性边界靠「身份字符串」承担**：写路径只校验 identity 非空（`memory-write.ts:1266`），`dir:` / `git:` 前缀原样放行（`tool-bridge.ts:706-712`），因此 `dir:global:org` 可以被直接写入，绕过发布闸门与域 cap；同时 classify 夜间调用会写 `shareable/scope`（`memory-write.ts:1881-1894`），与自己文档声明的「共享归人工闸门」相反。
 
-代码本身是健康的：`tsc --noEmit` 零错误（`strict` + `noUncheckedIndexedAccess`），`vitest run` 118/118 文件、1408/1408 用例通过（墙钟 14s）。线上库 schema v14、语料 v95，运行正常，最近一次 `verify` 在 14:32（本地）成功。
+代码本身是健康的：`tsc --noEmit` 零错误（`strict` + `noUncheckedIndexedAccess`），`vitest run` 118/118 文件、1419/1419 用例通过（墙钟 14s）。线上库 schema v14、语料 v95，运行正常，最近一次 `verify` 在 14:32（本地）成功。
 
 ---
 
@@ -78,7 +78,7 @@ execute band  → 只有压力 ≥ 阈值 / 空闲超 ttlMs / wire 有缺陷时�
 
 ### 2.3 后台调度（dream）
 
-单一调度器：`setInterval(5min)` → `runDueDreamTasks` 按 `next_due_at` 串行跑十个任务；跨进程靠 `dream_lease`（key = `dream:memory:<project>`，原子 upsert + 死 PID 围栏回收）；每次 run 的「写 run 行 + 推进 next_due_at」在**同一事务**（`stores.ts:2094-2133`）——这是避免重复执行的关键。
+单一调度器：`setInterval(5min)` → `runDueDreamTasks` 按 `next_due_at` 串行跑十一个任务；跨进程靠 `dream_lease`（key = `dream:memory:<project>`，原子 upsert + 死 PID 围栏回收）；每次 run 的「写 run 行 + 推进 next_due_at」在**同一事务**（`stores.ts:2094-2133`）——这是避免重复执行的关键。
 
 cron 是自研 5 字段求值器，按本地墙钟、Vixie 的 DOM/DOW 取或规则、DST 重复分钟去重（`cron.ts:183-287`）。失败按指数退避（5min→6h）、`skipped` 重置失败计数、环境性跳过 5 分钟短重试（`dream-handlers.ts:25`、`dream-runner.ts:181-184`）。
 
@@ -86,7 +86,7 @@ cron 是自研 5 字段求值器，按本地墙钟、Vixie 的 DOM/DOW 取或规
 
 ## 3. 运行时实证（本机）
 
-门禁：`npx tsc --noEmit -p tsconfig.json` → exit 0；`npx vitest run` → **118 files / 1408 tests passed，14.13s**。
+门禁：`npx tsc --noEmit -p tsconfig.json` → exit 0；`npx vitest run` → **118 files / 1419 tests passed**。
 
 线上库（2026-11-17 15:08 快照，13 MB）：
 
@@ -114,12 +114,12 @@ journal 里读到的真实故障轨迹（这条最能说明这套代码的诚实
 
 | # | 位置 | 机制与影响 | 建议 |
 |---|---|---|---|
-| 1 | `src/index.ts` 全文；`scripts/phase-map.mjs:361-364` | 装配层零覆盖。所有验收脚本直接调函数，绕过 `on(preStep, …)` 真实接线；仓库自己记了「接错函数而全绿」的事故。任何一次 `apply()` 里的顺序/参数错误都不会被测试发现。 | 加一个 smoke spec：fake `Context` 调 `apply()`，断言 `on()` 的事件名集合、五个工具注册、`/ctx-*` 命令注册、`dream_schedule` 播种、dispose 清理顺序。这是投入产出最高的一项。 |
-| 2 | `src/dsh/dream-handlers.ts:632-664`（`autoStageGlobalCandidates`，`src/core/global-autostage.ts:120+` 无 `withDeadline`） | 十个任务里唯一没有 LLM 墙钟的车道。一次永不 settle 的流会让 `index.ts:523-528` 的 `dreamTickInFlight` 永久为 `true`，本进程**之后所有后台任务永不启动**，且无日志（只有「tick 再也不进来」）。 | 与 verify/classify/curate 一致地包 `withDeadline`（60–120 s），并把 `dreamTickInFlight` 加一个最大持有时长兜底。 |
+| 1 | `src/index.ts` 全文；`scripts/phase-map.mjs:361-364` | 装配层零覆盖。所有验收脚本直接调函数，绕过 `on(preStep, …)` 真实接线；仓库自己记了「接错函数而全绿」的事故。任何一次 `apply()` 里的顺序/参数错误都不会被测试发现。 | 加一个 smoke spec：fake `Context` 调 `apply()`，断言 `on()` 的事件名集合、五个工具注册、`/ctx-*` 命令注册、`dream_schedule` 播种、dispose 清理顺序。这是投入产出最高的一项。**状态（2026-11-17）：部分处理**——先做了自检，完整的 `apply()` smoke spec 按实测数据判缓，理由见 §7.1。 |
+| 2 | `src/dsh/dream-handlers.ts:632-664`（`autoStageGlobalCandidates`，`src/core/global-autostage.ts:120+` 无 `withDeadline`） | 原本是十一个任务里唯一没有 LLM 墙钟的车道（已修，见 §7 前言）。一次永不 settle 的流会让 `index.ts:523-528` 的 `dreamTickInFlight` 永久为 `true`，本进程**之后所有后台任务永不启动**，且无日志（只有「tick 再也不进来」）。 | 与 verify/classify/curate 一致地包 `withDeadline`（60–120 s），并把 `dreamTickInFlight` 加一个最大持有时长兜底。 |
 | 3 | `src/core/dream-lease.ts:27,49`（`renew` 全库零调用） | 租约 TTL 15 分钟且**从不续期**。verify 的墙钟上限是 300 s，但 `buildFileIndex` 的全树遍历不受该预算约束（实测本机 `C:/data/code` 触发 20,001 文件上限）；超 15 分钟后另一进程可合法夺租，两边同时改写同一批记忆行（`dream-lease.ts:12-16` 自己描述过这个事故）。 | runner 在 run 期间每 TTL/3 调一次 `lease.renew`；或按任务声明 TTL（curate/verify 延长）。 |
 | 4 | `src/dsh/maintenance-wiring.ts:139-143` + `src/core/stores.ts:2379` | `tail(200)` 返回**新→旧**，循环却从 `rows.length-1` 递减，于是返回窗口内**最旧**的 `dream-run`。面板「上次维护」系统性偏旧、看起来像停了。 | 循环正序，或直接 `find` 第一条 `dream-run`。一行。 |
 | 5 | `src/core/verify-memories.ts:279-285`；`src/dsh/dream-handlers.ts:621,657` | 记账失真：verify 的超时/异常分支返回 `tokensUsed: 0`（provider 已烧掉上万 token）；`review-user-memories` 与 `auto-stage` 无论调没调模型都写 `tokensUsed: 0`。而 `dream-runner.ts:319-324` 的预算是**事后按 tokensUsed 判**的 → 55k/60k 等预算对这两条最贵的车道完全失效，成本曲线也读不出来。 | 从各 `outcome` 透传真实 token；超时分支至少回填已知的 usage 快照。 |
-| 6 | `src/core/journal.ts:334-341`、`src/dsh/live-journal.ts:60-79`、`src/dsh/dream-handlers.ts:25` + `dream-runner.ts:181-184` | 增长面无收敛：`dream_runs` 全库无 DELETE；journal 裁剪只在挂载或「retention 值变了」时执行（长驻进程数周不重启就不裁）；环境性跳过每 5 分钟落一条 run 行 + 一条 journal 行（无次数上限，仅失败有退避）。现状 journal 已 17,408 行，`/mc-telemetry` 的 `tail`/`journalBounds` 会随之变贵。 | 把 retention 做成一个 dream 任务；环境性跳过加「连续 N 次后按整周期」；`dream_runs` 保留最近 N 条/90 天。 |
+| 6 | `src/core/journal.ts:334-341`、`src/dsh/live-journal.ts:60-79`、`src/dsh/dream-handlers.ts:25` + `dream-runner.ts:181-184` | 增长面无收敛：`dream_runs` 全库无 DELETE；journal 裁剪只在挂载或「retention 值变了」时执行（长驻进程数周不重启就不裁）；环境性跳过每 5 分钟落一条 run 行 + 一条 journal 行（无次数上限，仅失败有退避）。现状 journal 已 17,408 行，`/mc-telemetry` 的 `tail`/`journalBounds` 会随之变贵。 | 把 retention 做成一个 dream 任务；环境性跳过加「连续 N 次后按整周期」；`dream_runs` 保留最近 N 条/90 天。**状态（2026-11-17）：journal 部分已处理**，另两项经上游对照后不做，理由见 §7.2。 |
 
 ### P1（正确性 / 一致性）
 
@@ -168,11 +168,114 @@ journal 里读到的真实故障轨迹（这条最能说明这套代码的诚实
 ## 6. 建议的修复顺序
 
 1. **装配层 smoke test**（P0-1）——先有安全带，再动其它。
+   *2026-11-17：只做了自检，smoke spec 判缓（§7.1）。*
 2. **一行级的 P0-4 / P1-7 / P1-13**：`maintenanceLast` 顺序、`engineFailed` 复位、`liveBoolean` 递归。改动极小，收益立竿见影。
+   *已全部完成。*
 3. **P0-2 与 P0-3**：auto-stage 接 `withDeadline`、租约续期。这两条决定后台体系在坏网络/长仓库下是否可靠。
+   *已全部完成。*
 4. **P0-5 记账真实化**，再顺手把 P0-6 的增长收敛（retention 任务 + skip 上限）。
+   *P0-5 已完成；P0-6 只做了 journal 一项（§7.2），skip 上限与 `dream_runs` 裁剪经上游对照后不做。*
 5. **P1-10 身份形状校验**（安全边界）、**P1-8/P1-9**（dry-run 副作用、classify 越界写共享）。
+   *P1-8、P1-10 已完成；P1-9（classify 共享写入与文档矛盾）仍待裁决。*
 6. 性能三项（P1-16/17）与 chunk 轨的去留（P1-15），放在功能稳定之后。
+
+---
+
+## 7. 处理记录（2026-11-17）
+
+本轮修了 P0-2 / P0-3 / P0-4 / P0-5、P1-7 / P1-8 / P1-10 / P1-11，加上本节详述的 P0-1 与 P0-6。
+两处**没有按报告建议的原样执行**，依据都是实测数据，记录在此以免下次重新论证。
+
+### 7.1 P0-1 装配层：只做自检，不做全量 smoke test
+
+**先给数据。**
+
+| 指标 | 实测值 | 取法 |
+|---|---|---|
+| 全时段挂载次数 | 354 | `SELECT COUNT(*) FROM journal WHERE kind='boot'` |
+| 装配层产生的 warn/error | **0** | `kind='engine'` 81 条，全部 `info` |
+| 已知装配事故 | **1** | 2026-11-17，`ensureDreamSchedules` 传给 `injectReduceGuidance` |
+| `src/index.ts` 规模 | 1,609 行 / 20+ 处接线 / 测试覆盖 0 | — |
+
+354 次挂载出 1 次错。这个频率不足以支撑「fake Context 调 `apply()`，断言事件名集合 + 五个工具 + 命令注册 + dispose 顺序」这套工程
+——那是一个需要持续维护的宿主仿真层，宿主每次改 Context 形状它都要跟着改。
+
+但那次事故的**失效形态**必须处理：它不抛错、不 warn、`dream_schedule` 静默保持 0 行，
+而 118 个测试文件、1,415 条用例、五个验收脚本全部通过——因为验收脚本直接调函数，绕过了 `on(preStep, …)`。
+
+**做了的（`src/index.ts`，约 40 行）**：`dreamTick` 里加一次性自检。
+
+```
+挂载满 2 分钟 → 查 dream_schedule 行数 → 仍为 0 → journal.warn('dream-seeded') + ctx.logger.warn
+```
+
+选 2 分钟是因为播种发生在「本次进程第一次 pre-step」，新挂载的进程合法地空一段时间；
+选 `dreamTick` 而不是新开 `setTimeout` 是因为 tick 本来就在跑，加一个定时器正是当年删掉维护扫描的原因。
+文案直接点名「通常是 apply() 的接线错误，检查 ensureDreamSchedules 是否到达 pre-step listener」。
+
+**没做的**：完整 smoke spec。留给「装配改动变频繁」或「再出一次同类事故」时。
+
+**这个自检覆盖不到什么**（写进 `scripts/phase-map.mjs` 的 blind 了）：
+播种到了错误身份、事件接反但仍然写库——它只看得到「一张表彻底空着」。
+
+### 7.2 P0-6 增长收敛：只做 journal 那一条
+
+报告建议三项：journal 裁剪任务化、环境性跳过加次数上限、`dream_runs` 保留 N 条。
+**只有第一项有数据支撑，另两项查了上游后放弃。**
+
+#### 上游对照（`C:\data\code\mc-upstream` @ a1ca346 v0.49.41）
+
+| 报告建议 | 上游有没有 | 证据 |
+|---|---|---|
+| `dream_runs` 保留 N 条 | **没有** | `storage-db.ts:1533` 只有 `CREATE TABLE`，全仓 `DELETE FROM dream_runs` 零命中 |
+| journal 裁剪 | **无对应物** | 上游没有 `journal` 表；日志走 `shared/logger.ts` 的 pino 式写盘，策略是单文件截断到 `MAX_LOG_FILE_BYTES = 32 * 1024 * 1024` |
+| 跳过次数上限 | **无对应机制** | 上游 `dream_runs` 是**一次 run 一行**（`tasks_json` 汇总），不写 per-task skip 行 |
+
+所以这三项都不能「跟进上游」——第一、二项上游也没做，第三项上游根本没有这个形状。
+本地的 `dream_runs` 是 per-task 一行，与上游结构不同，增长速度也不同。
+
+#### 实测增长
+
+```
+db 13.2 MB
+├─ journal 相关   6.2 MB  (47%)   journal 4.46 MB + 索引 1.75 MB
+├─ usage_records  1.57 MB
+├─ tags + idx     3.03 MB
+└─ compartments   0.64 MB
+```
+
+| 项 | 实测 | 一年推算 | 判断 |
+|---|---|---|---|
+| journal | 17,507 行 / 10 天（1,200–3,000 行/天） | ≈ 640k 行 / 160 MB | 真问题 |
+| `dream_runs` | 57 行 / 半天 | ≈ 41k 行 | 小，不紧迫 |
+| 环境性跳过 | **0 次发生**（今日 57 次 run 中 `status='skipped'` 为 0） | — | 纯理论风险 |
+
+「环境性跳过 0 次」是因为路由一直在（有会话在跑）。它只在「进程启动后尚无会话」的窗口里触发，
+而这个窗口在正常使用下很短。为它加上限是在修一个没发生过的问题。
+
+#### 做了的：`prune-journal` 成为第十一个 dream 任务
+
+`src/core/dream-registry.ts` + `src/dsh/dream-handlers.ts:buildPruneJournalHandler` + `src/index.ts` 接线。
+
+- cron `7 5 * * *`：排在整夜批次之后。放在午夜会删掉当晚任务正要写的行。
+- `host-only` / `tokenBudget: 0` / `mutatesMemories: false`：一次 DELETE，不调模型，不碰记忆语料。
+- retention 下限 1 天，与 `live-journal.ts` 对人工配置施加的地板一致——一个手滑的 0 不能清空整表。
+- DELETE 抛错 → `failed`（走退避），不重试得更勤：行明天还在，失败多半是 SQLite 争用，调度器解决不了。
+
+**线上验证**：
+
+```
+播种  dir:af36666a8eb6 | 7 5 * * * | 11 个任务（原 10）
+执行  #60  08:28:11  ok  changed=0  |  nothing past 30d retention
+```
+
+`changed=0` 是正确的：库里只有 10 天数据，retention 30 天。删不删得到要等库龄超过 30 天，
+行为本身由 `tests/dream-housekeeping.spec.ts` 的四条用例钉住（切点计算、1 天下限、DELETE 抛错、seam 缺失）。
+
+#### 没做的两项
+
+`dream_runs` 保留 N 条、跳过次数上限——上游无先例、本地实测无痛感，属于「按推测修」，不做。
+真要动，触发条件写清楚：`dream_runs` 超过 5 万行，或 `status='skipped'` 占到 20% 以上。
 
 ---
 

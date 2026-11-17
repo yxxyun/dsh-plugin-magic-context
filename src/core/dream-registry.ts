@@ -50,6 +50,13 @@ export const CANONICAL_DREAM_TASKS = [
   'auto-stage-global',
   'backfill-vectors',
   'index-commits',
+  // Also no upstream equivalent: upstream logs to a file with a 32 MB cap
+  // (`shared/logger.ts`), so it has nothing like the `journal` table to prune.
+  // This row exists because `journal` IS a table here and it is 47% of the
+  // database (6.2 MB of 13.2 MB, 17,507 rows over 10 days — measured
+  // 2026-11-17). Retention used to run only when the journal was OPENED, which
+  // for a long-lived process means "almost never".
+  'prune-journal',
 ] as const
 
 export type DreamTaskName = (typeof CANONICAL_DREAM_TASKS)[number]
@@ -146,6 +153,14 @@ export const DREAM_TASK_CAPABILITIES: Record<DreamTaskName, DreamTaskCapability>
     mutatesMemories: false,
     tokenBudget: 0,
   },
+  'prune-journal': {
+    transport: 'host-only',
+    // A DELETE past the retention line. No model, no memory mutation (the
+    // journal is the adapter's own log, not the memory corpus), so it needs no
+    // lease domain beyond the scheduler's own.
+    mutatesMemories: false,
+    tokenBudget: 0,
+  },
   'index-commits': {
     transport: 'host-only',
     mutatesMemories: false,
@@ -233,4 +248,7 @@ export const DEFAULT_DREAM_SCHEDULES: Record<DreamTaskName, string> = {
   'backfill-vectors': '*/30 * * * *',
   // Every two hours; a commit index that lags by one slot is harmless.
   'index-commits': '43 */2 * * *',
+  // Daily at 05:07, after the whole overnight batch: pruning first would drop
+  // the rows those tasks just wrote. Half an hour before the next day's work.
+  'prune-journal': '7 5 * * *',
 }

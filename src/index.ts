@@ -518,6 +518,11 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
       ...lane.indexCommits === undefined ? {} : { indexCommits: lane.indexCommits },
       indexCommitsEnabled: () => liveBoolean(config.memory?.indexCommits, true),
       projectRootOf: (identity: string) => dreamRoots.get(identity),
+      // `prune-journal` uses the store call directly rather than going through
+      // the live journal wrapper: the wrapper owns the config getters, and the
+      // DELETE is the same `stores.pruneJournal` either way.
+      pruneJournal: (cutoff: number) => stores.pruneJournal(cutoff),
+      journalRetentionDays: () => liveNumber(config.journal?.retentionDays, 30),
     },
   })
   /**
@@ -529,12 +534,56 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
    */
   const DREAM_TICK_MS = 5 * 60 * 1000
   let dreamTickInFlight = false
+  /**
+   * How long after mount an empty `dream_schedule` table is still normal.
+   *
+   * Seeding happens on the first pre-step of a conversation, so a freshly
+   * mounted process legitimately has zero rows for a while. Two minutes is long
+   * enough for a boot that immediately runs a step, and short enough that a
+   * wiring mistake surfaces on the very first tick instead of never.
+   */
+  const DREAM_SEED_GRACE_MS = 2 * 60 * 1000
+  const mountedAt = Date.now()
+  let seedChecked = false
+  /**
+   * One-shot self-check for the failure mode that has actually bitten this repo.
+   *
+   * On 2026-11-17 `ensureDreamSchedules` was wired to `injectReduceGuidance`
+   * (which only injects a system prompt) instead of the pre-step listener. The
+   * result: `dream_schedule` stayed at 0 rows and the journal had zero `dream-*`
+   * entries — while every unit test and all five acceptance scripts were green,
+   * because they call the functions directly rather than through `apply()`.
+   *
+   * A full assembly smoke test is the thorough answer and is not built yet. This
+   * is the cheap half: if no project has been registered two minutes after mount,
+   * say so once, loudly, in the journal and the host log. It cannot tell WHICH
+   * wire is wrong, but it turns a silent no-op into a visible one.
+   */
+  const checkDreamSeeding = (now: number): void => {
+    if (seedChecked) return
+    if (now - mountedAt < DREAM_SEED_GRACE_MS) return
+    let projects: number
+    try {
+      projects = stores.listDreamProjects().length
+    } catch {
+      return
+    }
+    seedChecked = true
+    if (projects > 0) return
+    const detail = `no project registered ${String(Math.round((now - mountedAt) / 1000))}s after mount: `
+      + 'dream_schedule is empty, so no background task can ever run. '
+      + 'The usual cause is a wiring mistake in apply() — check that '
+      + '`ensureDreamSchedules` reaches the pre-step listener.'
+    journal?.warn('dream-seeded', detail, { projects, sinceMountMs: now - mountedAt })
+    ctx.logger.warn(`magic-context dsh adapter: ${detail}`)
+  }
   const dreamTick = (): void => {
     // A slow task must not stack ticks behind it: the lease already prevents a
     // second *process* from running the same task, this prevents this process
     // from queueing runs of its own.
     if (dreamTickInFlight) return
     dreamTickInFlight = true
+    checkDreamSeeding(Date.now())
     void runDueDreamTasks({
       stores,
       lease: dreamLease,
