@@ -1644,6 +1644,12 @@ export const Config = z.object({
      * below the derivation is ignored — raise it to buy more headroom, but
      * lowering it below 85 has no effect. The status line prints the effective
      * value, not this one.
+     *
+     * Editable from the settings card: this field is volatile, so a change lands
+     * on the next pass without a restart and without touching the profile YAML.
+     * `min(0)` stays deliberate — clamping to 85 here would fail validation on
+     * any existing profile still carrying a lower value and keep the plugin from
+     * loading at all.
      */
     forceThreshold: z.number().min(0).max(100).default(85).volatile(),
     /**
