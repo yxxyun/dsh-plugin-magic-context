@@ -137,6 +137,24 @@ interface RequestErrorPayload {
 
 export type { MagicContextDshConfig, MagicContextDshConfigDefineTool }
 
+/**
+ * Whether a resolved project root still has to be written to `meta`.
+ *
+ * Split out because the answer is not obvious from the call site and getting it
+ * wrong is invisible: `registerDreamProject` runs from the pre-step on EVERY
+ * model step, and `setMeta` is a real `INSERT … ON CONFLICT`. Writing
+ * unconditionally turned the persistence fix into one write transaction per
+ * model call — measured 2026-11-17, the main session alone has 5,285 usage
+ * records, so that is 5,285 pointless upserts of a value that changes never.
+ *
+ * @param persisted - the root this process last wrote for the identity, if any.
+ * @param root - the root the pre-step just resolved.
+ * @returns true when the stored value differs and must be refreshed.
+ */
+export function dreamRootNeedsPersist(persisted: string | undefined, root: string): boolean {
+  return persisted !== root
+}
+
 export const name = 'magic-context-dsh-poc'
 
 /**
@@ -379,10 +397,18 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
    * value is exactly what a pre-step resolved earlier.
    */
   const DREAM_ROOT_META_PREFIX = 'dream.root.'
+  /**
+   * What is already in `meta`, so `registerDreamProject` can skip a write that
+   * would change nothing. Seeded from the warm-up below, so a value read back at
+   * mount is not immediately written again by the first pre-step.
+   */
+  const persistedDreamRoots = new Map<string, string>()
   try {
     for (const projectIdentity of stores.listDreamProjects()) {
       const root = stores.getMeta(`${DREAM_ROOT_META_PREFIX}${projectIdentity}`)
-      if (root !== undefined && root.length > 0) dreamRoots.set(projectIdentity, root)
+      if (root === undefined || root.length === 0) continue
+      dreamRoots.set(projectIdentity, root)
+      persistedDreamRoots.set(projectIdentity, root)
     }
   } catch {
     // advisory: a store without the meta table just means no warm roots
@@ -543,10 +569,21 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
       dreamRoots.set(projectIdentity, root)
       // Persist so a remount does not have to wait for the next pre-step to
       // learn where this project lives (see the preload above).
-      try {
-        stores.setMeta(`${DREAM_ROOT_META_PREFIX}${projectIdentity}`, root)
-      } catch {
-        // advisory: the in-memory map still serves this process
+      //
+      // Guarded by a change check, NOT written unconditionally: this runs from
+      // the pre-step on every model step, and `setMeta` is a real
+      // `INSERT … ON CONFLICT` — one write transaction per step, which is
+      // exactly the cost `dreamProjects` below exists to avoid (see its
+      // docstring). Writing only when the value differs keeps the first step
+      // after a boot (the case this persistence exists for) and costs nothing
+      // afterwards.
+      if (dreamRootNeedsPersist(persistedDreamRoots.get(projectIdentity), root)) {
+        try {
+          stores.setMeta(`${DREAM_ROOT_META_PREFIX}${projectIdentity}`, root)
+          persistedDreamRoots.set(projectIdentity, root)
+        } catch {
+          // advisory: the in-memory map still serves this process
+        }
       }
     }
     if (dreamProjects.has(projectIdentity)) return

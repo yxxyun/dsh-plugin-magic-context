@@ -30,6 +30,7 @@ import {
   type DreamTaskHandler,
 } from '../src/core/dream-runner.ts'
 import { DEFAULT_DREAM_SCHEDULES, leaseKeyFor } from '../src/core/dream-registry.ts'
+import { dreamRootNeedsPersist } from '../src/index.ts'
 
 const PROJECT = '/tmp/dreamer-project'
 
@@ -406,5 +407,28 @@ describe('backoff', () => {
   it('returns null when the schedule can never fire', () => {
     const now = new Date(2026, 0, 15, 10, 0, 0).getTime()
     expect(computeNextDue({ cron: '', now, status: 'ok', consecutiveFailures: 0 })).toBeNull()
+  })
+})
+
+
+// The root persistence is what stops a remount from losing a day, but it runs
+// from the pre-step on every model step. Writing unconditionally costs one
+// `INSERT … ON CONFLICT` per model call for a value that never changes —
+// measured 2026-11-17: 5,285 usage records in the main session alone.
+describe('dream root persistence is a no-op when nothing changed', () => {
+  it('writes the first time, and not again while the root is the same', () => {
+    expect(dreamRootNeedsPersist(undefined, 'D:/code/x')).toBe(true)
+    expect(dreamRootNeedsPersist('D:/code/x', 'D:/code/x')).toBe(false)
+  })
+
+  it('writes again when the project actually moves', () => {
+    expect(dreamRootNeedsPersist('D:/code/x', 'D:/code/y')).toBe(true)
+  })
+
+  it('treats a re-resolved identical path as unchanged, not as a new project', () => {
+    // The pre-step re-resolves the same directory every step; only a real move
+    // (or the first resolution in this process) may cost a write.
+    const root = 'D:/code/dsh-plugin-magic-context'
+    expect(dreamRootNeedsPersist(root, root)).toBe(false)
   })
 })
