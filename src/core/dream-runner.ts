@@ -57,6 +57,18 @@ export interface DreamTaskResult {
   /** One line a user can read in the dashboard. */
   readonly summary?: string
   readonly error?: string
+  /**
+   * A skip whose CAUSE is environmental rather than "nothing to do": the LLM
+   * route is not known yet in this process, or the project root has not been
+   * registered yet. Both resolve themselves on the next conversation step, so
+   * consuming a whole cron period for them is wrong — measured on this machine
+   * (2026-11-17): a remount at 12:21 left `verify` and `index-commits` skipped
+   * at 12:31 / 12:46 for exactly these reasons, and each skip pushed the task a
+   * full day out (`verify` → 11-18, `index-commits` → 11-18) although both would
+   * have run fine an hour later. Set this and the next attempt is
+   * `min(nextCron, now + retryInMs)`.
+   */
+  readonly retryInMs?: number
 }
 
 export type DreamTaskHandler = (context: DreamTaskContext) => Promise<DreamTaskResult>
@@ -158,8 +170,18 @@ export function computeNextDue(input: {
   consumedScheduledAt?: number
   status: DreamRunStatus
   consecutiveFailures: number
+  /** Set by a skip whose cause is environmental; see `DreamTaskResult.retryInMs`. */
+  retryInMs?: number
 }): number | null {
   const cronNext = nextDueAtMs(input.cron, input.now, input.consumedScheduledAt)
+  if (input.status !== 'failed' && input.status !== 'skipped') return cronNext
+  // An environmental skip keeps the task warm: `min(cronNext, now + retry)`.
+  // It never delays a task past its own cron, so a profile that stays in this
+  // state just retries cheaply instead of silently losing a day.
+  if (input.status === 'skipped' && input.retryInMs !== undefined) {
+    const retryAt = input.now + Math.max(1_000, input.retryInMs)
+    return cronNext === null ? retryAt : Math.min(cronNext, retryAt)
+  }
   if (input.status !== 'failed') return cronNext
   const retryAt = input.now + backoffMs(input.consecutiveFailures)
   if (cronNext === null) return retryAt
@@ -283,6 +305,7 @@ export async function runDueDreamTasks(
       ...schedule.nextDueAt === undefined ? {} : { consumedScheduledAt: schedule.nextDueAt },
       status: result.status,
       consecutiveFailures,
+      ...result.retryInMs === undefined ? {} : { retryInMs: result.retryInMs },
     })
 
     // Token ceiling enforcement. A handler that overspent is recorded as failed

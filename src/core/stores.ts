@@ -581,6 +581,15 @@ export interface AdapterStores {
   /** Every schedule row for one project, in canonical task order. */
   listDreamSchedules(projectPath: string): DreamScheduleRow[]
   /**
+   * Every project the scheduler knows about, derived from its own rows.
+   *
+   * Used at mount to warm the identity→root map from persisted values: a task
+   * that reads files (index-commits, verify) must not wait for a
+   * conversation step just to learn where a project lives, and a remount is
+   * exactly when that step has not happened yet in the new process.
+   */
+  listDreamProjects(): string[]
+  /**
    * Create or replace a schedule row. `nextDueAt: null` means "never fires" —
    * either the cron is empty or it names an instant that cannot occur.
    */
@@ -2049,6 +2058,10 @@ export function openStores(dataDir: string): AdapterStores {
     (db.prepare('SELECT * FROM dream_schedule WHERE project_path = ? ORDER BY task')
       .all(projectPath) as unknown as DreamScheduleDbRow[]).map(toDreamSchedule)
 
+  const listDreamProjects = (): string[] =>
+    (db.prepare('SELECT DISTINCT project_path FROM dream_schedule ORDER BY project_path').all() as unknown as Array<{ project_path: string }>)
+      .map(row => row.project_path)
+
   const upsertDreamSchedule = (row: DreamScheduleRow): void => {
     db.prepare(
       'INSERT INTO dream_schedule(project_path, task, cron, next_due_at, last_run_at, last_status, '
@@ -2286,6 +2299,7 @@ export function openStores(dataDir: string): AdapterStores {
     pruneNotes,
     getDreamSchedule,
     listDreamSchedules,
+    listDreamProjects,
     upsertDreamSchedule,
     listDueDreamTasks,
     recordDreamRun,

@@ -13,6 +13,16 @@
  */
 
 import type { DreamTaskHandler, DreamTaskResult } from '../core/dream-runner.ts'
+
+/**
+ * An environmental skip (no LLM route yet, project root not registered yet)
+ * retries on this cadence instead of waiting out the task's whole cron period.
+ * Both conditions are resolved by the next conversation step, so a five-minute
+ * retry is the difference between "ran an hour late" and "lost a day" —
+ * measured 2026-11-17: a remount left verify and index-commits skipped, and each
+ * skip pushed them to the next day.
+ */
+const PRECONDITION_RETRY_MS = 5 * 60_000
 import { runClassifyTick, type ClassifyLlm } from '../core/classify-memories.ts'
 import { runVerifyTick, type VerifyLlm } from '../core/verify-memories.ts'
 import { runCurateTick, type CurateLlm } from '../core/curate-memories.ts'
@@ -245,12 +255,13 @@ export function buildClassifyHandler(deps: DreamHandlerDeps): DreamTaskHandler {
     // the fields. The runner treats a 0 budget as a real ceiling (any reported
     // token fails the run), so "spent nothing" must be a declaration, not an
     // absence the runner has to infer.
-    const skip = (summary: string): DreamTaskResult => ({
+    const skip = (summary: string, retryInMs?: number): DreamTaskResult => ({
       status: 'skipped',
       itemsProcessed: 0,
       itemsChanged: 0,
       tokensUsed: 0,
       summary,
+      ...retryInMs === undefined ? {} : { retryInMs },
     })
     const classify = deps.classify
     if (classify === undefined || classify.writer === undefined || classify.llm === undefined) {
@@ -262,7 +273,7 @@ export function buildClassifyHandler(deps: DreamHandlerDeps): DreamTaskHandler {
     const route = classify.route?.()
     if (route === undefined) {
       // No route means no model to ask, and no session to inherit one from.
-      return skip('no llm route is known yet (no conversation has run in this process)')
+      return skip('no llm route is known yet (no conversation has run in this process)', PRECONDITION_RETRY_MS)
     }
     const cfg = classify.config?.()
     const outcome = await runClassifyTick({
@@ -304,8 +315,13 @@ export function buildClassifyHandler(deps: DreamHandlerDeps): DreamTaskHandler {
  */
 export function buildVerifyHandler(deps: DreamHandlerDeps): DreamTaskHandler {
   return async (context): Promise<DreamTaskResult> => {
-    const skip = (summary: string): DreamTaskResult => ({
-      status: 'skipped', itemsProcessed: 0, itemsChanged: 0, tokensUsed: 0, summary,
+    const skip = (summary: string, retryInMs?: number): DreamTaskResult => ({
+      status: 'skipped',
+      itemsProcessed: 0,
+      itemsChanged: 0,
+      tokensUsed: 0,
+      summary,
+      ...retryInMs === undefined ? {} : { retryInMs },
     })
     const verify = deps.verify
     if (verify === undefined || verify.writer === undefined || verify.llm === undefined) {
@@ -313,13 +329,13 @@ export function buildVerifyHandler(deps: DreamHandlerDeps): DreamTaskHandler {
     }
     if (verify.journal === undefined) return skip('no journal to report a verify run through')
     const route = verify.route?.()
-    if (route === undefined) return skip('no llm route is known yet (no conversation has run in this process)')
+    if (route === undefined) return skip('no llm route is known yet (no conversation has run in this process)', PRECONDITION_RETRY_MS)
     const projectRoot = verify.projectRootOf?.(context.projectPath)
     if (projectRoot === undefined) {
       // Without a directory there is no index, and without an index every
       // reference would read as missing — a verdict assembled from a missing
       // measurement is worse than no verdict.
-      return skip('no directory is registered for this project, so files cannot be read')
+      return skip('no directory is registered for this project, so files cannot be read', PRECONDITION_RETRY_MS)
     }
     const cfg = verify.config?.()
     const verifyBatch = cfg?.verifyBatchSize ?? verify.batchSize
@@ -366,8 +382,13 @@ export function buildVerifyHandler(deps: DreamHandlerDeps): DreamTaskHandler {
  */
 export function buildCurateHandler(deps: DreamHandlerDeps): DreamTaskHandler {
   return async (context): Promise<DreamTaskResult> => {
-    const skip = (summary: string): DreamTaskResult => ({
-      status: 'skipped', itemsProcessed: 0, itemsChanged: 0, tokensUsed: 0, summary,
+    const skip = (summary: string, retryInMs?: number): DreamTaskResult => ({
+      status: 'skipped',
+      itemsProcessed: 0,
+      itemsChanged: 0,
+      tokensUsed: 0,
+      summary,
+      ...retryInMs === undefined ? {} : { retryInMs },
     })
     const curate = deps.curate
     if (curate === undefined || curate.writer === undefined) {
@@ -403,7 +424,7 @@ export function buildCurateHandler(deps: DreamHandlerDeps): DreamTaskHandler {
       }
     }
     const route = curate.route?.()
-    if (route === undefined) return skip('no llm route is known yet (no conversation has run in this process)')
+    if (route === undefined) return skip('no llm route is known yet (no conversation has run in this process)', PRECONDITION_RETRY_MS)
     const modelId = curate.embeddingSpace?.()
     if (modelId === undefined) {
       // No shared embedding space means no pair can be scored; falling back to
@@ -468,8 +489,13 @@ export function buildCurateHandler(deps: DreamHandlerDeps): DreamTaskHandler {
  */
 export function buildRetrospectiveHandler(deps: DreamHandlerDeps): DreamTaskHandler {
   return async (context): Promise<DreamTaskResult> => {
-    const skip = (summary: string): DreamTaskResult => ({
-      status: 'skipped', itemsProcessed: 0, itemsChanged: 0, tokensUsed: 0, summary,
+    const skip = (summary: string, retryInMs?: number): DreamTaskResult => ({
+      status: 'skipped',
+      itemsProcessed: 0,
+      itemsChanged: 0,
+      tokensUsed: 0,
+      summary,
+      ...retryInMs === undefined ? {} : { retryInMs },
     })
     const retro = deps.retrospective
     if (retro === undefined || retro.stores === undefined || retro.llm === undefined) {
@@ -477,7 +503,7 @@ export function buildRetrospectiveHandler(deps: DreamHandlerDeps): DreamTaskHand
     }
     if (retro.journal === undefined) return skip('no journal to report a retrospective through')
     const route = retro.route?.()
-    if (route === undefined) return skip('no llm route is known yet (no conversation has run in this process)')
+    if (route === undefined) return skip('no llm route is known yet (no conversation has run in this process)', PRECONDITION_RETRY_MS)
     const cfg = retro.config?.()
     const outcome = await runRetrospectiveTick({
       stores: retro.stores,
@@ -613,7 +639,7 @@ export function buildAutoStageHandler(deps: DreamHandlerDeps): DreamTaskHandler 
     // project level is recoverable; one staged into the wrong domain is not
     // obviously so.
     const route = seam.route?.()
-    if (route === undefined) return { status: 'skipped', summary: 'no route to classify with' }
+    if (route === undefined) return { status: 'skipped', summary: 'no route to classify with', retryInMs: PRECONDITION_RETRY_MS }
     if (seam.autoStageEnabled !== undefined && !seam.autoStageEnabled()) {
       return { status: 'skipped', summary: 'auto-staging is switched off' }
     }
@@ -689,7 +715,7 @@ export function buildIndexCommitsHandler(deps: DreamHandlerDeps): DreamTaskHandl
     }
     const projectRoot = seam.projectRootOf?.(context.projectPath)
     if (projectRoot === undefined) {
-      return { status: 'skipped', summary: 'no project root for this identity' }
+      return { status: 'skipped', summary: 'no project root for this identity', retryInMs: PRECONDITION_RETRY_MS }
     }
     // A `git log` on a huge or network-mounted repo can stall for minutes, and a
     // stalled task holds the lease. A lagging commit index is harmless; a wedged

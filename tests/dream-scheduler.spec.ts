@@ -49,6 +49,15 @@ afterEach(() => {
 })
 
 describe('dream_schedule storage', () => {
+  it('lists every project the scheduler serves, for the mount-time root warm-up', () => {
+    // The map that maps an identity back to a directory dies with the process;
+    // this query is how a remount learns which identities to warm from metas.
+    stores.upsertDreamSchedule({ projectPath: '/a', task: 'verify', cron: '0 4 * * *', nextDueAt: 1, consecutiveFailures: 0, enabled: true, updatedAt: 1 })
+    stores.upsertDreamSchedule({ projectPath: '/a', task: 'curate', cron: '0 4 * * *', nextDueAt: 1, consecutiveFailures: 0, enabled: true, updatedAt: 1 })
+    stores.upsertDreamSchedule({ projectPath: '/b', task: 'verify', cron: '0 4 * * *', nextDueAt: 1, consecutiveFailures: 0, enabled: true, updatedAt: 1 })
+    expect(stores.listDreamProjects()).toEqual(['/a', '/b'])
+  })
+
   it('round-trips a row', () => {
     stores.upsertDreamSchedule({
       projectPath: PROJECT,
@@ -204,6 +213,22 @@ describe('runDueDreamTasks', () => {
     })
   }
 
+  it('an environmental skip retries in minutes, not at the next cron slot', async () => {
+    const NOW = new Date(2026, 0, 15, 10, 0, 0).getTime()
+    arm('verify', NOW - 1_000)
+    const handler: DreamTaskHandler = async () => ({
+      status: 'skipped', summary: 'no llm route is known yet (no conversation has run in this process)',
+      itemsProcessed: 0, itemsChanged: 0, tokensUsed: 0, retryInMs: 5 * 60_000,
+    })
+    const outcomes = await runDueDreamTasks({
+      stores, lease, handlers: { verify: handler }, now: () => NOW,
+    })
+    expect(outcomes[0]?.status).toBe('skipped')
+    // The run row still exists (history is honest), but the clock retries soon:
+    // before this rule the skip advanced the task to tomorrow 04:17.
+    expect(stores.getDreamSchedule(PROJECT, 'verify')?.nextDueAt).toBe(NOW + 5 * 60_000)
+  })
+
   it('runs a due task and records the outcome', async () => {
     arm('promote-primers', 500)
     const calls: string[] = []
@@ -349,6 +374,31 @@ describe('backoff', () => {
     const now = new Date(2026, 0, 15, 10, 0, 0).getTime()
     const next = computeNextDue({
       cron: '17 4 * * *', now, status: 'ok', consecutiveFailures: 0,
+    })
+    expect(next).toBe(new Date(2026, 0, 16, 4, 17, 0).getTime())
+  })
+
+  it('keeps a precondition skip warm instead of burning a whole day', () => {
+    const now = new Date(2026, 0, 15, 10, 0, 0).getTime()
+    // Measured 2026-11-17: a remount left `verify` and `index-commits` skipped
+    // because no route / no project root was known YET, and each skip advanced
+    // them a full day. An environmental skip must retry, not reschedule.
+    const next = computeNextDue({
+      cron: '17 4 * * *', now, status: 'skipped', consecutiveFailures: 0, retryInMs: 5 * 60_000,
+    })
+    expect(next).toBe(now + 5 * 60_000)
+  })
+
+  it('a skip with nothing to retry still waits for its cron slot', () => {
+    const now = new Date(2026, 0, 15, 10, 0, 0).getTime()
+    const next = computeNextDue({ cron: '17 4 * * *', now, status: 'skipped', consecutiveFailures: 0 })
+    expect(next).toBe(new Date(2026, 0, 16, 4, 17, 0).getTime())
+  })
+
+  it('never lets a precondition retry push past the cron slot', () => {
+    const now = new Date(2026, 0, 15, 10, 0, 0).getTime()
+    const next = computeNextDue({
+      cron: '17 4 * * *', now, status: 'skipped', consecutiveFailures: 0, retryInMs: 40 * 24 * 60 * 60_000,
     })
     expect(next).toBe(new Date(2026, 0, 16, 4, 17, 0).getTime())
   })

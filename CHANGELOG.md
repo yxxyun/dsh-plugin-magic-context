@@ -10,6 +10,21 @@
 
 ## [Unreleased]
 
+**后台任务不再为一次重启付一天的代价。** `skipped` 原本和 `ok` 一样按 cron 推下一个槽位，
+于是「此刻还拿不到路由 / 根目录」这种**环境性**跳过，会把任务直接推过一整天。
+
+### Fixed
+
+- **环境性跳过改为短重试**：`DreamTaskResult` 新增 `retryInMs`，`computeNextDue` 对
+  `skipped + retryInMs` 取 `min(下个 cron, now + retry)`，永不越过 cron。只有
+  「路由未知 / 根目录未注册」这两类跳过带它（配置关闭的跳过仍按整周期，不会每 5 分钟刷运行记录）。
+  实测 2026-11-17：`verify` / `index-commits` 因一次重挂而跳过，各自被推到 11-18。
+- **根目录持久化**：`dreamRoots`（identity → 目录）此前只由 pre-step 填，进程一重启就空，
+  而 identity 是哈希、无法反推路径，`index-commits` / `verify` 便只能 `skipped: no project root`。
+  现在 `registerDreamProject` 把 `dream.root.<identity>` 写进 meta，挂载时按
+  `listDreamProjects()` 回暖，重启后无需等对话即可读文件。
+  `tests/dream-scheduler.spec.ts` 新增 5 条用例。
+
 **缓存前缀不再被一次空转的 execute 重写；historian 信封解析补齐上游语义。** 两件都不是新特性，
 是把上游写进文件头和 golden 里的既有约定补回来。
 

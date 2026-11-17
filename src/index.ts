@@ -369,6 +369,24 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
   /** identity → the directory that produced it. The identity is a hash, so
    *  this is the only route back to a path a task can read files from. */
   const dreamRoots = new Map<string, string>()
+  /**
+   * The roots are also PERSISTED, because the map alone dies with the process.
+   * Measured 2026-11-17: a remount at 12:21 meant `index-commits` had no root at
+   * 12:46 (`no project root for this identity`) although the identity's schedule
+   * rows were right there in the table — the path was only ever known to a
+   * pre-step, and no conversation had run yet in that process. Reading the
+   * persisted map back at mount closes that window without inventing paths: the
+   * value is exactly what a pre-step resolved earlier.
+   */
+  const DREAM_ROOT_META_PREFIX = 'dream.root.'
+  try {
+    for (const projectIdentity of stores.listDreamProjects()) {
+      const root = stores.getMeta(`${DREAM_ROOT_META_PREFIX}${projectIdentity}`)
+      if (root !== undefined && root.length > 0) dreamRoots.set(projectIdentity, root)
+    }
+  } catch {
+    // advisory: a store without the meta table just means no warm roots
+  }
   const dreamLease = stores.dreamLease()
   // `classify-memories` needs the route, and the route lives further down (it is
   // set by the pre-step's per-turn note). The handler resolves it through this
@@ -521,7 +539,16 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
    * the verify task can read files from.
    */
   const registerDreamProject = (projectIdentity: string, now: number, root?: string): void => {
-    if (root !== undefined) dreamRoots.set(projectIdentity, root)
+    if (root !== undefined) {
+      dreamRoots.set(projectIdentity, root)
+      // Persist so a remount does not have to wait for the next pre-step to
+      // learn where this project lives (see the preload above).
+      try {
+        stores.setMeta(`${DREAM_ROOT_META_PREFIX}${projectIdentity}`, root)
+      } catch {
+        // advisory: the in-memory map still serves this process
+      }
+    }
     if (dreamProjects.has(projectIdentity)) return
     dreamProjects.add(projectIdentity)
     try {
