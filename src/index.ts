@@ -73,6 +73,7 @@ import { registerCtxStatusCommand } from './dsh/status-command.ts'
 import { registerCtxRecompCommand } from './dsh/recomp.ts'
 import { registerCtxFlushCommand } from './dsh/flush-command.ts'
 import { registerCtxDreamCommand } from './dsh/dream-command.ts'
+import { registerCtxEmbedCommand } from './dsh/embed-command.ts'
 import { registerCtxWrapupCommand } from './dsh/wrapup.ts'
 import { registerCtxGlobalCommand, registerCtxProfileCommand } from './dsh/command-surface.ts'
 import { reviewGlobalCandidates, type GlobalReviewAsker } from './dsh/global-review.ts'
@@ -1100,7 +1101,17 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
       runner: () => ({ stores, lease: dreamLease, handlers: dreamHandlers }),
       projects: () => [...dreamRoots.keys()],
     })
-    ctx.logger.info('magic-context dsh adapter: /ctx-status, /ctx-flush, /ctx-recomp and /ctx-dream registered')
+    // Upstream `ctx-embed`: coverage by default, one manual backfill tick on
+    // `start`. Both go through the SAME handle the maintenance tick uses, so a
+    // manual run cannot bypass the shared-space gate.
+    registerCtxEmbedCommand(ctx, {
+      corpusDbPath: () => lane.memoryRecall?.dbPath,
+      backfill: () => lane.vectorBackfill,
+      journal: () => journal,
+    })
+    ctx.logger.info(
+      'magic-context dsh adapter: /ctx-status, /ctx-flush, /ctx-recomp, /ctx-dream and /ctx-embed registered',
+    )
     // The global-domain surface rides the same gate: with Magic Context's
     // dashboard gone these commands ARE the operating surface for the profile
     // queue and the domains.
