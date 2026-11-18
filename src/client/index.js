@@ -239,6 +239,12 @@ window.__ModuleLoader__.load({
         hint: 'Newest tool results the policy never reclaims.',
       },
       {
+        path: ['policy', 'dropSmallResultFloor'], kind: 'number', label: 'Small-result floor (tokens)',
+        hint: 'A tool result at or below this size is never reclaimed. Deleting a 200-token result costs '
+          + 'its tag and buys almost nothing, so the pass skips it and reclaims something worth the bookkeeping. '
+          + '0 = off (every result is reclaimable).',
+      },
+      {
         path: ['policy', 'historianMinNodes'], kind: 'number', label: 'Historian minimum nodes',
         hint: 'Assistant/tool nodes required before the historian runs.',
       },
