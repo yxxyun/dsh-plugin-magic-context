@@ -70,6 +70,39 @@
 provider_overflow + 本轮没折 → 拒绝」这一条。disarm 需要可信测量，代码路径在、暂时
 不会触发——这是诚实的能力边界，不是逻辑缺失。
 
+## 教训：同一概念有两份实现，而正在用的那份是错的
+
+这个项目在 2026-11-18 一天之内踩了三次**同一形状**的错误。写下来，因为它们是同一类，
+不是三个巧合。
+
+| # | 概念 | 两份实现 | 结果 |
+|---|---|---|---|
+| 1 | 保护尾巴有多大 | `emergency.ts` 的 `min(64k, max(8k, ctx×5%))` vs `protected-tail.ts` 的完整推导 | 低压力保护不足、高压力不收缩 |
+| 2 | 请求有多大 | `surfaceTokens`（只看 text）vs `surfaceWireTokens`（全部 block） | 低估 2.4 倍，紧急回收的「装不装得下」判据反了 |
+| 3 | 渲染格式变没变 | `renderEpoch` vs `maxCompartmentId` vs `systemHash` | 第三个从未被写入（参数类型错），分支一直是死的 |
+
+三者的共同点：**正确的那份先写好了，错的那份因为更早存在、更简单、更适合调用点，就被一直用着**。
+
+### 这次怎么发现的
+
+都不是靠读代码，是靠**把本地数字和外部事实对上**：
+
+- 保护窗口：`emergency-drop.spec.ts` 的用例标题写着 `clamp(5% × window, 8k, 64k)`——
+  这个字面值和 `protected-tail.ts` 里的公式不一致，标题本身就是证据
+- 请求大小：`scripts/wire-pairing-probe.mjs` 把 pass 与 usage 两条时间线并排，一眼看到
+  `cache_read=411k` 而估算是 175k
+- system hash：`baseline_state.system_hash` 每一行都是 null。**一个本该有值的字段一直是
+  null，比任何断言失败都响**
+
+### 可复用的判据
+
+1. **同一个量如果能在两处算出来，先问哪一处被调用**。`scripts/unwired-modules.mjs` 查的是
+   文件级；函数级要靠 `grep` 调用点。
+2. **字段长期为 null / 为 0 是一个断言**。没人写的字段和没人读的字段一样值得追。
+3. **测试用例的标题里如果有具体数字，那个数字就是契约**。公式一变，标题会先露馅。
+4. **本地数字必须和外部事实对一次账**（provider 的 usage、DB 的实际行数）。只跟自己比，
+   错的那份永远自洽。
+
 ## 一个贯穿全局的口径问题（2026-11-18 发现并修复）
 
 `seams.ts:301` 的 `text` 视图按设计排除 tool-call 的 arguments 与 reasoning 块：

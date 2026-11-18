@@ -33,6 +33,11 @@
  * already stores no message text by construction; the corpus rows are never
  * serialized here.
  */
+import { sessionOf } from './telemetry.ts'
+
+// Re-exported: `sessionOf` lived here before it was de-duplicated, and callers
+// (including the dashboard's own tests) import it from this module's surface.
+export { sessionOf }
 import type { AdapterStores, SessionSummaryRow } from '../core/stores.ts'
 import { SCHEMA_VERSION } from '../core/stores.ts'
 import type { Journal, JournalLevel } from '../core/journal.ts'
@@ -98,12 +103,6 @@ const DAY_MS = 24 * 60 * 60_000
  * @param raw - the request URL's first `session` parameter.
  * @returns the Session id, or undefined for absent/empty.
  */
-export function sessionOf(raw: string | null | undefined): string | undefined {
-  if (raw === null || raw === undefined) return undefined
-  const value = raw.trim()
-  return value === '' ? undefined : value
-}
-
 /**
  * Clamp a `?limit=` query value to a sane page size.
  * @param raw - the raw query parameter.
