@@ -12,6 +12,7 @@ import {
   calibratedWireEstimate,
   MAX_TRUSTED_SPREAD,
   MIN_TRUSTED_SAMPLES,
+  PAIRING_WINDOW_MS,
   pairEstimateSamples,
   summarise,
   type AccuracySample,
@@ -112,6 +113,18 @@ describe('pairEstimateSamples', () => {
 
   it('ignores a pass with no later usage at all (the request never landed)', () => {
     expect(pairEstimateSamples([{ at: 350, estimated: 1_000 }], usage)).toEqual([])
+  })
+
+  it('ignores a usage reading that lands far later — it is another request', () => {
+    // A `reduce-nudge` pass sends nothing; the next request's bill must not be
+    // charged, at its estimate, to a surface this pass never described.
+    const late = [{ recordedAt: 100 + PAIRING_WINDOW_MS + 1, inputTokens: 900 }]
+    expect(pairEstimateSamples([{ at: 100, estimated: 1_000 }], late)).toEqual([])
+  })
+
+  it('accepts a usage reading inside the window', () => {
+    const inside = [{ recordedAt: 100 + PAIRING_WINDOW_MS - 1, inputTokens: 900 }]
+    expect(pairEstimateSamples([{ at: 100, estimated: 1_000 }], inside)).toHaveLength(1)
   })
 
   it('ignores a pass with no estimate', () => {

@@ -121,9 +121,22 @@ export function calibratedWireEstimate(
  * Pure: the caller supplies both series, so this cannot silently read the wrong
  * store.
  */
+/**
+ * How far after a pass its request may land and still be the same request.
+ *
+ * This bound is what makes the pairing honest. A `reduce-nudge` pass injects a
+ * reminder and sends nothing, and a `defer` pass only records a decision — so the
+ * "first usage after this pass" can easily be the NEXT pass's request, measured
+ * against an estimate that described a different surface. Measured 2026-11-18:
+ * without the bound the sample spread was 2.04 with a median of 1.35; the width
+ * was pairing error, not estimate error.
+ */
+export const PAIRING_WINDOW_MS = 10_000
+
 export function pairEstimateSamples(
   passes: ReadonlyArray<{ readonly at: number; readonly estimated: number | undefined }>,
   usage: ReadonlyArray<{ readonly recordedAt: number; readonly inputTokens: number }>,
+  windowMs = PAIRING_WINDOW_MS,
 ): AccuracySample[] {
   if (usage.length === 0) return []
   const sorted = [...usage].sort((left, right) => left.recordedAt - right.recordedAt)
@@ -137,7 +150,11 @@ export function pairEstimateSamples(
       picked = row
       break
     }
-    if (picked === undefined || !Number.isFinite(picked.inputTokens) || picked.inputTokens <= 0) continue
+    if (picked === undefined) continue
+    // A reading far after the pass belongs to a later request, whose estimate
+    // this pass never produced.
+    if (picked.recordedAt - pass.at > windowMs) continue
+    if (!Number.isFinite(picked.inputTokens) || picked.inputTokens <= 0) continue
     samples.push({ estimated: pass.estimated, actual: picked.inputTokens })
   }
   return samples

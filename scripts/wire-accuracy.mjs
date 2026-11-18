@@ -54,6 +54,9 @@ try {
               FROM usage_records u
              WHERE u.session_id = p.session_id
                AND u.recorded_at >= p.at
+               -- Only a reading close behind the pass belongs to the request
+               -- it sized; a later one is a different request.
+               AND u.recorded_at - p.at <= 10000
              ORDER BY u.recorded_at ASC
              LIMIT 1) AS actual
       FROM journal p
