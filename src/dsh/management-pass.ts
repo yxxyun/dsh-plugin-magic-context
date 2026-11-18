@@ -913,7 +913,10 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
           input.stores.getTag(input.sessionId, { kind: 'tool-result', callId })),
         input.policy,
         input.contextWindow,
-        surfaceTokens(input.session),
+        // Wire tokens, for the same reason as the overflow lane: this guard
+        // decides whether dropping CAN fit the request, and a text-only estimate
+        // answers "yes" to a request that will still overflow.
+        surfaceWireTokens(input.session),
       )
       forceDropped = reclaim.dropped.length
       if (forceDropped > 0) {

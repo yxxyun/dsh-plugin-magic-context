@@ -58,7 +58,7 @@ import {
 import { reclaimForEmergency } from './dsh/emergency.ts'
 import type { HistorianLlm } from './dsh/historian.ts'
 import { historianInFlight } from './dsh/historian.ts'
-import { publishReadyCompartments, surfaceTokens } from './dsh/management-pass.ts'
+import { publishReadyCompartments, surfaceTokens, surfaceWireTokens } from './dsh/management-pass.ts'
 import {
   defineCtxExpandTool,
   defineCtxReduceTool,
@@ -894,9 +894,13 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
       const nodes = enumerateSurfaceToolResults(session, callId =>
         stores.getTag(sessionId, { kind: 'tool-result', callId }))
       // #731: the whole-surface estimate (measured AFTER any Tier-0 publish)
-      // lets the drop lane refuse a reclaim that cannot fit the request.
+      // lets the drop lane refuse a reclaim that cannot fit the request. It must
+      // be the WIRE estimate, not the text one: `surfaceTokens` excludes tool-call
+      // arguments and reasoning, so it under-reports by ~2.4x on a tool-heavy
+      // session (measured 2026-11-18) — and a 2.4x optimistic input is exactly how
+      // this guard concludes "dropping will fit" when it will not.
       const reclaim = reclaimForEmergency(
-        session, nodes, policy, context.contextWindow, surfaceTokens(session))
+        session, nodes, policy, context.contextWindow, surfaceWireTokens(session))
       journal?.warn('emergency-reclaim', `provider rejected the request as too long; dropped ${String(reclaim.dropped.length)} tool output(s)`, {
         dropped: reclaim.dropped.length,
         protected: reclaim.protectedCount,

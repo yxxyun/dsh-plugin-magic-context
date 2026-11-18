@@ -70,6 +70,33 @@
 provider_overflow + 本轮没折 → 拒绝」这一条。disarm 需要可信测量，代码路径在、暂时
 不会触发——这是诚实的能力边界，不是逻辑缺失。
 
+## 一个贯穿全局的口径问题（2026-11-18 发现并修复）
+
+`seams.ts:301` 的 `text` 视图按设计排除 tool-call 的 arguments 与 reasoning 块：
+
+    /** Concatenated text blocks (tool-call arguments excluded — they are not text). */
+    readonly text: string
+
+`surfaceTokens` 就建在这个视图上。所以它不是「请求要花多少 token」，而是「surface 上有
+多少文本」。实测缺口 2.4 倍（估算 175k，账单 415k）——工具调用密集的会话里，被排除的
+部分就是大头。
+
+**受影响的是所有拿它当「请求大小」用的决策点**：
+
+| 位置 | 原先 | 现在 |
+|---|---|---|
+| force band 的 #731 guard（`management-pass.ts`） | `surfaceTokens` | `surfaceWireTokens` |
+| overflow 后的紧急回收（`index.ts`） | `surfaceTokens` | `surfaceWireTokens` |
+| pass 的精度样本（`pre-step.ts`） | `surfaceTokens` + system | wire + system |
+| 回收量统计（journal 的 before/after） | `surfaceTokens` | **保留**——衡量的是文本减少，口径本就对 |
+
+前两处是决策：`reclaimForEmergency` 用估算判断「即使全删也装不下」。乐观 2.4 倍的输入
+会让它答「装得下」，于是执行一次根本不够的删除。这正是 #731 guard 要防的事，而它的
+输入曾经是错的。
+
+**保留 text 口径的地方**：渲染、tier 选择、保留窗口内的内容判断——它们关心的是文本
+本身，不是账单。
+
 ## 自创且未启用（上游无对应，且没有运行路径用它们）
 
 审计方法：对 `src/core/*.ts` 与 `src/dsh/*.ts` 逐个查「有没有别的文件 import 它」。
