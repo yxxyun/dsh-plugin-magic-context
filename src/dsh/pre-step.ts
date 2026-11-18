@@ -41,7 +41,7 @@ import { runManagementPass } from './management-pass.ts'
 import { evaluateEmergencyFailClosed } from '../core/emergency-fail-closed.ts'
 import { provenLimitKey } from '../core/provider-limit.ts'
 import { calibratedWireEstimate, pairEstimateSamples, summarise } from '../core/wire-accuracy.ts'
-import { surfaceTokens } from './management-pass.ts'
+import { surfaceTokens, surfaceWireTokens } from './management-pass.ts'
 import { appendMagicContextEntry } from './session-notice.ts'
 import { historianInFlight } from './historian.ts'
 import { syncMachineDomain } from '../core/machine-domain.ts'
@@ -401,7 +401,11 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
         // Surface nodes PLUS the system prompt: the wire carries both, and a
         // surface-only number under-reported by 2.5x on the first measured
         // sample. Recorded under the same key so old rows stay comparable.
-        estSurfaceTokens: surfaceTokens(payload.agent.session) + (latestSystemPromptTokens ?? 0),
+        // WIRE tokens, not text tokens: `surfaceTokens` excludes tool-call
+        // arguments and reasoning by design, and that exclusion is most of a
+        // tool-heavy request (measured 2.4x). `surfaceWireTokens` charges every
+        // block, so this number means what the provider will bill.
+        estSurfaceTokens: surfaceWireTokens(payload.agent.session) + (latestSystemPromptTokens ?? 0),
         ...latestSystemPromptTokens === undefined ? {} : { estSystemPromptTokens: latestSystemPromptTokens },
         pressure: pressure === undefined ? undefined : Number(pressure.toFixed(1)),
         // Visible in the pass row: a stale reading explains why a high

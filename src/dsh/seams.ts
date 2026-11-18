@@ -357,6 +357,46 @@ function contentOf(event: SessionEvent): readonly ContentBlock[] {
   return data?.message?.content ?? data?.content ?? []
 }
 
+/**
+ * The tokens a surface event actually costs on the wire.
+ *
+ * `textOfSurfaceEvent` deliberately keeps only text blocks — it is what the
+ * adapter RENDERS and reasons about, and tool-call arguments are not "text". But
+ * the provider bills for all of it: a tool call's arguments are serialized JSON,
+ * and a reasoning block is content. Estimating from the text alone therefore
+ * under-reports, and measured on 2026-11-18 it under-reported by 2.4x on a
+ * tool-heavy session (estimate 175k against a provider-reported 415k).
+ *
+ * This walks the same blocks and charges every one of them.
+ */
+export function wireTokensOfSurfaceEvent(
+  event: SessionEvent,
+  estimate: (text: string) => number,
+): number {
+  let total = 0
+  for (const block of contentOf(event)) {
+    if (block.type === 'text' || block.type === 'reasoning') {
+      const text = (block as { text?: unknown }).text
+      total += typeof text === 'string' ? estimate(text) : 1
+    } else if (block.type === 'tool-call') {
+      // The arguments are what the provider reads; the name alone is a few
+      // tokens. `JSON.stringify` is the closest local stand-in for the
+      // serialized form it receives.
+      const args = (block as { arguments?: unknown }).arguments
+      total += args === undefined ? 1 : estimate(JSON.stringify(args))
+    } else if (block.type === 'image' || block.type === 'file') {
+      // A durable image reference costs tokens the text estimate cannot see.
+      // The exact figure is provider-specific; a flat charge keeps the estimate
+      // from pretending the block is free.
+      total += IMAGE_BLOCK_TOKEN_ESTIMATE
+    }
+  }
+  return total
+}
+
+/** Flat per-image charge for wire estimation (provider tokenizers vary). */
+const IMAGE_BLOCK_TOKEN_ESTIMATE = 1_000
+
 /** Concatenated text of a surface event, ignoring tool-call/reasoning blocks. */
 export function textOfSurfaceEvent(event: SessionEvent): string {
   return contentOf(event)

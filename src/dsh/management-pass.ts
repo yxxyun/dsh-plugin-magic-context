@@ -48,6 +48,7 @@ import type { CompartmentLease } from '../core/compartment-lease.ts'
 import {
   dropPlaceholderContent,
   enumerateSurfaceNodes,
+  wireTokensOfSurfaceEvent,
   enumerateSurfaceToolResults,
   magicContextSource,
   pairingClosedWindow,
@@ -241,6 +242,27 @@ export interface ManagementPassResult {
  * lane in index.ts — the #731 fit guard needs the whole-surface estimate). */
 export function surfaceTokens(session: Session): number {
   return enumerateSurfaceNodes(session).reduce((total, node) => total + (node.hasText ? estimateTokens(node.text) : 0), 0)
+}
+
+/**
+ * What the whole surface costs on the wire: every content block, not just text.
+ *
+ * `surfaceTokens` answers "how much text is on the surface", which is what the
+ * adapter renders and what its retention rules reason about. It is NOT what the
+ * provider bills: tool-call arguments and reasoning blocks are excluded there by
+ * design, and on a tool-heavy session that is most of the request. Measured
+ * 2026-11-18: 175k estimated against 415k billed, a 2.4x gap that made every
+ * estimate-based decision pessimistic.
+ */
+export function surfaceWireTokens(session: Session): number {
+  const surface = session.surface
+  const nodes = new Set<number>(surface.nodes as readonly number[])
+  let total = 0
+  for (const event of session.snapshotEvents()) {
+    if (!nodes.has(event.seq as number)) continue
+    total += wireTokensOfSurfaceEvent(event, estimateTokens)
+  }
+  return total
 }
 
 /** The baseline block currently carried by a node, when it has one. */
