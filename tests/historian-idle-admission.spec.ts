@@ -108,16 +108,6 @@ describe('historian admission: the idle window is the cheap one', () => {
     expect(entries.find(entry => entry.kind === 'historian')).toBeUndefined()
   })
 
-  it('holds an active pass below the force band, and says why', () => {
-    const entries: Recorded[] = []
-    const result = runManagementPass({
-      ...pass('execute-threshold', 45, { journal: recordingJournal(entries), historian: historianSeam() }),
-    })
-    expect(result.historianRequested).toBe(false)
-    const row = entries.find(entry => entry.kind === 'historian')
-    expect(row?.data).toMatchObject({ phase: 'active-below-force', pressure: 45, forceThreshold: 85 })
-  })
-
   it('starts one on an active pass at or above the force band', () => {
     const result = runManagementPass({
       ...pass('execute-threshold', 86, { historian: historianSeam() }),

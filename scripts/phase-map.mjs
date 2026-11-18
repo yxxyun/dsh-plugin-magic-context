@@ -29,8 +29,6 @@ const PHASE_BASE = [
   'tests/drain-budget.spec.ts',
   'tests/drain-latch.spec.ts',
   'tests/drop-projection.spec.ts',
-  'tests/starved-registry.spec.ts',
-  'tests/starved-escalation.spec.ts',
   // `ctx_search`'s from/to contract: a date-only `to` must cover the whole day,
   // and an impossible date must be refused rather than normalised by Date.UTC.
   'tests/date-range.spec.ts',

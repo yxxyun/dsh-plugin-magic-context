@@ -33,8 +33,7 @@ import { errText } from '../core/types.ts'
 import { effectiveForceThreshold } from '../core/escalation-bands.ts'
 import { DRAIN_FAILURE_BACKOFF_MS, reserveDrain, selectPerRunCap } from '../core/drain-budget.ts'
 import { resolvedEmergencyDrainLatch } from '../core/drain-latch.ts'
-import { notePassStarved } from './starved-registry.ts'
-import { dropsSuffice, reclaimEffectivelyEmpty } from '../core/drop-projection.ts'
+import { dropsSuffice } from '../core/drop-projection.ts'
 import { reclaimForEmergency } from './emergency.ts'
 import { runHistorian, type HistorianDeps, type HistorianLlm } from './historian.ts'
 import type { CompartmentLease } from '../core/compartment-lease.ts'
@@ -877,124 +876,62 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
     let historianStarted = false
     // Tokens this pass reserved from the drain window (0 when nothing ran).
     let drainReserved = 0
-    const idlePoke = input.pass.reason === 'cache-ttl-idle'
-    // Drop starvation: this pass already landed everything it could, and the
-    // surface barely moved. Below the force band the historian is normally held
-    // back because the cache is alive and a digest rewrites the prefix — but if
-    // drops cannot move the needle, summarisation is the only lever left, and
-    // holding it back means firing an execute band on every step for nothing.
-    //
-    // Measured before this gate existed (RCC ORC session, 2026-11-17): 44
-    // execute passes in 80 minutes, 43 of them reclaiming exactly 0 tokens,
-    // because the droppable tail had long since been exhausted. Upstream reaches
-    // the same decision from the other side — `estimateProjectedPostDropPercentage`
-    // — and skips the historian only when drops are projected to suffice.
-    const reclaimedThisPass = Math.max(0, tokensBefore - surfaceTokens(input.session))
-    const starvedFloor = Math.max(
-      1,
-      Math.round((input.contextWindow ?? input.policy.assumedContextWindow) * 0.005),
-    )
-    // Starvation only escalates INSIDE the execute band. Below it the adapter is
-    // not supposed to be doing work at all, so "the drops came up empty" says
-    // nothing about whether summarisation is warranted — it just means the pass
-    // ran early. (An idle poke is by construction below the band: the pressure
-    // branch in `decidePass` is checked first.)
-    const inExecuteBand = input.pressure !== undefined && input.pressure >= input.policy.executeThreshold
-    const reclaimStarved = inExecuteBand && reclaimEffectivelyEmpty(reclaimedThisPass, starvedFloor)
-
-    // The drain budget's only consumer is the expensive half of the lane. A drop
-    // run that reclaims nothing costs nothing and is harmless; a historian that
-    // keeps re-summarising the same surface costs a full model call every time.
-    // So the budget holds the historian, never the drops — and it is consulted
-    // only when starvation is what would have unlocked it.
-    const starvedNow = input.historian?.now === undefined ? Date.now() : input.historian.now()
-    const starvationHoldState = (sid: string): { spentTokens: number } => {
-      try {
-        return { spentTokens: input.stores.getDrainState(sid).spentTokens }
-      } catch {
-        return { spentTokens: 0 }
-      }
-    }
-    const starvationHeld = (starved: boolean): boolean => {
-      if (!starved) return false
-      let st: { windowStartedAt: number; spentTokens: number }
-      try {
-        const row = input.stores.getDrainState(input.sessionId)
-        st = { windowStartedAt: row.windowStartedAt, spentTokens: row.spentTokens }
-      } catch {
-        // A store without drain accounting cannot hold anything: fall through to
-        // the pre-budget behaviour rather than swallowing the historian run.
-        return false
-      }
-      const usable = Math.max(
-        1,
-        Math.round(((input.contextWindow ?? input.policy.assumedContextWindow) * input.policy.executeThreshold) / 100),
-      )
-      // Preview only: `reserveDrain` on a zero-token request reports whether a
-      // real reservation could succeed without consuming anything.
-      const preview = reserveDrain({
-        state: st,
-        requestedTokens: 1,
-        usagePercentage: input.pressure ?? 0,
-        usable,
-        perRunCap: selectPerRunCap(input.pressure ?? 0, usable, input.policy.protectedToolResults),
-        latchActive: (input.pressure ?? 0) >= forceBand,
-        inFailureBackoff: false,
-        now: starvedNow,
-      })
-      return !preview.ok
-    }
-    const activeBelowForce = !idlePoke
-      && !reclaimStarved
-      && input.pressure !== undefined
-      && input.pressure < forceBand
-    if (input.historian !== undefined && activeBelowForce) {
-      input.journal?.info(
-        'historian',
-        `historian not started: active pass at ${input.pressure?.toFixed(1) ?? '?'}% is below the `
-          + `${String(forceBand)}% force band (the cache is alive; waiting for a free window)`,
-        {
-          phase: 'active-below-force',
-          pressure: input.pressure,
-          forceThreshold: forceBand,
-          trigger: input.pass.reason,
-        },
-        input.sessionId,
-      )
-    } else if (input.historian !== undefined && starvationHeld(reclaimStarved)) {
-      // The drain budget is the historian's own admission limit: the drop lane
-      // is cheap and always runs, but a session that cannot reclaim anything and
-      // keeps asking for a digest must pay down its window first.
-      input.journal?.info(
-        'historian',
-        `historian not started: drain budget spent (${String(starvationHoldState(input.sessionId).spentTokens)} tok `
-          + `this window), starvation escalation deferred`,
-        {
-          phase: 'starvation-budget-spent',
-          pressure: input.pressure,
-          reclaimStarved,
-          windowSpent: starvationHoldState(input.sessionId).spentTokens,
-        },
-        input.sessionId,
-      )
-    } else if (input.historian !== undefined) {
-      if (reclaimStarved && input.pressure !== undefined && input.pressure < forceBand) {
+    // The trigger decision is the historian's own (upstream `checkCompartmentTrigger`
+    // runs the whole chain on every pass): force band, tail size, drain budget,
+    // no-progress and the eligibility scan all live behind `runHistorian`. Keeping
+    // a second gate here — "only escalate when the drops came up empty" — was a
+    // local invention, and it fired the expensive lane for the wrong reason while
+    // still holding it when the material was genuinely there.
+    if (input.historian !== undefined) {
+      // Upstream step 6 (`proactive floor`): below `executeThreshold - 2` the
+      // historian is not supposed to fire at all. The redundancy projection only
+      // makes sense INSIDE the bands — evaluated at 18% it always says "drops are
+      // enough", because at 18% everything is enough.
+      const proactiveFloor = Math.max(0, input.policy.executeThreshold - 2)
+      const idlePoke = input.pass.reason === 'cache-ttl-idle'
+      const belowProactiveFloor = !idlePoke
+        && input.pressure !== undefined
+        && input.pressure < proactiveFloor
+      // Upstream step 7 (`historian redundancy skip`): if landing this pass's
+      // drops already brings usage under 75% of the execute threshold, the
+      // summariser is redundant — a compartment would pay for a prefix rewrite
+      // the drops just made unnecessary.
+      const reclaimedThisPass = Math.max(0, tokensBefore - surfaceTokens(input.session))
+      // The projection works in the SAME units as the trigger: the live pressure
+      // reading, not the surface total. They diverge whenever the surface figure
+      // and the measured pressure disagree (a fake or stale pressure in tests, a
+      // window the provider reports differently), and using the surface total
+      // made a force-band pass look like "drops are enough" because the fixture
+      // surface was tiny.
+      const windowForProjection = input.contextWindow ?? input.policy.assumedContextWindow
+      const pressureTokens = input.pressure === undefined
+        ? tokensBefore
+        : Math.round((windowForProjection * input.pressure) / 100)
+      // An unknown pressure must never block a digest (upstream's `usage` is
+      // always present there; here it can be missing, and "we cannot measure"
+      // is not "drops are enough").
+      const dropsEnough = !idlePoke && input.pressure !== undefined && dropsSuffice({
+        pressureTokens,
+        droppableTokens: reclaimedThisPass,
+        windowTokens: windowForProjection,
+        executeThresholdPercentage: input.policy.executeThreshold,
+      }) === true
+      if (belowProactiveFloor) {
         input.journal?.info(
           'historian',
-          `historian escalated: drops reclaimed only ${String(reclaimedThisPass)} tok `
-            + `(< ${String(starvedFloor)} floor) at ${input.pressure.toFixed(1)}% — summarisation is the only lever left`,
-          {
-            phase: 'starved-escalation',
-            pressure: input.pressure,
-            forceThreshold: forceBand,
-            reclaimedThisPass,
-            starvedFloor,
-            trigger: input.pass.reason,
-          },
+          `historian not started: ${input.pressure?.toFixed(1) ?? '?'}% is below the ${String(proactiveFloor)}% proactive floor`,
+          { phase: 'below-proactive-floor', pressure: input.pressure, proactiveFloor, trigger: input.pass.reason },
           input.sessionId,
         )
-      }
-
+      } else if (dropsEnough) {
+        input.journal?.info(
+          'historian',
+          `historian redundancy skip: drops reclaimed ${String(reclaimedThisPass)} tok, already under the `
+            + `${String(Math.round(input.policy.executeThreshold * 0.75))}% target — no digest needed`,
+          { phase: 'redundancy-skip', reclaimedThisPass, pressure: input.pressure, trigger: input.pass.reason },
+          input.sessionId,
+        )
+      } else {
       const deps: HistorianDeps = {
         stores: input.stores,
         policy: input.policy,
@@ -1104,6 +1041,7 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
           }, input.sessionId)
         }))
       historianRequested = true
+      }
     }
 
     // Drain accounting (upstream a1ca346 `protectedTailDrain*` / `emergencyDrainActive`).
