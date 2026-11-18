@@ -40,6 +40,7 @@
  *    checkpoint-summarizing engine competes with the reclaim lanes.
  */
 import { join } from 'node:path'
+import { parseProviderLimitTokens, provenLimitKey } from './core/provider-limit.ts'
 import type { Context } from '@deepseek-ai/cordis'
 import {
   CONTEXT_WINDOW_EXCEEDED_CODE,
@@ -788,6 +789,27 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
     // waterfall. Degrade to pass-through instead — the emergency lane simply
     // stays idle, and the doctor heartbeat is what surfaces the drift.
     if (payload?.failure?.code !== CONTEXT_WINDOW_EXCEEDED_CODE || payload?.signal?.aborted) return next()
+    // Record the limit the provider just stated. It is the only trustworthy
+    // source for this route (`providerProvenLimitTokens`): a catalog value may
+    // describe a different deployment, and the emergency latch refuses to disarm
+    // without a proven number. Fail-open — an unparseable message costs nothing.
+    try {
+      const context = payload.agent?.session === undefined
+        ? undefined
+        : requestContextOf(payload.agent.session)
+      const proven = parseProviderLimitTokens(payload.failure.message)
+      if (proven !== undefined && context?.provider !== undefined && context.model !== undefined) {
+        stores.setMeta(provenLimitKey(context.provider, context.model), String(proven))
+        journal?.info(
+          'provider-limit',
+          `provider stated a ${String(proven)} token limit for ${context.provider}/${context.model}`,
+          { provider: context.provider, model: context.model, limit: proven },
+          payload.agent?.session?.id,
+        )
+      }
+    } catch (limitError) {
+      ctx.logger.warn(`magic-context: proving the provider limit failed: ${errText(limitError)}`)
+    }
     const session = payload.agent?.session
     const sessionId = session?.id
     if (session === undefined || sessionId === undefined) return next()

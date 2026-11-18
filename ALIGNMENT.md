@@ -60,7 +60,8 @@
 
 | 行为 | 上游位置 | 本地 | 状态 |
 |---|---|---|---|
-| 紧急 fail-closed 判定 | `transform-postprocess-phase.ts:1901` | `core/emergency-fail-closed.ts`（10 条测试） | **纯函数已完成，未接入 pre-step**：DSH 的 pre-step 能否中止一个 turn 尚未确认 |
+| 紧急 fail-closed 判定 | `transform-postprocess-phase.ts:1901` | `core/emergency-fail-closed.ts`（10 条测试） | **判定已完成。pre-step 确认可以中止 turn**（`{ kind: 'reject' }`）。接线还差 arm 状态持久化 |
+| provider 证明的 limit 解析 | `providerProvenLimitTokens`（:1915） | `core/provider-limit.ts`（10 条测试） | **已接线**：overflow 时从 `failure.message` 解析并存 `meta`，journal `provider-limit` |
 
 ## 已知缺口
 

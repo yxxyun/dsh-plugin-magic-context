@@ -50,6 +50,10 @@ export type JournalKind =
   | 'historian'
   | 'baseline'
   | 'emergency-reclaim'
+  /** The context limit a provider stated in an overflow refusal. The only
+   *  trustworthy source for a route's real window (`providerProvenLimitTokens`):
+   *  a catalog value may describe a different deployment. */
+  | 'provider-limit'
   | 'wire-repair'
   | 'memory-recall'
   | 'profile-recall'
