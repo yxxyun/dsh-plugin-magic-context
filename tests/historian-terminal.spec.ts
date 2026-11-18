@@ -234,7 +234,11 @@ describe('historian terminal events (unit)', () => {
     expect(phases(calls)).toEqual(['start', 'failed'])
     const failed = terminals(calls)[0]!
     expect(failed.level).toBe('error')
-    expect(failed.data?.kind).toBe('stream-error')
+    // The kind is now the structured classification (upstream
+    // `externalHistorianFailureReason`): an adapter that throws plain `Error`
+    // reports `provider_error:class_...` or bare `provider_error`, never a
+    // catch-all `stream-error`.
+    expect(String(failed.data?.kind)).toMatch(/^provider_error/)
     expect(failed.data?.errorName).toBe('Error')
     expect(String(failed.data?.reason)).toContain('no adapter registered')
     // A transport failure is not retried; only a rejected digest is.
@@ -648,7 +652,7 @@ describe('historian terminal events (real agent loop)', () => {
 
       const failed = terminalRows.find(row => row.data?.phase === 'failed')!
       expect(failed.level).toBe('error')
-      expect(failed.data?.kind).toBe('stream-error')
+      expect(String(failed.data?.kind)).toMatch(/^provider_error/)
       expect(String(failed.data?.reason)).toContain('boom')
       expect(typeof failed.data?.durationMs).toBe('number')
       expect(failed.data?.attempts).toBeGreaterThanOrEqual(1)

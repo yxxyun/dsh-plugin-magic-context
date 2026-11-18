@@ -33,6 +33,7 @@ import type { CompartmentLease } from '../core/compartment-lease.ts'
 import type { LlmSeamMessage } from '../core/types.ts'
 import { errText } from '../core/types.ts'
 import { spanRequestMessages, type SessionSeq, type SurfaceNode } from './seams.ts'
+import { externalHistorianFailureReason } from '../core/historian-failure.ts'
 import { deriveProtectedTailTokenTarget, protectedNodeCount } from '../core/protected-tail.ts'
 
 /** The narrow LLM seam the historian needs (satisfied by `ctx.llm`). */
@@ -502,12 +503,26 @@ function addUsage(
 }
 
 /** Why a historian run produced no digest, in the journal's vocabulary. */
+/**
+ * Local failure kinds stay distinct from the provider detail:
+ *
+ *   timeout       — our own wall-clock budget expired (HistorianTimeoutError)
+ *   max-tokens    — the model hit the output cap mid-block (truncation)
+ *   invalid-output— the reply did not satisfy the contract
+ *   aborted       — the caller's signal fired
+ *   <structured>  — anything from the provider, classified by
+ *                   upstream's `externalHistorianFailureReason`
+ *
+ * The structured branch is what makes a failure row diagnosable: instead of 21
+ * identical `stream-error` rows the journal carries
+ * `provider_error:http_429:rate_limit_error`.
+ */
 function classifyFailure(error: unknown): string {
   if (error instanceof HistorianTimeoutError) return 'timeout'
   if (error instanceof HistorianTruncatedError) return 'max-tokens'
   if (error instanceof HistorianOutputError) return 'invalid-output'
   if (error instanceof Error && error.name === 'AbortError') return 'aborted'
-  return 'stream-error'
+  return externalHistorianFailureReason(error, 'provider_error')
 }
 
 /**
