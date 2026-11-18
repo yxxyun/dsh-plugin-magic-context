@@ -917,7 +917,7 @@ export function injectReduceGuidance(deps: PreStepDeps): void {
           // every baseline row while the code looked correct.
           if (!systemPromptObservationWarned) {
             systemPromptObservationWarned = true
-            ctx.logger.warn(
+            ctx.logger?.warn(
               `magic-context: system prompt observation failed (continuing): ${errText(fingerprintError)}`,
             )
           }
