@@ -115,16 +115,28 @@ describe('pairEstimateSamples', () => {
     expect(pairEstimateSamples([{ at: 350, estimated: 1_000 }], usage)).toEqual([])
   })
 
-  it('ignores a usage reading that lands far later — it is another request', () => {
-    // A `reduce-nudge` pass sends nothing; the next request's bill must not be
-    // charged, at its estimate, to a surface this pass never described.
-    const late = [{ recordedAt: 100 + PAIRING_WINDOW_MS + 1, inputTokens: 900 }]
-    expect(pairEstimateSamples([{ at: 100, estimated: 1_000 }], late)).toEqual([])
+  it('refuses a usage reading that lands after the NEXT pass started', () => {
+    // A `reduce-nudge` pass sends nothing; the next pass's request must not be
+    // charged, at this pass's estimate, to a surface this pass never described.
+    const readings = [{ recordedAt: 400, inputTokens: 900 }]
+    const passes = [{ at: 100, estimated: 1_000 }, { at: 350, estimated: 1_000 }]
+    // The first pass has no reading before 350, so it contributes nothing; the
+    // second one owns the 400 reading and pairs with it.
+    const samples = pairEstimateSamples(passes, readings)
+    expect(samples).toHaveLength(1)
+    expect(samples[0]).toEqual({ estimated: 1_000, actual: 900 })
   })
 
-  it('accepts a usage reading inside the window', () => {
-    const inside = [{ recordedAt: 100 + PAIRING_WINDOW_MS - 1, inputTokens: 900 }]
-    expect(pairEstimateSamples([{ at: 100, estimated: 1_000 }], inside)).toHaveLength(1)
+  it('accepts a reading the model took minutes to produce', () => {
+    // Measured latency on this host: 124 and 137 seconds between a pass and the
+    // bill for the request it sized. A short window would drop these silently.
+    const slow = [{ recordedAt: 100 + 137_000, inputTokens: 900 }]
+    expect(pairEstimateSamples([{ at: 100, estimated: 1_000 }], slow)).toHaveLength(1)
+  })
+
+  it('still refuses a reading beyond the outer bound', () => {
+    const tooLate = [{ recordedAt: 100 + PAIRING_WINDOW_MS + 1, inputTokens: 900 }]
+    expect(pairEstimateSamples([{ at: 100, estimated: 1_000 }], tooLate)).toEqual([])
   })
 
   it('ignores a pass with no estimate', () => {

@@ -122,16 +122,14 @@ export function calibratedWireEstimate(
  * store.
  */
 /**
- * How far after a pass its request may land and still be the same request.
+ * How long after a pass its request may be BILLED and still be the same request.
  *
- * This bound is what makes the pairing honest. A `reduce-nudge` pass injects a
- * reminder and sends nothing, and a `defer` pass only records a decision — so the
- * "first usage after this pass" can easily be the NEXT pass's request, measured
- * against an estimate that described a different surface. Measured 2026-11-18:
- * without the bound the sample spread was 2.04 with a median of 1.35; the width
- * was pairing error, not estimate error.
+ * A pass runs BEFORE the request and the usage row is written when the request
+ * finishes, so the gap is the model's latency — measured at 124 and 137 seconds
+ * on this host (2026-11-18). A 10-second window dropped most real pairs; the
+ * structural guard is that no other pass may run in between (see the loop).
  */
-export const PAIRING_WINDOW_MS = 10_000
+export const PAIRING_WINDOW_MS = 300_000
 
 export function pairEstimateSamples(
   passes: ReadonlyArray<{ readonly at: number; readonly estimated: number | undefined }>,
@@ -140,13 +138,19 @@ export function pairEstimateSamples(
 ): AccuracySample[] {
   if (usage.length === 0) return []
   const sorted = [...usage].sort((left, right) => left.recordedAt - right.recordedAt)
+  // The NEXT pass in time is the real upper bound: a `defer` or `reduce-nudge`
+  // pass sends nothing, so a reading that arrives after another pass started
+  // belongs to that one, not to this estimate.
+  const ordered = [...passes].sort((left, right) => left.at - right.at)
   const samples: AccuracySample[] = []
-  for (const pass of passes) {
+  for (const [index, pass] of ordered.entries()) {
     if (pass.estimated === undefined || !Number.isFinite(pass.estimated) || pass.estimated <= 0) continue
+    const nextPassAt = ordered[index + 1]?.at
     // First usage reading at or after the pass: the request it just sized.
     let picked: { recordedAt: number; inputTokens: number } | undefined
     for (const row of sorted) {
       if (row.recordedAt < pass.at) continue
+      if (nextPassAt !== undefined && row.recordedAt >= nextPassAt) break
       picked = row
       break
     }
