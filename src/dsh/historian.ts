@@ -28,6 +28,7 @@ import type { AdapterStores } from '../core/stores.ts'
 import type { Journal } from '../core/journal.ts'
 import { REFERENCE_ANCHORS } from '../core/reference-seeds.ts'
 import type { PressurePolicy } from '../core/policy.ts'
+import { effectiveForceThreshold } from '../core/escalation-bands.ts'
 import type { CompartmentLease } from '../core/compartment-lease.ts'
 import type { LlmSeamMessage } from '../core/types.ts'
 import { errText } from '../core/types.ts'
@@ -929,6 +930,13 @@ interface HistorianNoProgress {
   readonly endSeq: number
   readonly at: number
   readonly kind: string
+  /**
+   * One recovery attempt already spent in the force band (upstream
+   * `HistoryWait.recoveryAttempted`). Upstream lets a session retry ONCE past
+   * 85% even with no new history — otherwise a session that cannot advance its
+   * boundary is stranded exactly where reclaiming is mandatory.
+   */
+  readonly recoveryAttempted: boolean
 }
 
 /** Fail-open: an unreadable record never blocks a run, and a store double
@@ -941,7 +949,12 @@ function readHistorianNoProgress(stores: AdapterStores, sessionId: string): Hist
     if (typeof parsed.endSeq !== 'number' || typeof parsed.at !== 'number' || typeof parsed.kind !== 'string') {
       return undefined
     }
-    return { endSeq: parsed.endSeq, at: parsed.at, kind: parsed.kind }
+    return {
+      endSeq: parsed.endSeq,
+      at: parsed.at,
+      kind: parsed.kind,
+      recoveryAttempted: parsed.recoveryAttempted === true,
+    }
   } catch {
     return undefined
   }
@@ -983,6 +996,10 @@ export function runHistorian(
     /** Explicit span (the manual/region path); default is the eligibility scan. */
     readonly forcedRange?: readonly SurfaceNode[]
     readonly onStart?: () => void
+    /** False = the drain window is spent; the caller journalled why. */
+    readonly reserveRun?: (tokens: number) => boolean
+    /** Live pressure, for the force-band recovery override (upstream pass-through). */
+    readonly usagePercentage?: number
   },
 ): Promise<Compartment | undefined> {
   const existing = inFlight.get(input.sessionId)
@@ -1006,6 +1023,10 @@ async function runHistorianExclusive(
     readonly session: Parameters<typeof spanRequestMessages>[0]
     readonly forcedRange?: readonly SurfaceNode[]
     readonly onStart?: () => void
+    /** False = the drain window is spent; the caller journalled why. */
+    readonly reserveRun?: (tokens: number) => boolean
+    /** Live pressure, for the force-band recovery override (upstream pass-through). */
+    readonly usagePercentage?: number
   },
 ): Promise<Compartment | undefined> {
   // #802: after a run that published nothing, automatic runs wait for a node
@@ -1014,7 +1035,22 @@ async function runHistorianExclusive(
   if (input.forcedRange === undefined) {
     const noProgress = readHistorianNoProgress(deps.stores, input.sessionId)
     const lastNode = input.nodes.length > 0 ? input.nodes[input.nodes.length - 1] : undefined
-    if (noProgress !== undefined && lastNode !== undefined && noProgress.endSeq >= lastNode.seq) {
+    // Upstream `shouldWaitForNewHistorianHistory`: waiting on unchanged history
+    // is overridden once the session reaches the force band, but only ONCE
+    // (`recoveryAttempted`). Without the exception a session that cannot grow
+    // its surface is stranded exactly where summarising is mandatory.
+    const atForceBand = input.usagePercentage !== undefined
+      && input.usagePercentage >= effectiveForceThreshold(deps.policy)
+    const recoverySpent = noProgress?.recoveryAttempted === true
+    if (atForceBand && noProgress !== undefined && !recoverySpent) {
+      writeHistorianNoProgress(deps.stores, input.sessionId, { ...noProgress, recoveryAttempted: true })
+      deps.journal?.info(
+        'historian',
+        'historian no-progress override: force band allows one recovery attempt on unchanged history',
+        { phase: 'no-progress-recovery', failedEndSeq: noProgress.endSeq, usage: input.usagePercentage },
+        input.sessionId,
+      )
+    } else if (noProgress !== undefined && lastNode !== undefined && noProgress.endSeq >= lastNode.seq) {
       deps.journal?.info(
         'historian',
         'historian auto-run skipped: the previous run published nothing and no newer message has arrived (#802)',
@@ -1095,6 +1131,12 @@ async function runHistorianExclusive(
     }
   }
   try {
+    // Reserve before the run, not after it (upstream
+    // `reserveProtectedTailDrainTokens`): a spent window must stop the call from
+    // being paid for at all, and the reservation is sized by what this run will
+    // actually send. Returning here keeps the terminal invariant intact — no
+    // `start` row was written, so nothing needs a sibling.
+    if (input.reserveRun !== undefined && !input.reserveRun(cappedRange.tokens)) return undefined
     const draft = await callHistorian(deps, {
       sessionId: input.sessionId,
       session: input.session,
@@ -1185,6 +1227,7 @@ async function runHistorianExclusive(
       endSeq: last.seq,
       at: deps.now?.() ?? Date.now(),
       kind: classifyFailure(error),
+      recoveryAttempted: false,
     })
     throw error
   } finally {

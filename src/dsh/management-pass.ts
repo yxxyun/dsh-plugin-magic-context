@@ -31,7 +31,7 @@ import type { PassDecision, PressurePolicy } from '../core/policy.ts'
 import type { AdapterStores, BaselineState } from '../core/stores.ts'
 import { errText } from '../core/types.ts'
 import { effectiveForceThreshold } from '../core/escalation-bands.ts'
-import { chargeDrain, drainAdmission, selectPerRunCap } from '../core/drain-budget.ts'
+import { DRAIN_FAILURE_BACKOFF_MS, reserveDrain, selectPerRunCap } from '../core/drain-budget.ts'
 import { resolvedEmergencyDrainLatch } from '../core/drain-latch.ts'
 import { notePassStarved } from './starved-registry.ts'
 import { dropsSuffice, reclaimEffectivelyEmpty } from '../core/drop-projection.ts'
@@ -875,6 +875,8 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
     // Charged only when a provider call is actually paid for: see `onStart` in
     // historian.ts. `historianRequested` stays for the release/return shape.
     let historianStarted = false
+    // Tokens this pass reserved from the drain window (0 when nothing ran).
+    let drainReserved = 0
     const idlePoke = input.pass.reason === 'cache-ttl-idle'
     // Drop starvation: this pass already landed everything it could, and the
     // surface barely moved. Below the force band the historian is normally held
@@ -928,14 +930,19 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
         1,
         Math.round(((input.contextWindow ?? input.policy.assumedContextWindow) * input.policy.executeThreshold) / 100),
       )
-      const admission = drainAdmission({
+      // Preview only: `reserveDrain` on a zero-token request reports whether a
+      // real reservation could succeed without consuming anything.
+      const preview = reserveDrain({
         state: st,
+        requestedTokens: 1,
         usagePercentage: input.pressure ?? 0,
         usable,
         perRunCap: selectPerRunCap(input.pressure ?? 0, usable, input.policy.protectedToolResults),
+        latchActive: (input.pressure ?? 0) >= forceBand,
+        inFailureBackoff: false,
         now: starvedNow,
       })
-      return admission !== null
+      return !preview.ok
     }
     const activeBelowForce = !idlePoke
       && !reclaimStarved
@@ -1004,6 +1011,67 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
       // the terminal row: measured 2026-11-18 on the RCC ORC session, 21 failed
       // runs produced 60 `historian promise rejected` rows (2.86 per failure),
       // which reads like three times as much breakage as actually happened.
+      // Reserve BEFORE the run (upstream `reserveProtectedTailDrainTokens`).
+      // The earlier shape charged afterwards by what a pass reclaimed, which
+      // made the limiter measure work already done — a pass that produced
+      // nothing cost nothing, so the window never filled and a starving session
+      // kept firing. A reservation sizes the run by what it will actually send
+      // and either grants it or refuses to start.
+      const reserveRun = (tokens: number): boolean => {
+        try {
+          const settled = input.historian?.now === undefined ? Date.now() : input.historian.now()
+          const prior = input.stores.getDrainState(input.sessionId)
+          const usable = Math.max(
+            1,
+            Math.round(
+              ((input.contextWindow ?? input.policy.assumedContextWindow) * input.policy.executeThreshold) / 100,
+            ),
+          )
+          const inFailureBackoff = prior.failureAt > 0
+            && prior.failureAt <= settled
+            && settled - prior.failureAt < DRAIN_FAILURE_BACKOFF_MS
+          const result = reserveDrain({
+            state: { windowStartedAt: prior.windowStartedAt, spentTokens: prior.spentTokens },
+            requestedTokens: tokens,
+            usagePercentage: input.pressure ?? 0,
+            usable,
+            perRunCap: selectPerRunCap(input.pressure ?? 0, usable, input.policy.protectedToolResults),
+            // The latch is the emergency bypass: past the force band a spent
+            // window must not be what strands the session.
+            latchActive: (input.pressure ?? 0) >= forceBand,
+            inFailureBackoff,
+            now: settled,
+          })
+          if (!result.ok) {
+            input.journal?.info(
+              'drain',
+              `historian held: drain window spent (${String(prior.spentTokens)}/${String(result.limitTokens)} tok); `
+                + `next eligible in ${String(Math.max(0, Math.round((result.state.windowStartedAt + 10 * 60_000 - settled) / 1000)))}s`,
+              {
+                requestedTokens: tokens,
+                spentTokens: prior.spentTokens,
+                limitTokens: result.limitTokens,
+                pressure: input.pressure,
+                latchActive: (input.pressure ?? 0) >= forceBand,
+                inFailureBackoff,
+              },
+              input.sessionId,
+            )
+            return false
+          }
+          input.stores.putDrainState(input.sessionId, {
+            windowStartedAt: result.state.windowStartedAt,
+            spentTokens: result.state.spentTokens,
+            latchActiveSince: prior.latchActiveSince,
+            failureAt: prior.failureAt,
+          })
+          drainReserved = result.reservedTokens
+          return true
+        } catch {
+          // Accounting must never be the reason a run does not happen.
+          return true
+        }
+      }
       const run = runHistorian(deps, {
         sessionId: input.sessionId,
         session: input.session,
@@ -1014,6 +1082,8 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
         ...input.contextWindow === undefined ? {} : { contextWindow: input.contextWindow },
         ...input.route === undefined ? {} : { route: input.route },
         onStart: () => { historianStarted = true },
+        reserveRun,
+        ...input.pressure === undefined ? {} : { usagePercentage: input.pressure },
       })
       // A reused run already carries its handler; a fresh one needs both (the
       // silent catch keeps an unhandled rejection from escaping).
@@ -1061,14 +1131,6 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
           ((input.contextWindow ?? input.policy.assumedContextWindow) * input.policy.executeThreshold) / 100,
         ),
       )
-      const historianCharge = historianStarted
-        ? Math.max(1, Math.min(input.policy.historianMaxTokens, Math.round(usableForCharge * 0.05)))
-        : 0
-      const window = chargeDrain(
-        { windowStartedAt: prior.windowStartedAt, spentTokens: prior.spentTokens },
-        reclaimed + historianCharge,
-        settledNow,
-      )
       const latchActiveSince = resolvedEmergencyDrainLatch(
         { activeSince: prior.latchActiveSince, failureAt: prior.failureAt },
         input.pressure ?? 0,
@@ -1076,24 +1138,27 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
         input.policy.executeThreshold,
         settledNow,
       )
+      // `reserveRun` already persisted whatever this pass reserved; re-read so
+      // the latch write does not overwrite it with the pre-reservation numbers.
+      const afterReserve = input.stores.getDrainState(input.sessionId)
       input.stores.putDrainState(input.sessionId, {
-        windowStartedAt: window.windowStartedAt,
-        spentTokens: window.spentTokens,
+        windowStartedAt: afterReserve.windowStartedAt,
+        spentTokens: afterReserve.spentTokens,
         latchActiveSince,
         failureAt: prior.failureAt,
       })
-      // Feed the next pass: an empty pass is the evidence that the budget must
-      // start holding (see starved-registry.ts for why the budget alone cannot).
-      notePassStarved(input.sessionId, reclaimEffectivelyEmpty(reclaimed, starvedFloor))
-      if (reclaimed > 0) {
+      // Drops are not charged: upstream accounts only the historian's model
+      // input, because that is the expensive half. A drop run that reclaims
+      // nothing costs nothing and needs no limiter.
+      if (drainReserved > 0) {
         input.journal?.info(
           'drain',
-          `drain charged ${String(reclaimed)} tok (window ${String(window.spentTokens)} tok since `
-            + `${new Date(window.windowStartedAt).toISOString()})`,
+          `drain reserved ${String(drainReserved)} tok for the historian (window `
+            + `${String(afterReserve.spentTokens)} tok since ${new Date(afterReserve.windowStartedAt).toISOString()})`,
           {
-            reclaimed,
-            windowSpent: window.spentTokens,
-            windowStartedAt: window.windowStartedAt,
+            reserved: drainReserved,
+            windowSpent: afterReserve.spentTokens,
+            windowStartedAt: afterReserve.windowStartedAt,
             latchActiveSince,
             pressure: input.pressure,
             trigger: input.pass.reason,
