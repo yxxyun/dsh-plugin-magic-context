@@ -451,6 +451,15 @@ export function publishReadyCompartments(
  * changed. A HARD rebuild (no state yet, route change, memory-digest change)
  * freezes m[0] again and empties the delta; otherwise the delta grows.
  */
+/**
+ * Renderer format stamp for the composed baseline (upstream
+ * `compartmentRenderEpoch`). Bump this whenever a change to the renderer would
+ * produce different bytes for the SAME inputs — tier selection, block layout,
+ * header format. Every existing baseline then folds once, instead of surviving
+ * as a mismatch nobody can see.
+ */
+export const BASELINE_RENDER_EPOCH = 2
+
 function refreshBaseline(
   input: ManagementPassInput,
   nodes: readonly SurfaceNode[],
@@ -463,6 +472,12 @@ function refreshBaseline(
   const previous = input.stores.baselineState(input.sessionId)
   const routeChanged = previous !== undefined
     && (previous.provider !== input.route?.provider || previous.model !== input.route?.model)
+  // Upstream `compartmentRenderEpoch`: a baseline written by a DIFFERENT renderer
+  // must be folded once. Without this, changing how tiers are chosen (the decay
+  // curve) left every existing baseline rendering at the old tiers forever,
+  // because the cached bytes still matched the cached bytes.
+  const renderEpochChanged = previous !== undefined
+    && (previous.renderEpoch ?? 0) !== BASELINE_RENDER_EPOCH
   const memoriesChanged = previous !== undefined
     && previous.memoriesDigest !== undefined
     && memories !== undefined
@@ -503,7 +518,7 @@ function refreshBaseline(
   // costs nothing that is not already lost and folds m[1] back into m[0] for
   // the requests that follow. Off ⇒ the pass only lands queued work.
   const ttlFold = input.policy.ttlRebuild === true && input.pass.reason === 'cache-ttl-idle'
-  const hard = ttlFold || previous === undefined || routeChanged || memoriesChanged || epochChanged || cursorUpgrade || profileChanged  // Freeze targets for a HARD fold. Falling back to the previous values keeps a
+  const hard = ttlFold || previous === undefined || routeChanged || memoriesChanged || epochChanged || cursorUpgrade || profileChanged || renderEpochChanged  // Freeze targets for a HARD fold. Falling back to the previous values keeps a
   // pass that has no mutation lane (bridge unavailable) from rewinding them.
   const frozenCursor = updates?.cursor ?? previous?.maxMemoryMutationId
   const frozenEpochFingerprint = updates?.projectEpochFingerprint ?? previous?.projectEpochFingerprint
@@ -593,6 +608,7 @@ function refreshBaseline(
         nodeSeq: target.seq,
         ...input.route === undefined ? {} : { provider: input.route.provider, model: input.route.model },
         ...memories === undefined ? {} : { memoriesDigest: memories.digest },
+        renderEpoch: BASELINE_RENDER_EPOCH,
       })
     }
     return false
@@ -614,6 +630,7 @@ function refreshBaseline(
     nodeSeq: landedSeq,
     ...input.route === undefined ? {} : { provider: input.route.provider, model: input.route.model },
     ...memories === undefined ? {} : { memoriesDigest: memories.digest },
+    renderEpoch: BASELINE_RENDER_EPOCH,
   })
   input.journal?.info(
     'baseline',

@@ -23,7 +23,7 @@ import { openCompartmentLease, type CompartmentLease, type LeaseDatabase } from 
 import { openDreamLease, type DreamLease, type DreamLeaseOptions } from './dream-lease.ts'
 import type { TagRecord, TagTarget, UsageRecord } from './types.ts'
 
-export const SCHEMA_VERSION = 15
+export const SCHEMA_VERSION = 16
 
 /** The m[0]/m[1] baseline identity for one session. */
 export interface BaselineState {
@@ -37,6 +37,13 @@ export interface BaselineState {
   readonly model?: string
   /** Timestamp of the last HARD rebuild; m[1] holds compartments newer than this. */
   readonly frozenAt: number
+  /**
+   * Renderer format stamp (upstream `compartmentRenderEpoch`). A baseline
+   * composed by a different renderer must be folded once: its cached bytes came
+   * from code that no longer exists, so comparing them against today's output
+   * keeps reporting a difference that is not the session's.
+   */
+  readonly renderEpoch?: number
   /** Identity of the injected project-memory digest (change ⇒ HARD). */
   readonly memoriesDigest?: string
   /**
@@ -1129,6 +1136,24 @@ const MIGRATIONS: readonly Migration[] = [
       `)
     },
   },
+  {
+    // v16: renderer format stamp for the composed baseline. Upstream gates a HARD
+    // rebuild on `compartmentRenderEpoch` (inject-compartments.ts:1816): when the
+    // renderer's output changes, a baseline composed by the old one must be
+    // folded once. Without the stamp, changing how tiers are chosen (the decay
+    // curve) left every existing baseline rendering at the old tiers forever —
+    // the cached bytes still matched the cached bytes.
+    //
+    // `IF NOT EXISTS` is not available for ADD COLUMN in SQLite before 3.35 and
+    // the guard here is the migration version itself; the schema tests rewind and
+    // replay the chain, which walks each version exactly once.
+    version: 16,
+    up: (db) => {
+      const columns = db.prepare('PRAGMA table_info(baseline_state)').all() as Array<{ name: string }>
+      if (columns.some(column => column.name === 'render_epoch')) return
+      db.exec('ALTER TABLE baseline_state ADD COLUMN render_epoch INTEGER NOT NULL DEFAULT 0')
+    },
+  },
 ]
 
 /**
@@ -1577,6 +1602,7 @@ export function openStores(dataDir: string): AdapterStores {
     memories_digest: string | null; max_memory_id: number | null
     max_memory_mutation_id: number | null; project_epoch_fingerprint: string | null
     profile_watermark: number | null; profile_m0_digest: string | null
+    render_epoch: number | null
     updated_at: number
   }
 
@@ -1598,6 +1624,7 @@ export function openStores(dataDir: string): AdapterStores {
       ...row.project_epoch_fingerprint === null ? {} : { projectEpochFingerprint: row.project_epoch_fingerprint },
       ...row.profile_watermark === null ? {} : { profileWatermark: row.profile_watermark },
       ...row.profile_m0_digest === null ? {} : { profileM0Digest: row.profile_m0_digest },
+      ...row.render_epoch === null || row.render_epoch === 0 ? {} : { renderEpoch: row.render_epoch },
       updatedAt: row.updated_at,
     }
   }
@@ -1605,15 +1632,15 @@ export function openStores(dataDir: string): AdapterStores {
   const saveBaselineState = (state: BaselineState): void => {
     db.prepare(
       'INSERT INTO baseline_state(session_id, epoch, node_seq, provider, model, frozen_at, memories_digest, '
-        + 'max_memory_id, max_memory_mutation_id, project_epoch_fingerprint, profile_watermark, profile_m0_digest, updated_at) '
-        + 'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) '
+        + 'max_memory_id, max_memory_mutation_id, project_epoch_fingerprint, profile_watermark, profile_m0_digest, render_epoch, updated_at) '
+        + 'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) '
         + 'ON CONFLICT(session_id) DO UPDATE SET epoch = excluded.epoch, node_seq = excluded.node_seq, '
         + 'provider = excluded.provider, model = excluded.model, frozen_at = excluded.frozen_at, '
         + 'memories_digest = excluded.memories_digest, max_memory_id = excluded.max_memory_id, '
         + 'max_memory_mutation_id = excluded.max_memory_mutation_id, '
         + 'project_epoch_fingerprint = excluded.project_epoch_fingerprint, '
         + 'profile_watermark = excluded.profile_watermark, '
-        + 'profile_m0_digest = excluded.profile_m0_digest, '
+        + 'profile_m0_digest = excluded.profile_m0_digest, render_epoch = excluded.render_epoch, '
         + 'updated_at = excluded.updated_at',
     ).run(
       state.sessionId,
@@ -1628,6 +1655,7 @@ export function openStores(dataDir: string): AdapterStores {
       state.projectEpochFingerprint ?? null,
       state.profileWatermark ?? null,
       state.profileM0Digest ?? null,
+      state.renderEpoch ?? 0,
       state.updatedAt,
     )
   }

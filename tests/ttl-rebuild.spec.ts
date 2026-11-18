@@ -20,7 +20,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { DEFAULT_POLICY } from '../src/core/policy.ts'
 import { openStores, type AdapterStores } from '../src/core/stores.ts'
 import type { Journal } from '../src/core/journal.ts'
-import { runManagementPass } from '../src/dsh/management-pass.ts'
+import { runManagementPass, BASELINE_RENDER_EPOCH, } from '../src/dsh/management-pass.ts'
 
 const T0 = 1_700_000_000_000
 const SESSION = 'mc-ttl-rebuild'
@@ -81,6 +81,9 @@ function seedBaseline(stores: AdapterStores): void {
     epoch: 1,
     frozenAt: T0,
     memoriesDigest: DIGEST,
+    // A baseline written by the CURRENT renderer, so the render-epoch gate does
+    // not fire and these cases keep testing the ttl behaviour they name.
+    renderEpoch: BASELINE_RENDER_EPOCH,
     updatedAt: T0,
   })
 }
