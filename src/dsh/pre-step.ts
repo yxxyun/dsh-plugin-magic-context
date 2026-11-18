@@ -398,7 +398,11 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
         // (execute and defer alike). The accuracy report pairs it with the usage
         // the provider bills for the request that follows; without it on the
         // common path there is nothing to regress against.
-        estSurfaceTokens: surfaceTokens(payload.agent.session),
+        // Surface nodes PLUS the system prompt: the wire carries both, and a
+        // surface-only number under-reported by 2.5x on the first measured
+        // sample. Recorded under the same key so old rows stay comparable.
+        estSurfaceTokens: surfaceTokens(payload.agent.session) + (latestSystemPromptTokens ?? 0),
+        ...latestSystemPromptTokens === undefined ? {} : { estSystemPromptTokens: latestSystemPromptTokens },
         pressure: pressure === undefined ? undefined : Number(pressure.toFixed(1)),
         // Visible in the pass row: a stale reading explains why a high
         // percentage did not reclaim (see the force-band guard).
@@ -849,6 +853,12 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
 let latestSystemPromptFingerprint: string | undefined
 
 /**
+ * Tokens of the last assembled system prompt. Paired with `surfaceTokens` it
+ * approximates the real request, which is what the accuracy report is measuring.
+ */
+let latestSystemPromptTokens: number | undefined
+
+/**
  * MD5 of the rendered system prompt — the same digest and the same material the
  * upstream fingerprint uses (`systemPromptFingerprint`, prompt-surface-runtime.ts:71),
  * so a value recorded here means what an upstream value means.
@@ -860,7 +870,18 @@ function fingerprintOf(assembly: unknown): string | undefined {
   if (assembly === undefined || assembly === null) return undefined
   const rendered = renderPrompt(assembly as Parameters<typeof renderPrompt>[0])
   if (typeof rendered !== 'string' || rendered.length === 0) return undefined
+  // Record the SIZE alongside the digest. `surfaceTokens` counts only surface
+  // nodes, so the system prompt — plus the tool schemas rendered beside it — is
+  // the biggest single thing a wire estimate can miss. Measured 2026-11-18: the
+  // first calibrated sample put actual at 2.51x the estimate, and the missing
+  // system block is the bulk of that.
+  latestSystemPromptTokens = estimateTokens(rendered)
   return createHash('md5').update(rendered).digest('hex')
+}
+
+/** Tokens the last assembled system prompt (and its tool schemas) occupied. */
+export function currentSystemPromptTokens(): number | undefined {
+  return latestSystemPromptTokens
 }
 
 /** Test seam: the digest of the most recent assembly, or undefined. */
