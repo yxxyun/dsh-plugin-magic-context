@@ -209,11 +209,25 @@ export function computeNextDue(input: {
  */
 export async function runDueDreamTasks(
   deps: DreamRunnerDeps,
-  options: { limit?: number } = {},
+  options: {
+    limit?: number
+    /**
+     * Run NOW, ignoring the cron gate — upstream's `runManual(task?)`. A task may
+     * be forced by name, or every enabled task of the project by omitting it.
+     * `projectPath` is required because a manual run has no "due" row to read it
+     * from.
+     */
+    readonly force?: { readonly projectPath: string; readonly task?: DreamTaskName }
+  } = {},
 ): Promise<DreamRunOutcome[]> {
   const now = deps.now ?? Date.now
   const log = deps.log ?? ((): void => {})
-  const due = deps.stores.listDueDreamTasks(now(), options.limit)
+  const due = options.force === undefined
+    ? deps.stores.listDueDreamTasks(now(), options.limit)
+    : deps.stores
+        .listDreamSchedules(options.force.projectPath)
+        .filter(schedule => schedule.enabled !== false)
+        .filter(schedule => options.force?.task === undefined || schedule.task === options.force.task)
   const outcomes: DreamRunOutcome[] = []
 
   for (const schedule of due) {

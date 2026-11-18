@@ -31,6 +31,7 @@ const PHASE_BASE = [
   'tests/baseline-render-epoch.spec.ts',
   'tests/drop-small-result.spec.ts',
   'tests/flush-command.spec.ts',
+  'tests/dream-command.spec.ts',
   // Anti-idle gates ported from upstream mc-upstream a1ca346: the derived force
   // band, the rolling drain budget, the emergency latch, and the post-drop
   // projection that decides when summarisation is the only lever left.
