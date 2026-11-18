@@ -16,8 +16,9 @@
  *    domain-shared rows additionally need `shareable = 1`,
  *    `scope IN ('project','ecosystem','universe')` and a category in the
  *    active domains' `share_categories` allowlist;
- *  - selection priority is permanent → importance → max(last_seen_at,
- *    verified_at) → id, trimmed to a token budget.
+ *  - selection priority is upstream's: permanent → utility tier (retrieved >
+ *    constraint wording > rest) → seen_count → shorter content → id, trimmed to
+ *    a token budget as a strict priority prefix (see memory-budget.ts).
  *
  * WRITES ARE DELIBERATELY ABSENT: inserting memories also means computing
  * Magic Context's normalized hash, bumping `project_state.project_memory_epoch`
@@ -25,6 +26,7 @@
  * honoring the authority guard — invariants owned by Magic Context's storage
  * layer. The adapter recalls; it does not fork the memory store.
  */
+import { compareMemoryPriority } from './memory-budget.ts'
 import { DatabaseSync } from 'node:sqlite'
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
@@ -77,6 +79,10 @@ export interface MemoryRow {
   readonly updatedAt: number
   readonly lastSeenAt: number
   readonly verifiedAt?: number
+  /** Times this memory matched a recall query (upstream `seenCount`). */
+  readonly seenCount?: number
+  /** Times it was actually retrieved into context (upstream `retrievalCount`). */
+  readonly retrievalCount?: number
 }
 
 export interface MemoryRecallRequest {
@@ -326,9 +332,12 @@ interface MemoryTableRow {
   updated_at: number
   last_seen_at: number | null
   verified_at: number | null
+  seen_count: number | null
+  retrieval_count: number | null
 }
 
-const SELECT_COLUMNS = 'id, project_path, category, content, importance, shareable, status, expires_at, updated_at, last_seen_at, verified_at'
+const SELECT_COLUMNS = 'id, project_path, category, content, importance, shareable, status, expires_at, updated_at, '
+  + 'last_seen_at, verified_at, seen_count, retrieval_count'
 
 /** Magic Context's normalized-hash whitespace set, for stable digests only. */
 export function normalizeMemoryContent(content: string): string {
@@ -441,23 +450,22 @@ function identityCandidates(project: string | undefined): string[] {
   return primary === legacy ? [primary] : [primary, legacy]
 }
 
-function priorityOf(row: MemoryRow): [number, number, number, number] {
-  return [
-    row.permanent ? 1 : 0,
-    row.importance,
-    Math.max(row.lastSeenAt, row.verifiedAt ?? 0),
-    row.id,
-  ]
-}
-
+/**
+ * Upstream's priority order (`trimMemoriesToBudget`, inject-compartments.ts:369):
+ *
+ *   1. permanent first
+ *   2. utility tier — RETRIEVED beats CONSTRAINT WORDING beats the rest
+ *   3. seen count, descending
+ *   4. shorter content first (more memories fit the budget)
+ *   5. id, so the order is total and cache-stable
+ *
+ * The authored `importance` score is deliberately NOT in this list. It is a
+ * model's guess made once at authoring time; a retrieval count is evidence from
+ * use. Ranking by importance meant a memory the agent kept reaching for could
+ * lose its slot to one that merely sounded important.
+ */
 function comparePriority(left: MemoryRow, right: MemoryRow): number {
-  const a = priorityOf(left)
-  const b = priorityOf(right)
-  for (let index = 0; index < a.length; index += 1) {
-    const difference = (b[index] ?? 0) - (a[index] ?? 0)
-    if (difference !== 0) return difference
-  }
-  return 0
+  return compareMemoryPriority(left, right)
 }
 
 function categoryRank(category: string): number {
@@ -630,6 +638,8 @@ export function openMemoryBridge(options: MemoryBridgeOptions): MemoryBridge {
       permanent: row.status === 'permanent',
       updatedAt: row.updated_at,
       lastSeenAt: row.last_seen_at ?? row.updated_at,
+      ...row.seen_count === null ? {} : { seenCount: row.seen_count },
+      ...row.retrieval_count === null ? {} : { retrievalCount: row.retrieval_count },
       ...row.verified_at === null ? {} : { verifiedAt: row.verified_at },
     })
 
@@ -1124,15 +1134,18 @@ export function openMemoryBridge(options: MemoryBridgeOptions): MemoryBridge {
             const usable = scoringActive
               ? candidates.filter(row => !retiredIds.has(row.id))
               : candidates
+            // Upstream `trimMemoriesToBudget` semantics: priority order decides
+            // the set, and the walk STOPS at the first row that does not fit, so
+            // the result is a priority prefix. `continue` (the previous behaviour)
+            // packed more rows by skipping the big one, which made the visible set
+            // depend on byte-level fit — one edit reshuffled what the model saw.
+            const ordered = [...usable].sort(comparePriority)
             const selected: MemoryRow[] = []
             let used = 0
-            const ranked = scoringActive
-              ? [...usable].sort((left, right) => scoreOf(right) - scoreOf(left) || comparePriority(left, right))
-              : [...usable].sort(comparePriority)
-            for (const row of ranked) {
+            for (const row of ordered) {
               if (selected.length >= request.limit) break
               const cost = estimateTokens(renderMemoryLine(row))
-              if (used + cost > budgetTokens) continue
+              if (used + cost > budgetTokens) break
               used += cost
               selected.push(row)
             }
