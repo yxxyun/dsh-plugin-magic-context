@@ -714,11 +714,9 @@ function refreshBaseline(
     {
       mode: hard ? 'hard' : 'soft',
       epoch: state.epoch,
-      // The chars/4 estimate this pass was sized against. Recorded so the
-      // estimate can be regression-tested against what the provider actually
-      // billed (usage_records.input_tokens): until that ratio is known and
-      // tight, no wire measurement can be marked trusted, and the emergency
-      // gate's disarm branch stays dark (see core/wire-accuracy.ts).
+      // Also on the baseline row, for a pass that only refreshes the baseline
+      // (no pass row is written then). The accuracy report reads the PASS rows;
+      // this one is a convenience for ad-hoc queries.
       estSurfaceTokens: surfaceTokens(input.session),
       nodeSeq: landedSeq,
       compartments: { baseline: sets.baseline.length, delta: sets.delta.length },

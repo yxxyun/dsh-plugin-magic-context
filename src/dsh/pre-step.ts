@@ -394,6 +394,11 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
       if (sessionCwd !== undefined) deps.noteSessionCwd?.(sessionCwd)
       const basePassData = {
         reason: pass.reason,
+        // The chars/4 estimate this pass was sized against, on EVERY pass row
+        // (execute and defer alike). The accuracy report pairs it with the usage
+        // the provider bills for the request that follows; without it on the
+        // common path there is nothing to regress against.
+        estSurfaceTokens: surfaceTokens(payload.agent.session),
         pressure: pressure === undefined ? undefined : Number(pressure.toFixed(1)),
         // Visible in the pass row: a stale reading explains why a high
         // percentage did not reclaim (see the force-band guard).
