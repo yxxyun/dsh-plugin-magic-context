@@ -12,6 +12,7 @@ import {
   calibratedWireEstimate,
   MAX_TRUSTED_SPREAD,
   MIN_TRUSTED_SAMPLES,
+  pairEstimateSamples,
   summarise,
   type AccuracySample,
 } from '../src/core/wire-accuracy.ts'
@@ -93,5 +94,46 @@ describe('calibratedWireEstimate', () => {
     const trusted = summarise(samples(MIN_TRUSTED_SAMPLES, 1.1))
     expect(calibratedWireEstimate(0, trusted)).toMatchObject({ tokens: 0, trusted: false })
     expect(calibratedWireEstimate(Number.NaN, trusted).trusted).toBe(false)
+  })
+})
+
+describe('pairEstimateSamples', () => {
+  const usage = [
+    { recordedAt: 100, inputTokens: 1_000 },
+    { recordedAt: 200, inputTokens: 1_200 },
+    { recordedAt: 300, inputTokens: 1_400 },
+  ]
+
+  it('pairs a pass with the FIRST usage reading at or after it', () => {
+    // A pass at 250 sized the request whose bill is recorded at 300.
+    const samples = pairEstimateSamples([{ at: 250, estimated: 1_000 }], usage)
+    expect(samples).toEqual([{ estimated: 1_000, actual: 1_400 }])
+  })
+
+  it('ignores a pass with no later usage at all (the request never landed)', () => {
+    expect(pairEstimateSamples([{ at: 350, estimated: 1_000 }], usage)).toEqual([])
+  })
+
+  it('ignores a pass with no estimate', () => {
+    expect(pairEstimateSamples([{ at: 250, estimated: undefined }], usage)).toEqual([])
+  })
+
+  it('ignores a zero or negative usage reading at the paired moment', () => {
+    const withZero = [{ recordedAt: 200, inputTokens: 0 }]
+    expect(pairEstimateSamples([{ at: 150, estimated: 1_000 }], withZero)).toEqual([])
+  })
+
+  it('returns nothing when there is no usage at all', () => {
+    expect(pairEstimateSamples([{ at: 250, estimated: 1_000 }], [])).toEqual([])
+  })
+
+  it('produces one sample per pass, in pass order', () => {
+    const samples = pairEstimateSamples(
+      [{ at: 150, estimated: 800 }, { at: 250, estimated: 900 }],
+      usage,
+    )
+    expect(samples).toHaveLength(2)
+    expect(samples[0]?.actual).toBe(1_200)
+    expect(samples[1]?.actual).toBe(1_400)
   })
 })

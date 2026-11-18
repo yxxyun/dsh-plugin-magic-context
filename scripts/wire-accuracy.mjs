@@ -38,8 +38,9 @@ const hours = Number(arg('hours', '24'))
 const db = new DatabaseSync(dbPath, { readOnly: true })
 try {
   const since = Date.now() - hours * 3_600_000
-  // One row per (session, moment): the pass's estimate and the usage reading
-  // recorded closest to it. A pass and the request it sized are seconds apart.
+  // One row per (session, moment): the pass's estimate and the FIRST usage the
+  // provider reported at or after it — a pass runs, then the request it sized
+  // goes out, so the bill comes after, not before.
   const rows = db.prepare(`
     SELECT p.session_id,
            p.at            AS pass_at,
@@ -47,8 +48,8 @@ try {
            (SELECT u.input_tokens + COALESCE(u.cache_read_tokens, 0) + COALESCE(u.cache_write_tokens, 0)
               FROM usage_records u
              WHERE u.session_id = p.session_id
-               AND u.recorded_at <= p.at
-             ORDER BY u.recorded_at DESC
+               AND u.recorded_at >= p.at
+             ORDER BY u.recorded_at ASC
              LIMIT 1) AS actual
       FROM journal p
      WHERE p.kind = 'pass'

@@ -40,6 +40,8 @@ import {
 import { runManagementPass } from './management-pass.ts'
 import { evaluateEmergencyFailClosed } from '../core/emergency-fail-closed.ts'
 import { provenLimitKey } from '../core/provider-limit.ts'
+import { calibratedWireEstimate, pairEstimateSamples, summarise } from '../core/wire-accuracy.ts'
+import { surfaceTokens } from './management-pass.ts'
 import { appendMagicContextEntry } from './session-notice.ts'
 import { historianInFlight } from './historian.ts'
 import { syncMachineDomain } from '../core/machine-domain.ts'
@@ -741,11 +743,31 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
           ? undefined
           : stores.getMeta(provenLimitKey(route.provider, route.model))
         const provenLimit = provenRaw === undefined ? undefined : Number(provenRaw)
+        // Calibrated wire estimate: the chars/4 surface number scaled by the
+        // measured estimate-to-bill ratio. `trusted` comes from the report, not
+        // from optimism — until >=30 samples with a narrow band exist, this stays
+        // untrusted and the gate ignores it, exactly as before.
+        const accuracy = summarise(pairEstimateSamples(
+          stores.listJournal({ sessionId, kinds: ['pass'], limit: 200 }).map(entry => ({
+            at: entry.at,
+            estimated: typeof (entry.data as { estSurfaceTokens?: unknown } | undefined)?.estSurfaceTokens === 'number'
+              ? (entry.data as { estSurfaceTokens: number }).estSurfaceTokens
+              : undefined,
+          })),
+          stores.listUsage(sessionId).map(record => ({
+            recordedAt: record.recordedAt,
+            inputTokens: (record.inputTokens ?? 0)
+              + (record.cacheReadTokens ?? 0)
+              + (record.cacheWriteTokens ?? 0),
+          })),
+        ))
+        const wire = calibratedWireEstimate(surfaceTokens(payload.agent.session), accuracy)
         const failClosed = evaluateEmergencyFailClosed({
           usagePercentage: pressureThisTurn ?? 0,
           emergencyRecoveryArmed: armed,
           emergencyRecoveryOrigin: drain.overflowOrigin ?? null,
           foldMaterializedThisPass: baselineUpdatedThisPass,
+          ...wire.trusted ? { finalWireEstimate: { tokens: wire.tokens, trusted: true } } : {},
           ...provenLimit === undefined || !Number.isFinite(provenLimit)
             ? {}
             : { providerProvenLimitTokens: provenLimit },

@@ -104,3 +104,41 @@ export function calibratedWireEstimate(
     : 0
   return { tokens, trusted: report.trusted && tokens > 0 }
 }
+
+/**
+ * Pair each pass's local estimate with the usage the provider reported for the
+ * same session at the same moment.
+ *
+ * The estimate is recorded by the pass itself (`estSurfaceTokens`); the actual
+ * number is `input_tokens + cache_read + cache_write`, which is also what
+ * `pressurePercent` divides by.
+ *
+ * Direction matters: a pass runs and then the request it sized goes out, so the
+ * matching usage row is the first one recorded AT OR AFTER the pass — not the
+ * last one before it. Pairing backwards lines each estimate up with the previous
+ * request's bill.
+ *
+ * Pure: the caller supplies both series, so this cannot silently read the wrong
+ * store.
+ */
+export function pairEstimateSamples(
+  passes: ReadonlyArray<{ readonly at: number; readonly estimated: number | undefined }>,
+  usage: ReadonlyArray<{ readonly recordedAt: number; readonly inputTokens: number }>,
+): AccuracySample[] {
+  if (usage.length === 0) return []
+  const sorted = [...usage].sort((left, right) => left.recordedAt - right.recordedAt)
+  const samples: AccuracySample[] = []
+  for (const pass of passes) {
+    if (pass.estimated === undefined || !Number.isFinite(pass.estimated) || pass.estimated <= 0) continue
+    // First usage reading at or after the pass: the request it just sized.
+    let picked: { recordedAt: number; inputTokens: number } | undefined
+    for (const row of sorted) {
+      if (row.recordedAt < pass.at) continue
+      picked = row
+      break
+    }
+    if (picked === undefined || !Number.isFinite(picked.inputTokens) || picked.inputTokens <= 0) continue
+    samples.push({ estimated: pass.estimated, actual: picked.inputTokens })
+  }
+  return samples
+}
