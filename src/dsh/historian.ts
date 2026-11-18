@@ -635,10 +635,15 @@ export function planChunkSpans(
 export const HISTORIAN_MERGE_INSTRUCTION = [
   'You are the HISTORIAN merging PARTIAL digests of ONE long span into the final single <output> block.',
   'Return ONLY one <output> block in exactly the contract shape:',
-  '<output><compartments><compartment importance="0"><p1>...</p1><p2>...</p2><p3>...</p3><p4>...</p4></compartment></compartments>',
+  // NB: the example score must NOT be 0. A literal example is the strongest
+  // signal in a prompt, and 0 is the lowest possible score — the merge was
+  // emitting it verbatim and every merged compartment landed at the floor.
+  '<output><compartments><compartment importance="70"><p1>...</p1><p2>...</p2><p3>...</p3><p4>...</p4></compartment></compartments>',
   '<facts><CONSTRAINTS>* one fact per line</CONSTRAINTS></facts>',
   '<events><causal_incident><summary>...</summary></causal_incident></events>',
   '<user_observations>* one statement per line</user_observations></output>',
+  'Set importance to 1-100 for the MERGED work unit: it decides how many render passes this compartment stays at a detailed tier, so score it by how long this finding must survive in high fidelity, not by how much effort it took.',
+  'Each partial digest carries its own importance; treat those as calibration anchors. The merged score is usually near the HIGHEST partial — merging does not make a finding less durable — but raise it when the combined arc established a project-wide invariant, and lower it when the parts were incidental.',
   'Merge and deduplicate the partials; keep the most durable facts; preserve exact paths, commands and error strings verbatim.',
   'p1 at most 250 words; the other tiers one or two sentences each; at most about 700 tokens overall.',
 ].join('\n')

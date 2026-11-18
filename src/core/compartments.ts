@@ -978,8 +978,15 @@ export function parseHistorianEnvelope(text: string): CompartmentDraft {
     return tidy(rest.slice(0, limit))
   }
 
-  const rawImportance = Number(first.attrs.importance)
-  const importance = Number.isFinite(rawImportance) && rawImportance > 0
+  // Upstream distinguishes "the attribute is absent" from "the model said 0"
+  // (compartment-parser.ts:335 + decay-render.ts:166): an absent score defaults
+  // to 50, while an explicit 0 is the LOWEST score and is clamped to 1 at render
+  // time. Treating 0 as "absent" — which `rawImportance > 0` did — silently
+  // promoted every deliberately-low compartment to 50, and it is exactly what the
+  // merge prompt's `importance="0"` example produced.
+  const importanceAttr = first.attrs.importance
+  const rawImportance = importanceAttr === undefined ? Number.NaN : Number(importanceAttr)
+  const importance = Number.isFinite(rawImportance)
     ? Math.min(100, Math.max(0, Math.round(rawImportance)))
     : 50
   // Side channels live OUTSIDE the compartment body. A paragraph that QUOTES
