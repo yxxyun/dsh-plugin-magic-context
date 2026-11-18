@@ -32,6 +32,7 @@
 import type { Session, SessionSeq } from '@deepseek-ai/dsh-session'
 import { dropPlaceholderContent, replaceToolResultContent, type SurfaceToolNode } from './seams.ts'
 import type { PressurePolicy } from '../core/policy.ts'
+import { deriveProtectedTailTokenTarget } from '../core/protected-tail.ts'
 
 export interface EmergencyReclaimResult {
   /** Nodes replaced with placeholders, tier order then oldest first. */
@@ -70,11 +71,34 @@ export function resolveToolTier(toolName: string | null): ToolTier {
 }
 
 /** clamp(contextWindow × 5%, 8k, 64k) — undefined when the window is unknown. */
-export function protectionWindowTokens(contextWindow: number | undefined): number | undefined {
+/**
+ * How many tokens at the tail are spared from an emergency reclaim.
+ *
+ * This used to be `min(64k, max(8k, context × 5%))` — a flat slice of the RAW
+ * window with no notion of pressure — while `core/protected-tail.ts` already
+ * carried upstream's derivation (`deriveProtectedTailTokenTarget`, from the USABLE
+ * window and shrinking as the session fills). Two implementations of one rule,
+ * and the reclaim lane was using the wrong one: a flat 5% protected a fraction of
+ * the intended slice at low pressure and too much at high pressure, which is
+ * precisely when holding the tail back is what fills the window.
+ *
+ * This now delegates, so there is one rule.
+ */
+export function protectionWindowTokens(
+  contextWindow: number | undefined,
+  options: {
+    readonly executeThresholdPercentage?: number
+    readonly usagePercentage?: number
+  } = {},
+): number | undefined {
   if (contextWindow === undefined || !Number.isFinite(contextWindow) || contextWindow <= 0) {
     return undefined
   }
-  return Math.min(64_000, Math.max(8_000, Math.round(contextWindow * 0.05)))
+  return deriveProtectedTailTokenTarget({
+    contextLimit: contextWindow,
+    executeThresholdPercentage: options.executeThresholdPercentage ?? 65,
+    usagePercentage: options.usagePercentage ?? 0,
+  }).N
 }
 
 /**
@@ -103,9 +127,14 @@ export function reclaimForEmergency(
   contextWindow?: number,
   /** #731: whole-surface token estimate (all nodes); without it the guard is off. */
   surfaceTokensEstimate?: number,
+  /** Current usage, which the protected-tail target scales down against. */
+  usagePercentage?: number,
 ): EmergencyReclaimResult {
   const tagged = nodes.filter(node => node.tagNumber !== undefined && !node.isPlaceholder)
-  const windowTokens = protectionWindowTokens(contextWindow)
+  const windowTokens = protectionWindowTokens(contextWindow, {
+    executeThresholdPercentage: policy.executeThreshold,
+    ...usagePercentage === undefined ? {} : { usagePercentage },
+  })
 
   // Which nodes survive. Two independent floors, and the WIDER one wins:
   //

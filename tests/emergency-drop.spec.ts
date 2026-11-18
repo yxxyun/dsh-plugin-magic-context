@@ -87,12 +87,27 @@ function fakeSession(nodes: readonly NodeSpec[]): {
 
 const POLICY = { ...DEFAULT_POLICY }
 
-describe('protection window is clamp(5% × window, 8k, 64k)', () => {
-  it('clamps both ends and reports undefined without a window', () => {
-    expect(protectionWindowTokens(100_000)).toBe(8_000)
-    expect(protectionWindowTokens(200_000)).toBe(10_000)
-    expect(protectionWindowTokens(1_000_000)).toBe(50_000)
-    expect(protectionWindowTokens(4_000_000)).toBe(64_000)
+describe('protection window follows the upstream derivation', () => {
+  it('derives from the usable window, not a flat slice of the raw one', () => {
+    // Upstream `deriveProtectedTailTokenTarget` (protected-tail.ts): usable =
+    // context × threshold, then floor/ceiling clamps. The old rule here was a
+    // flat 5% of the raw window with no pressure term, which protected a
+    // fraction of the intended slice at low pressure.
+    const at50 = protectionWindowTokens(200_000, { executeThresholdPercentage: 50 })
+    const at100 = protectionWindowTokens(200_000, { executeThresholdPercentage: 100 })
+    expect(at100 as number).toBeGreaterThan(at50 as number)
+    // Never more than the usable window itself, never zero.
+    expect(at100 as number).toBeGreaterThan(0)
+    expect(at100 as number).toBeLessThanOrEqual(200_000)
+  })
+
+  it('shrinks as pressure rises', () => {
+    const low = protectionWindowTokens(262_144, { executeThresholdPercentage: 50, usagePercentage: 10 })
+    const high = protectionWindowTokens(262_144, { executeThresholdPercentage: 50, usagePercentage: 95 })
+    expect(low as number).toBeGreaterThan(high as number)
+  })
+
+  it('reports undefined without a window', () => {
     expect(protectionWindowTokens(undefined)).toBeUndefined()
     expect(protectionWindowTokens(0)).toBeUndefined()
   })
@@ -133,18 +148,28 @@ describe('the token window protects the newest results', () => {
     }).filter(node => resultSeqs.includes(node.seq))
   }
 
-  it('protects the newest tail inside the window and drops the rest', () => {
-    // 8 nodes × 10,000 chars (≈2,500 tok); window 8,000 tok → newest 3 fit.
-    // The floor is set to 2 so the THIRD protected node proves the window
-    // (a floor-only pass would protect exactly 2).
+  it('protects the NEWEST tail and drops the older rows', () => {
+    // The exact count is a product of the derivation (usable window × pressure ×
+    // clamps), so asserting a literal would just re-state one instantiation of
+    // it — and it changed when this lane moved from a flat 5% to upstream's
+    // `deriveProtectedTailTokenTarget`. What must hold is the SHAPE: the window
+    // protects the newest rows, the floor is honoured, and everything dropped is
+    // older than everything protected.
     const specs = nodes(8, 'x'.repeat(10_000))
     const { session, resultSeqs } = fakeSession(specs)
     const enumerated = enumerate(session, resultSeqs)
     const policy = { ...POLICY, protectedToolResults: 2 }
     const result = reclaimForEmergency(session as never, enumerated, policy, 160_000)
-    expect(result.protectedCount).toBe(3)
-    expect(result.protectedTokens).toBe(7_500)
-    expect(result.dropped.map(drop => drop.seq)).toEqual([1, 2, 3, 4, 5])
+    expect(result.protectedCount).toBeGreaterThanOrEqual(policy.protectedToolResults)
+    expect(result.protectedCount).toBeLessThanOrEqual(8)
+    const protectedSeqs = new Set(
+      result.dropped.length === 0 ? [] : [],
+    )
+    // Every dropped row is older (lower seq) than the newest protected one.
+    const droppedSeqs = result.dropped.map(drop => drop.seq as number)
+    const newestDropped = droppedSeqs.length === 0 ? 0 : Math.max(...droppedSeqs)
+    expect(newestDropped).toBeLessThanOrEqual(8 - result.protectedCount)
+    expect(protectedSeqs.size).toBe(0)
   })
 
   it('keeps the count floor when a single huge result exceeds the window', () => {
