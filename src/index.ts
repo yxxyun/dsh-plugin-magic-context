@@ -71,6 +71,7 @@ import type { SessionQueryReadLike } from './core/session-history.ts'
 import { ReduceNudgeTracker } from './dsh/reduce-guidance.ts'
 import { registerCtxStatusCommand } from './dsh/status-command.ts'
 import { registerCtxRecompCommand } from './dsh/recomp.ts'
+import { registerCtxFlushCommand } from './dsh/flush-command.ts'
 import { registerCtxWrapupCommand } from './dsh/wrapup.ts'
 import { registerCtxGlobalCommand, registerCtxProfileCommand } from './dsh/command-surface.ts'
 import { reviewGlobalCandidates, type GlobalReviewAsker } from './dsh/global-review.ts'
@@ -1089,7 +1090,9 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
       ...llm === undefined ? {} : { llm },
       activeRoute: historianRouteOf,
     })
-    ctx.logger.info('magic-context dsh adapter: /ctx-status and /ctx-recomp registered')
+    // Upstream `execute-flush.ts`: settle the queue without waiting for a band.
+    registerCtxFlushCommand(ctx, { stores, policy: activePolicy })
+    ctx.logger.info('magic-context dsh adapter: /ctx-status, /ctx-flush and /ctx-recomp registered')
     // The global-domain surface rides the same gate: with Magic Context's
     // dashboard gone these commands ARE the operating surface for the profile
     // queue and the domains.

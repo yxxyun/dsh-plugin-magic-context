@@ -34,6 +34,7 @@ import { effectiveForceThreshold } from '../core/escalation-bands.ts'
 import { DRAIN_FAILURE_BACKOFF_MS, reserveDrain, selectPerRunCap } from '../core/drain-budget.ts'
 import { resolvedEmergencyDrainLatch } from '../core/drain-latch.ts'
 import { dropsSuffice } from '../core/drop-projection.ts'
+import { landPendingDrops, type LandedDrops } from './drop-landing.ts'
 import { historianTriggerBudget, selectHistorianRange } from './historian.ts'
 import { historianFailureCount, shouldNoticeHistorianFailures } from './historian.ts'
 import {
@@ -739,60 +740,19 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
   }
 
   // 1. Queued ctx_reduce marks.
+  let landed: LandedDrops = { landed: [], retired: [], skippedSmall: 0, reclaimedTokens: 0, alreadyLanded: [] }
   try {
-    const toolNodes = enumerateSurfaceToolResults(input.session, callId =>
-      input.stores.getTag(input.sessionId, { kind: 'tool-result', callId }))
-    // Capture the pre-drop text BEFORE any replacement: rebuilding this map after
-    // the loop reads back the placeholder, so every drop estimated as 0 tokens
-    // and the reclaim accounting showed nothing (measured 2026-11-09: one record,
-    // 165 tags, estTokens 0).
-    const textBySeq = new Map(enumerateSurfaceNodes(input.session).map(node => [node.seq, node.text]))
-    // Newest RECENT_TOOL_SKELETON_WINDOW tool tags whose result is under
-    // SKELETON_REAL_INPUT_MAX_BYTES: too little to reclaim, too much to lose.
-    const newestToolTags = [...toolNodes]
-      .filter(candidate => candidate.tagNumber !== undefined)
-      .sort((left, right) => (right.tagNumber ?? 0) - (left.tagNumber ?? 0))
-      .slice(0, RECENT_TOOL_SKELETON_WINDOW)
-    const smallFloor = input.policy.dropSmallResultFloor > 0
-      ? Math.min(input.policy.dropSmallResultFloor, SKELETON_REAL_INPUT_MAX_BYTES)
-      : 0
-    const recentSmallToolTags = new Set(
-      smallFloor === 0
-        ? []
-        : newestToolTags
-            .filter(candidate => (textBySeq.get(candidate.seq)?.length ?? 0) <= smallFloor)
-            .map(candidate => candidate.tagNumber as number),
-    )
-    let skippedSmall = 0
-    for (const tag of input.stores.listPendingDrops(input.sessionId)) {
-      const node = toolNodes.find(candidate => candidate.tagNumber === tag)
-      if (node === undefined) {
-        // Target gone. A queued drop can only land on a live tool result; the
-        // node is absent when its message was folded into a compartment (the
-        // surface carries `[compacted §Cn§]` instead) or when the call id no
-        // longer maps to a tag. Every pass retried it forever otherwise, and
-        // the dashboard's pending count could only grow.
-        input.stores.retireDrop(input.sessionId, tag)
-        retiredDrops.push(tag)
-        continue
-      }
-      if (node.isPlaceholder) {
-        input.stores.markDropLanded(input.sessionId, tag, node.seq)
-        continue
-      }
-      // Upstream `planNewToolDrop` (apply-operations.ts:132) keeps a SMALL result
-      // inside the newest-call window instead of dropping it: the reclaim is a
-      // few hundred bytes, while the reader loses a step's actual output. It is
-      // a protection, not an optimisation — dropping these is how a session ends
-      // up "drained" with nothing to show for it.
-      if (recentSmallToolTags.has(tag)) {
-        skippedSmall += 1
-        continue
-      }
-      const landedSeq = replaceToolResultContent(input.session, node.seq, dropPlaceholderContent(tag))
-      input.stores.markDropLanded(input.sessionId, tag, landedSeq)
-      landedDrops.push(tag)
-    }
+    landed = landPendingDrops({
+      session: input.session,
+      sessionId: input.sessionId,
+      stores: input.stores,
+      policy: input.policy,
+    })
+    landedDrops.push(...landed.landed)
+    retiredDrops.push(...landed.retired)
+    // A store fault must reach the pass's terminal error row, exactly as it did
+    // when this scan lived inline here.
+    if (landed.error !== undefined) throw landed.error
     if (retiredDrops.length > 0) {
       input.journal?.info(
         'drop-retired',
@@ -809,11 +769,7 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
         {
           tags: landedDrops,
           count: landedDrops.length,
-          estTokens: landedDrops.reduce((total, tag) => {
-            const node = toolNodes.find(candidate => candidate.tagNumber === tag)
-            const text = node === undefined ? undefined : textBySeq.get(node.seq)
-            return total + (text === undefined ? 0 : estimateTokens(text))
-          }, 0),
+          estTokens: landed.reclaimedTokens,
         },
         input.sessionId,
       )
@@ -848,7 +804,13 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
       // #731: pass the whole-surface estimate so the drop lane can refuse a
       // reclaim that cannot fit the request even at zero tool results.
       const reclaim = reclaimForEmergency(
-        input.session, toolNodes, input.policy, input.contextWindow, surfaceTokens(input.session))
+        input.session,
+        enumerateSurfaceToolResults(input.session, callId =>
+          input.stores.getTag(input.sessionId, { kind: 'tool-result', callId })),
+        input.policy,
+        input.contextWindow,
+        surfaceTokens(input.session),
+      )
       forceDropped = reclaim.dropped.length
       if (forceDropped > 0) {
         input.journal?.warn(
