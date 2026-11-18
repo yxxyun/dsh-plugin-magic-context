@@ -248,14 +248,36 @@ function composeBaselineContent(node: SurfaceNode, block: string): ContentBlock[
 }
 
 /** Split stored compartments into the frozen m[0] set and the m[1] delta. */
+/**
+ * The m[0] compartment boundary to persist (upstream `cachedM0MaxCompartmentSeq`).
+ * 0 when m[0] holds nothing, which the loader reads back as "no boundary" and the
+ * split then falls back to the frozen timestamp.
+ */
+function highestCompartmentId(compartments: readonly Compartment[]): number {
+  let highest = 0
+  for (const compartment of compartments) {
+    if (compartment.compartmentId > highest) highest = compartment.compartmentId
+  }
+  return highest
+}
+
 export function splitBaselineSets(
   compartments: readonly Compartment[],
   state: BaselineState | undefined,
 ): { baseline: Compartment[]; delta: Compartment[] } {
   if (state === undefined) return { baseline: [...compartments], delta: [] }
+  // Sequence boundary (upstream `cachedM0MaxCompartmentSeq`), not a timestamp.
+  // A time boundary is ambiguous for two compartments created in the same
+  // millisecond and inverts on a clock step backwards — which silently rewrites
+  // the frozen prefix, the one thing m[0] must never do. Rows written before
+  // v17 carry no sequence, so they fall back to the frozen timestamp once.
+  const boundary = state.maxCompartmentId
+  const inBaseline = boundary === undefined
+    ? (compartment: Compartment): boolean => compartment.createdAt <= state.frozenAt
+    : (compartment: Compartment): boolean => compartment.compartmentId <= boundary
   return {
-    baseline: compartments.filter(compartment => compartment.createdAt <= state.frozenAt),
-    delta: compartments.filter(compartment => compartment.createdAt > state.frozenAt),
+    baseline: compartments.filter(inBaseline),
+    delta: compartments.filter(compartment => !inBaseline(compartment)),
   }
 }
 
@@ -615,6 +637,7 @@ function refreshBaseline(
         ...input.route === undefined ? {} : { provider: input.route.provider, model: input.route.model },
         ...memories === undefined ? {} : { memoriesDigest: memories.digest },
         renderEpoch: BASELINE_RENDER_EPOCH,
+        maxCompartmentId: highestCompartmentId(sets.baseline),
       })
     }
     return false
@@ -637,6 +660,7 @@ function refreshBaseline(
     ...input.route === undefined ? {} : { provider: input.route.provider, model: input.route.model },
     ...memories === undefined ? {} : { memoriesDigest: memories.digest },
     renderEpoch: BASELINE_RENDER_EPOCH,
+    maxCompartmentId: highestCompartmentId(sets.baseline),
   })
   input.journal?.info(
     'baseline',

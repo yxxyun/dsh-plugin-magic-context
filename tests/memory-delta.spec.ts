@@ -724,7 +724,7 @@ describe('baseline rendering: the delta lane stays inside m[1] (A7)', () => {
 describe('adapter store: the per-session mutation cursor (schema v6)', () => {
   it('round-trips the cursor and the epoch fingerprint', () => {
     const dataDir = tempDir('mc-delta-store-')
-    expect(SCHEMA_VERSION).toBe(16)
+    expect(SCHEMA_VERSION).toBe(17)
     const stores = openStores(dataDir)
     try {
       stores.saveBaselineState({
@@ -805,7 +805,7 @@ describe('adapter store: the per-session mutation cursor (schema v6)', () => {
     const check = new DatabaseSync(dbPath, { readOnly: true })
     try {
       const version = check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }
-      expect(version.value).toBe('16')
+      expect(version.value).toBe('17')
       const names = new Set(
         (check.prepare('PRAGMA table_info(baseline_state)').all() as Array<{ name: string }>).map(row => row.name),
       )

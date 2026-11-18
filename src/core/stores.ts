@@ -23,7 +23,7 @@ import { openCompartmentLease, type CompartmentLease, type LeaseDatabase } from 
 import { openDreamLease, type DreamLease, type DreamLeaseOptions } from './dream-lease.ts'
 import type { TagRecord, TagTarget, UsageRecord } from './types.ts'
 
-export const SCHEMA_VERSION = 16
+export const SCHEMA_VERSION = 17
 
 /** The m[0]/m[1] baseline identity for one session. */
 export interface BaselineState {
@@ -44,6 +44,12 @@ export interface BaselineState {
    * keeps reporting a difference that is not the session's.
    */
   readonly renderEpoch?: number
+  /**
+   * Highest compartment id frozen into m[0] (upstream `cachedM0MaxCompartmentSeq`).
+   * The split is by SEQUENCE, not time: a timestamp boundary is ambiguous for two
+   * compartments created in the same millisecond and inverts on a clock step back.
+   */
+  readonly maxCompartmentId?: number
   /** Identity of the injected project-memory digest (change ⇒ HARD). */
   readonly memoriesDigest?: string
   /**
@@ -1154,6 +1160,22 @@ const MIGRATIONS: readonly Migration[] = [
       db.exec('ALTER TABLE baseline_state ADD COLUMN render_epoch INTEGER NOT NULL DEFAULT 0')
     },
   },
+  {
+    // v17: the m[0] boundary is a compartment SEQUENCE, not a timestamp.
+    //
+    // Upstream marks it with `cachedM0MaxCompartmentSeq` (inject-compartments.ts:972)
+    // and this adapter used `createdAt <= frozenAt`. Timestamps make the split
+    // ambiguous exactly where it matters: two compartments created in the same
+    // millisecond land on either side depending on iteration order, and a clock
+    // step backwards moves compartments out of m[0] on the next render — a silent
+    // rewrite of the frozen prefix, which is the one thing m[0] must not do.
+    version: 17,
+    up: (db) => {
+      const columns = db.prepare('PRAGMA table_info(baseline_state)').all() as Array<{ name: string }>
+      if (columns.some(column => column.name === 'max_compartment_id')) return
+      db.exec('ALTER TABLE baseline_state ADD COLUMN max_compartment_id INTEGER NOT NULL DEFAULT 0')
+    },
+  },
 ]
 
 /**
@@ -1603,6 +1625,7 @@ export function openStores(dataDir: string): AdapterStores {
     max_memory_mutation_id: number | null; project_epoch_fingerprint: string | null
     profile_watermark: number | null; profile_m0_digest: string | null
     render_epoch: number | null
+    max_compartment_id: number | null
     updated_at: number
   }
 
@@ -1625,6 +1648,9 @@ export function openStores(dataDir: string): AdapterStores {
       ...row.profile_watermark === null ? {} : { profileWatermark: row.profile_watermark },
       ...row.profile_m0_digest === null ? {} : { profileM0Digest: row.profile_m0_digest },
       ...row.render_epoch === null || row.render_epoch === 0 ? {} : { renderEpoch: row.render_epoch },
+      ...row.max_compartment_id === null || row.max_compartment_id === 0
+        ? {}
+        : { maxCompartmentId: row.max_compartment_id },
       updatedAt: row.updated_at,
     }
   }
@@ -1632,8 +1658,8 @@ export function openStores(dataDir: string): AdapterStores {
   const saveBaselineState = (state: BaselineState): void => {
     db.prepare(
       'INSERT INTO baseline_state(session_id, epoch, node_seq, provider, model, frozen_at, memories_digest, '
-        + 'max_memory_id, max_memory_mutation_id, project_epoch_fingerprint, profile_watermark, profile_m0_digest, render_epoch, updated_at) '
-        + 'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) '
+        + 'max_memory_id, max_memory_mutation_id, project_epoch_fingerprint, profile_watermark, profile_m0_digest, render_epoch, max_compartment_id, updated_at) '
+        + 'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) '
         + 'ON CONFLICT(session_id) DO UPDATE SET epoch = excluded.epoch, node_seq = excluded.node_seq, '
         + 'provider = excluded.provider, model = excluded.model, frozen_at = excluded.frozen_at, '
         + 'memories_digest = excluded.memories_digest, max_memory_id = excluded.max_memory_id, '
@@ -1656,6 +1682,7 @@ export function openStores(dataDir: string): AdapterStores {
       state.profileWatermark ?? null,
       state.profileM0Digest ?? null,
       state.renderEpoch ?? 0,
+      state.maxCompartmentId ?? 0,
       state.updatedAt,
     )
   }
