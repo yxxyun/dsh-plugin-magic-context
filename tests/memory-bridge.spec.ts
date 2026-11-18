@@ -187,7 +187,7 @@ describe('memory bridge (read-only recall)', () => {
     try {
       const recall = bridge.recall({ project: dir, budgetTokens: 8000, limit: 40, now: 1000 })
       expect(recall!.rows.map(row => row.content)).toEqual(['dir identified'])
-      expect(renderMemoryLine(recall!.rows[0]!)).toBe('- [CONSTRAINTS] dir identified')
+      expect(renderMemoryLine(recall!.rows[0]!)).toBe('- #1 [CONSTRAINTS]: dir identified')
       expect(recall!.lines[0]).toContain('dir identified')
     } finally {
       bridge.close()

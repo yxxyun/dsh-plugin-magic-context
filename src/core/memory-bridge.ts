@@ -472,10 +472,23 @@ function categoryRank(category: string): number {
   return memoryCategoryOrder(category)
 }
 
-/** Render one memory as a baseline line (category-tagged, MC render order). */
+/**
+ * Render one memory as a baseline line.
+ *
+ * The `#<id>` is NOT decoration: `<memory-updates>` addresses corrections by id
+ * (`<superseded id="12" by="14"/>`), and upstream's line format carries it for
+ * exactly that reason ("ids exist on the m0/m1 wire so the corrections block can
+ * point at a row the model has seen"). Without it every correction pointed at a
+ * number the model never saw.
+ *
+ * Upstream `renderMemoryLineV2` (inject-compartments.ts:2327) renders
+ * `#<id>: <content>` and gets the category from the surrounding group. This
+ * adapter still renders a flat list, so the category stays on the line — the
+ * grouping is a separate change (it needs a structured payload, not a string).
+ */
 export function renderMemoryLine(row: MemoryRow): string {
-  const badge = row.permanent ? ', permanent' : ''
-  return `- [${row.category || 'MEMORY'}${badge}] ${row.content.replace(/\s+/g, ' ').trim()}`
+  const badge = row.permanent ? ' (permanent)' : ''
+  return `- #${String(row.id)} [${row.category || 'MEMORY'}]${badge}: ${row.content.replace(/\s+/g, ' ').trim()}`
 }
 
 /** Render one profile row as a baseline line. */
@@ -1155,8 +1168,14 @@ export function openMemoryBridge(options: MemoryBridgeOptions): MemoryBridge {
           // MC budgets the additions at 25% of the memory injection budget.
           const deltaSelected = pick(additions, Math.max(1, Math.floor(request.budgetTokens * 0.25)))
           if (poolSelected.length === 0 && deltaSelected.length === 0) return undefined
+          // Upstream `memoryRenderOrder` (:1286): category priority, then the
+          // category name for unknown ones, then id. `updatedAt` is deliberately
+          // NOT a key — it changes on every touch, so the same set of memories
+          // would render in a different order after an unrelated write.
           const order = (selected: readonly MemoryRow[]): MemoryRow[] => [...selected].sort((left, right) =>
-            categoryRank(left.category) - categoryRank(right.category) || right.updatedAt - left.updatedAt)
+            categoryRank(left.category) - categoryRank(right.category)
+            || (left.category < right.category ? -1 : left.category > right.category ? 1 : 0)
+            || left.id - right.id)
           const orderedPool = order(poolSelected)
           const orderedAdditions = order(deltaSelected)
           // Digest covers the m[0] pool ONLY: a new memory may not bust the cache.
