@@ -857,6 +857,8 @@ let latestSystemPromptFingerprint: string | undefined
  * approximates the real request, which is what the accuracy report is measuring.
  */
 let latestSystemPromptTokens: number | undefined
+/** One-shot: the observation path is best-effort, but its failure is not silent. */
+let systemPromptObservationWarned = false
 
 /**
  * MD5 of the rendered system prompt — the same digest and the same material the
@@ -909,8 +911,16 @@ export function injectReduceGuidance(deps: PreStepDeps): void {
       text: (assembly: unknown) => {
         try {
           latestSystemPromptFingerprint = fingerprintOf(assembly)
-        } catch {
-          // Observation only: a fingerprint failure must not cost the turn.
+        } catch (fingerprintError) {
+          // Observation only: a fingerprint failure must not cost the turn. But
+          // say it ONCE — a silent catch here is why `system_hash` sat at null in
+          // every baseline row while the code looked correct.
+          if (!systemPromptObservationWarned) {
+            systemPromptObservationWarned = true
+            ctx.logger.warn(
+              `magic-context: system prompt observation failed (continuing): ${errText(fingerprintError)}`,
+            )
+          }
         }
         try {
           const agent = (assembly as { agent?: { session?: Session } }).agent
