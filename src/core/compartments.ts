@@ -434,9 +434,6 @@ export function renderBaseline(input: {
   if (profileLines.length > 0) {
     sections.push(['<user-profile>', ...profileLines, '</user-profile>'].join('\n'))
   }
-  if (input.memories.length > 0) {
-    sections.push(['<project-memories>', ...input.memories, '</project-memories>'].join('\n'))
-  }
   if (input.baseline.length > 0) {
     const ordered = [...input.baseline].sort((left, right) => left.createdAt - right.createdAt)
     // Positional age is measured INSIDE m[0] only.
@@ -475,6 +472,15 @@ export function renderBaseline(input: {
       }
     }
     if (rendered.length > 0) sections.push(['<compartment-baseline>', ...rendered, '</compartment-baseline>'].join('\n'))
+  }
+  // Upstream m[0] order (`renderM0`, inject-compartments.ts:2408-2442):
+  // project-docs -> user-profile -> session-history -> project-memory -> mural.
+  // Memory comes AFTER the history block, not before it: the summary of what
+  // happened reads as the session's own voice, and the standing instructions
+  // follow it. The previous order put the memories first, which made the digest
+  // of m[0] depend on which of the two blocks was non-empty.
+  if (input.memories.length > 0) {
+    sections.push(['<project-memories>', ...input.memories, '</project-memories>'].join('\n'))
   }
   // m[1] begins here: every section below is delta-shaped and may change without
   // touching a single byte of the sections above (the cache-prefix invariant).
