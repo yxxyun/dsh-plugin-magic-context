@@ -180,9 +180,21 @@ provider_overflow + 本轮没折 → 拒绝」这一条。disarm 需要可信测
    `sourceEventSeqs` 追溯），不可逆；上游只是记 id、渲染时跳过。做之前要先实测
    thinking 在本地会话里的 token 占比，否则是拿不可逆换未知收益。
 
-2. **`transform-postprocess-phase` 剩余部分**（5,307 行）：本地对应分散在
-   `management-pass` 与 `pre-step`，DSH 的 surface 模型与 OpenCode 的消息数组不同，
-   逐行核对无意义——需要按行为清单抽查。
+2. **`transform-postprocess-phase` 剩余部分**（5,307 行）：已按**导出函数**逐项分类
+   （见下），未做逐行比对——两边架构不同，逐行没有意义。
+
+### `transform-postprocess-phase` 逐项分类
+
+| 导出 | 判定 |
+|---|---|
+| `evaluateEmergencyFailClosed` | **已移植**（f726f39 + 2895e72） |
+| `freezeReasoningOnBustingPass` / `ProactiveThinkingStrip` | **待实测**：见缺口 1 |
+| `servesThinkingBlock` / `firstServedDivergenceIndex` / `ThinkingBindingRecoveryApplication` | **平台差异**：OpenCode 的 thinking 块跨轮连续性协商。DSH 的 session 自己持有 reasoning 块，不做「服务/不服务」的逐轮判断 |
+| `PendingCompactionMarker` / `reconcileMarkerRepresentation` / `clearPendingCompactionMarkerAfterSuccessfulDrain` / `CompactionMarkerStrategy` | **平台差异**：这些解决的是「transform 阶段注入可能失败、要重试直到成功」。DSH 用 `replaceSurfaceRange` 做持久原子替换，没有「待注入」这个中间态 |
+| `isSyntheticHeadMessage` | **平台差异**：识别 OpenCode 的 synthetic head message。DSH 的合成节点靠 `source.kind`（`magic-context` / `compact-checkpoint`）区分，不需要形状嗅探 |
+| `resetDegradedCacheCount` | **平台差异**：OpenCode 侧对「缓存能力降级」的计数。DSH 没有这个概念 |
+| `rustMode*`（约 12 个） | **平台差异**：Rust 模块桥 |
+| `FinalizeMessageRepresentationOptions` / `ConfirmedAbortClient` / `PostTransformPhaseResult` | 数据结构，随各自的行为一起处置 |
 
 ## 结论
 
