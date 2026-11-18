@@ -56,7 +56,19 @@
 | `auto-search-worker-client.ts`（976） | `memory-search.ts` + 工具面 | 上游是 worker 进程 |
 | `system-prompt-hash.ts`（882） | — | 用于检测 system prompt 变化触发 HARD；本地用 `renderEpoch` + 路由变化，**未实现 system hash** |
 
+## 已移植但未接线
+
+| 行为 | 上游位置 | 本地 | 状态 |
+|---|---|---|---|
+| 紧急 fail-closed 判定 | `transform-postprocess-phase.ts:1901` | `core/emergency-fail-closed.ts`（10 条测试） | **纯函数已完成，未接入 pre-step**：DSH 的 pre-step 能否中止一个 turn 尚未确认 |
+
 ## 已知缺口
+
+0. **`freezeReasoningOnBustingPass`**（`transform-postprocess-phase.ts:590`）：缓存必然
+   失效的那一轮把 assistant 的 reasoning 块剥掉。thinking 文本通常很大，缓存既然已废，
+   剥掉是纯收益。**未做**：本地 `replaceSurfaceRange` 是真的替换（原内容只能靠
+   `sourceEventSeqs` 追溯），不可逆；上游只是记 id、渲染时跳过。做之前要先实测
+   thinking 在本地会话里的 token 占比，否则是拿不可逆换未知收益。
 
 1. **`system-prompt-hash.ts`**：上游把 system prompt 的哈希也算进 HARD 重建条件（system prompt 变了，缓存必然失效）。本地只看路由、记忆 digest、epoch、渲染戳。DSH 的 system prompt 由宿主拼装，插件拿不到稳定哈希 —— 但**可以**在 pre-step 里对当前 system prompt 文本取哈希。这是真实缺口，下一轮评估。
 
