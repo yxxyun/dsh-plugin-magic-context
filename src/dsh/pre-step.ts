@@ -769,8 +769,11 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
         const accuracy = summarise(pairEstimateSamples(
           stores.listJournal({ sessionId, kinds: ['pass'], limit: 200 }).map(entry => ({
             at: entry.at,
-            estimated: typeof (entry.data as { estSurfaceTokens?: unknown } | undefined)?.estSurfaceTokens === 'number'
-              ? (entry.data as { estSurfaceTokens: number }).estSurfaceTokens
+            // `estWireTokens` only: the older key has meant three different
+            // things over this project's life, so a calibration built on it
+            // mixes eras (see the note where the key is written).
+            estimated: typeof (entry.data as { estWireTokens?: unknown } | undefined)?.estWireTokens === 'number'
+              ? (entry.data as { estWireTokens: number }).estWireTokens
               : undefined,
           })),
           stores.listUsage(sessionId).map(record => ({

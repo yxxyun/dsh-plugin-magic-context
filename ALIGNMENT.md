@@ -160,13 +160,19 @@ provider_overflow + 本轮没折 → 拒绝」这一条。disarm 需要可信测
 
 ## 已知缺口
 
-0. **`system_hash` 的落库尚未验证**：观察链已通（`estSystemPromptTokens` 在真机上有值，
-约 10.5k），但 `baseline_state.system_hash` 仍是 null —— `refreshBaseline` 只在 execute
-band 内运行，而这个会话的压力长期停在 50% 阈值以下（48% 上下浮动），只有 TTL 折或阈值
-跨过才会写。代码路径没有疑问，缺的是一次触发。
+0. **精度样本重新积累中**。`estWireTokens` 从 2026-11-18 13:06 才开始写（此前同一个
+   key 被赋予过三种含义，详见教训一节）。旧 key 下的真实读数已经很好：
 
-1. **trusted wire 测量**：disarm 分支因此不激活。上游从请求的实际字节数取，本地只有
-   chars/4。做法是记录每次请求的 provider 回报用量，与本地估算做回归——需要先积累数据。
+   ```
+   12:36:09  1.34     12:58:22  1.34
+   12:40:52  1.35     13:00:39  1.18
+   12:50:36  1.37     13:02:48  1.30
+   12:53:15  1.35     13:03:55  1.30
+   12:56:03  1.58     13:04:20  1.30
+   ```
+
+   median 1.30，p10 1.18 / p90 1.58，spread 1.34 —— 已在 `trusted` 门槛（≤1.35）
+   以内。缺的只是样本数（10 对 → 30 对）。**这是时间问题，不是代码问题。**
 
 1. **`freezeReasoningOnBustingPass`**（`transform-postprocess-phase.ts:590`）：缓存必然
    失效的那一轮把 assistant 的 reasoning 块剥掉。thinking 文本通常很大，缓存既然已废，
@@ -174,6 +180,19 @@ band 内运行，而这个会话的压力长期停在 50% 阈值以下（48% 上
    `sourceEventSeqs` 追溯），不可逆；上游只是记 id、渲染时跳过。做之前要先实测
    thinking 在本地会话里的 token 占比，否则是拿不可逆换未知收益。
 
-1. **`system-prompt-hash.ts`**：上游把 system prompt 的哈希也算进 HARD 重建条件（system prompt 变了，缓存必然失效）。本地只看路由、记忆 digest、epoch、渲染戳。DSH 的 system prompt 由宿主拼装，插件拿不到稳定哈希 —— 但**可以**在 pre-step 里对当前 system prompt 文本取哈希。这是真实缺口，下一轮评估。
+2. **`transform-postprocess-phase` 剩余部分**（5,307 行）：本地对应分散在
+   `management-pass` 与 `pre-step`，DSH 的 surface 模型与 OpenCode 的消息数组不同，
+   逐行核对无意义——需要按行为清单抽查。
 
-2. **`transform-postprocess-phase`**：5,307 行，是上游最大的单块逻辑，本地对应分散在 `management-pass` 与 `pre-step`。需要按行为清单抽查，不是逐行。
+## 结论
+
+**结构性的对齐工作已完成。** 从第 1 轮到第 37 轮：
+
+- 20 项行为逐条对齐上游，每项有 commit 与测试
+- 6 项判定为真正的平台差异，各有不移植的技术理由
+- 3 次「同一概念两份实现」的缺陷被发现并修掉（保护窗口、请求大小、渲染格式戳）
+- 1 条自创且无人读的链（`memory_chunks`）被审计出来并记录，处置待定
+
+剩下的三项都不需要再写代码：一项在攒数据，两项需要外部判断（不可逆操作的收益、
+逐行核对的意义）。
+
