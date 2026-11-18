@@ -827,6 +827,21 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
       // publish failure falls through to the drop lane, never skips it. No
       // baseline refresh and no fact promotion here — both belong to the
       // next execute pass (facts stay durable in the compartment row).
+      // Arm the session for emergency recovery BEFORE reclaiming. Upstream keeps
+      // this beside the detected limit (`needsEmergencyRecovery` +
+      // `emergencyRecoveryOrigin`, storage-meta-persisted.ts:2138) because the
+      // fail-closed gate refuses a request only when the arming came from a
+      // provider overflow — an untyped flag may not abort. Best-effort: the
+      // reclaim below must run whether or not this write lands.
+      try {
+        stores.putDrainState(sessionId, {
+          ...stores.getDrainState(sessionId),
+          overflowArmedAt: Date.now(),
+          overflowOrigin: 'provider_overflow',
+        })
+      } catch (armingError) {
+        ctx.logger.warn(`magic-context: arming emergency recovery failed: ${errText(armingError)}`)
+      }
       const publishedIds: number[] = []
       const publishOnce = (): void => {
         const bank = publishReadyCompartments({

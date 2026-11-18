@@ -23,7 +23,7 @@ import { openCompartmentLease, type CompartmentLease, type LeaseDatabase } from 
 import { openDreamLease, type DreamLease, type DreamLeaseOptions } from './dream-lease.ts'
 import type { TagRecord, TagTarget, UsageRecord } from './types.ts'
 
-export const SCHEMA_VERSION = 18
+export const SCHEMA_VERSION = 19
 
 /** The m[0]/m[1] baseline identity for one session. */
 export interface BaselineState {
@@ -1196,6 +1196,26 @@ const MIGRATIONS: readonly Migration[] = [
       db.exec('ALTER TABLE baseline_state ADD COLUMN system_hash TEXT')
     },
   },
+  {
+    // v19: emergency arming, per session.
+    //
+    // Upstream keeps `needsEmergencyRecovery` + `emergencyRecoveryOrigin` beside
+    // the detected limit (storage-meta-persisted.ts:2138). The pairing matters:
+    // the emergency fail-closed gate refuses a request only when the session is
+    // armed BY A PROVIDER OVERFLOW, so an origin-less flag may not abort. The
+    // limit itself lives in `meta` keyed by provider+model, which also gives the
+    // model-match rule for free — a limit detected on one model says nothing
+    // about another.
+    version: 19,
+    up: (db) => {
+      const columns = db.prepare('PRAGMA table_info(drain_state)').all() as Array<{ name: string }>
+      if (columns.some(column => column.name === 'overflow_armed_at')) return
+      db.exec(
+        'ALTER TABLE drain_state ADD COLUMN overflow_armed_at INTEGER NOT NULL DEFAULT 0',
+      )
+      db.exec('ALTER TABLE drain_state ADD COLUMN overflow_origin TEXT')
+    },
+  },
 ]
 
 /**
@@ -1215,9 +1235,20 @@ export interface DrainStateRow {
   readonly latchActiveSince: number
   /** Epoch ms of the last failed drain run; 0 = none. */
   readonly failureAt: number
+  /**
+   * Epoch ms the session was armed for emergency recovery; 0 = unarmed.
+   * Upstream `needsEmergencyRecovery` (storage-meta-persisted.ts:2142).
+   */
+  readonly overflowArmedAt?: number
+  /**
+   * Why it was armed. The fail-closed gate refuses a request only when the arming
+   * came from a `provider_overflow` — an untyped (legacy) flag may not abort.
+   */
+  readonly overflowOrigin?: 'provider_overflow' | 'proactive_model_shrink'
 }
 
 export const EMPTY_DRAIN_STATE: DrainStateRow = {
+  overflowArmedAt: 0,
   windowStartedAt: 0,
   spentTokens: 0,
   latchActiveSince: 0,
@@ -1442,10 +1473,17 @@ export function openStores(dataDir: string): AdapterStores {
   const getDrainState = (sessionId: string): DrainStateRow => {
     try {
       const row = db.prepare(
-        'SELECT window_started_at, spent_tokens, latch_active_since, failure_at '
-          + 'FROM drain_state WHERE session_id = ?',
+        'SELECT window_started_at, spent_tokens, latch_active_since, failure_at, '
+          + 'overflow_armed_at, overflow_origin FROM drain_state WHERE session_id = ?',
       ).get(sessionId) as
-        | { window_started_at?: number; spent_tokens?: number; latch_active_since?: number; failure_at?: number }
+        | {
+          window_started_at?: number
+          spent_tokens?: number
+          latch_active_since?: number
+          failure_at?: number
+          overflow_armed_at?: number
+          overflow_origin?: string | null
+        }
         | undefined
       if (row === undefined) return EMPTY_DRAIN_STATE
       return {
@@ -1453,6 +1491,10 @@ export function openStores(dataDir: string): AdapterStores {
         spentTokens: typeof row.spent_tokens === 'number' ? row.spent_tokens : 0,
         latchActiveSince: typeof row.latch_active_since === 'number' ? row.latch_active_since : 0,
         failureAt: typeof row.failure_at === 'number' ? row.failure_at : 0,
+        overflowArmedAt: typeof row.overflow_armed_at === 'number' ? row.overflow_armed_at : 0,
+        ...row.overflow_origin === 'provider_overflow' || row.overflow_origin === 'proactive_model_shrink'
+          ? { overflowOrigin: row.overflow_origin }
+          : {},
       }
     } catch {
       // Accounting must never fail the turn that asked for it. A neutral state
@@ -1463,12 +1505,22 @@ export function openStores(dataDir: string): AdapterStores {
 
   const putDrainState = (sessionId: string, state: DrainStateRow): void => {
     db.prepare(
-      'INSERT INTO drain_state(session_id, window_started_at, spent_tokens, latch_active_since, failure_at) '
-        + 'VALUES(?, ?, ?, ?, ?) '
+      'INSERT INTO drain_state(session_id, window_started_at, spent_tokens, latch_active_since, failure_at, '
+        + 'overflow_armed_at, overflow_origin) '
+        + 'VALUES(?, ?, ?, ?, ?, ?, ?) '
         + 'ON CONFLICT(session_id) DO UPDATE SET window_started_at = excluded.window_started_at, '
         + 'spent_tokens = excluded.spent_tokens, latch_active_since = excluded.latch_active_since, '
-        + 'failure_at = excluded.failure_at',
-    ).run(sessionId, state.windowStartedAt, state.spentTokens, state.latchActiveSince, state.failureAt)
+        + 'failure_at = excluded.failure_at, overflow_armed_at = excluded.overflow_armed_at, '
+        + 'overflow_origin = excluded.overflow_origin',
+    ).run(
+      sessionId,
+      state.windowStartedAt,
+      state.spentTokens,
+      state.latchActiveSince,
+      state.failureAt,
+      state.overflowArmedAt ?? 0,
+      state.overflowOrigin ?? null,
+    )
   }
 
   const queueDrop = (sessionId: string, tagNumber: number, now: number): void => {    db.prepare(
