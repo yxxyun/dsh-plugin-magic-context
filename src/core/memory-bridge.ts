@@ -34,7 +34,7 @@ import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, normalize, resolve } from 'node:path'
 import { estimateTokens, MEMORY_VISIBILITY_SENTINEL, type MemoryMutationType, type MemoryUpdateLine } from './compartments.ts'
-import { memoryCategoryOrder } from './memory-categories.ts'
+import { memoryCategoryOrder, MEMORY_CATEGORY_PRIORITY } from './memory-categories.ts'
 import { scoreMemory, type MemoryRecallScoring } from './memory-scoring.ts'
 import { errText } from './types.ts'
 
@@ -482,6 +482,39 @@ function comparePriority(left: MemoryRow, right: MemoryRow): number {
 
 function categoryRank(category: string): number {
   return memoryCategoryOrder(category)
+}
+
+/**
+ * The historian's `<project-memory>` block (upstream `renderHistorianMemoryBlock`,
+ * inject-compartments.ts:301).
+ *
+ * Deliberately DIFFERENT from the agent-facing block: category-grouped
+ * `- <fact>` lines with NO memory ids, ordered by category priority, and
+ * categories outside the priority list are not rendered at all.
+ *
+ * Why no ids: the historian reads this block only for content-based dedup
+ * ("scan the existing facts and skip anything that overlaps") and for
+ * contradiction reporting. It never addresses a memory by id — the ids on the
+ * m[0] wire exist for `<memory-updates>` corrections, which the historian has no
+ * part in. Both lanes emit their own exact form on purpose.
+ */
+export function renderHistorianMemoryBlock(rows: readonly MemoryRow[]): string {
+  if (rows.length === 0) return ''
+  const byCategory = new Map<string, MemoryRow[]>()
+  for (const row of rows) {
+    const category = row.category || ''
+    const existing = byCategory.get(category)
+    if (existing === undefined) byCategory.set(category, [row])
+    else existing.push(row)
+  }
+  const body: string[] = []
+  for (const category of MEMORY_CATEGORY_PRIORITY) {
+    const group = byCategory.get(category)
+    if (group === undefined || group.length === 0) continue
+    body.push(`<${category}>`, ...group.map(row => `- ${row.content.replace(/\s+/g, ' ').trim()}`), `</${category}>`)
+  }
+  if (body.length === 0) return ''
+  return ['<project-memory>', ...body, '</project-memory>'].join('\n')
 }
 
 /**

@@ -24,6 +24,7 @@ import { PROFILE_M0_BUDGET_TOKENS, resolveIdentitySpec } from '../core/memory-br
 import type { MemoryFact } from '../core/memory-categories.ts'
 import { errText } from '../core/types.ts'
 import { estimateTokens } from '../core/compartments.ts'
+import { renderHistorianMemoryBlock } from '../core/memory-bridge.ts'
 import {
   DSH_EVENTS,
   type PreStepEnterDecision,
@@ -574,6 +575,13 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
               historian: {
                 llm,
                 ...generationRoute === undefined ? {} : { route: generationRoute },
+                // Semantic dedup input: the historian scans these facts and skips
+                // overlapping ones. `normalized_hash` only catches a verbatim
+                // repeat, so a fact restated in other words would become a second
+                // row without this block.
+                memoryBlock: () => memories === undefined
+                  ? undefined
+                  : renderHistorianMemoryBlock([...memories.rows, ...memories.newRows]),
               },
             },
           ...memoryRecall === undefined

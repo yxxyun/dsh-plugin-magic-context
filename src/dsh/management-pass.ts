@@ -106,7 +106,13 @@ export interface ManagementPassInput {
    */
   readonly historianBusy?: boolean
   /** The historian's seam; omitted disables historian firing (tests, hosts). */
-  readonly historian?: { readonly llm: HistorianLlm; readonly now?: () => number; readonly route?: { provider: string; model: string } }
+  readonly historian?: {
+    readonly llm: HistorianLlm
+    readonly now?: () => number
+    readonly route?: { provider: string; model: string }
+    /** Existing `<project-memory>` block for semantic fact dedup. */
+    readonly memoryBlock?: () => string | undefined
+  }
   /** Validation-period activity journal (optional). */
   readonly journal?: Journal
   /** Project memories to inject (already rendered, in MC render order). */
@@ -1089,6 +1095,7 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
         ...input.journal === undefined ? {} : { journal: input.journal },
         ...input.historian.route === undefined ? {} : { route: input.historian.route },
         ...input.historian.now === undefined ? {} : { now: input.historian.now },
+        ...input.historian.memoryBlock === undefined ? {} : { memoryBlock: input.historian.memoryBlock },
         ...input.profileCollect === undefined ? {} : { profileCollect: input.profileCollect },
         ...input.lease === undefined ? {} : { lease: input.lease },
       }

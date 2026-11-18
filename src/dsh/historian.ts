@@ -142,6 +142,16 @@ export interface HistorianDeps {
    * Absent = no cross-process guard, which is what a test harness wants.
    */
   readonly lease?: CompartmentLease
+  /**
+   * The existing `<project-memory>` block for fact dedup (upstream
+   * `renderHistorianMemoryBlock`, injected by `buildCompartmentAgentPrompt`).
+   *
+   * This is the SEMANTIC half of dedup: `normalized_hash` catches a verbatim
+   * repeat, but a fact restated in different words becomes a second row. The
+   * historian is told to scan this block and skip anything that overlaps.
+   * Absent or failing = no block, block-free run (never fail the digest for it).
+   */
+  readonly memoryBlock?: () => string | undefined
 }
 
 /** The eligible span the historian would digest. */
@@ -361,9 +371,19 @@ export const USER_OBSERVATIONS_DISABLED_TOGGLE = [
  * anchors, and — only when no review lane will consume them — the skip
  * toggle. Default `true` keeps the historical bytes for every existing
  * caller. */
-export function historianPromptText(userObservationsRequested = true): string {
-  const base = `${HISTORIAN_INSTRUCTION}\n\n${calibrationAnchors()}`
-  return userObservationsRequested ? base : `${base}\n\n${USER_OBSERVATIONS_DISABLED_TOGGLE}`
+export function historianPromptText(
+  userObservationsRequested = true,
+  /** The `<project-memory>` block; empty when memory is off or nothing exists. */
+  projectMemory?: string,
+): string {
+  // Upstream block order (`buildCompartmentAgentPrompt`, compartment-prompt.ts:143):
+  // seed examples -> session references -> project-memory -> the per-run toggles.
+  // This port has no seed/reference blocks, so memory comes first.
+  const parts: string[] = []
+  if (projectMemory !== undefined && projectMemory.length > 0) parts.push(projectMemory)
+  parts.push(`${HISTORIAN_INSTRUCTION}\n\n${calibrationAnchors()}`)
+  if (!userObservationsRequested) parts.push(USER_OBSERVATIONS_DISABLED_TOGGLE)
+  return parts.join('\n\n')
 }
 
 /** Consume a chunk stream into text, honoring the terminal finish reason.
@@ -658,7 +678,7 @@ export const HISTORIAN_MERGE_INSTRUCTION = [
  * wall-clock budget so the run cannot outlive `timeoutMs`.
  */
 export async function callHistorian(
-  deps: Pick<HistorianDeps, 'policy' | 'llm' | 'logger' | 'route' | 'now' | 'journal' | 'timeoutMs' | 'profileCollect'>,
+  deps: Pick<HistorianDeps, 'policy' | 'llm' | 'logger' | 'route' | 'now' | 'journal' | 'timeoutMs' | 'profileCollect' | 'memoryBlock'>,
   input: {
     readonly sessionId: string
     readonly session: Parameters<typeof spanRequestMessages>[0]
@@ -737,9 +757,16 @@ export async function callHistorian(
   // d02292d0d: observations are requested only when a sink is armed to
   // consume them; otherwise the per-call instruction says so (see the toggle).
   const userObservationsRequested = deps.profileCollect !== undefined
+  // Fail-open: a memory read that throws must not cost the digest.
+  let memoryBlock: string | undefined
+  try {
+    memoryBlock = deps.memoryBlock?.()
+  } catch {
+    memoryBlock = undefined
+  }
   const baseMessages = [
     ...replayOf(0),
-    { role: 'user', content: [{ type: 'text', text: historianPromptText(userObservationsRequested) }] },
+    { role: 'user', content: [{ type: 'text', text: historianPromptText(userObservationsRequested, memoryBlock) }] },
   ]
   const baseData = {
     trigger,
@@ -814,7 +841,7 @@ export async function callHistorian(
           ? baseMessages
           : [
             ...replayOf(call),
-            { role: 'user', content: [{ type: 'text', text: historianPromptText(userObservationsRequested) }] },
+            { role: 'user', content: [{ type: 'text', text: historianPromptText(userObservationsRequested, memoryBlock) }] },
           ]
       let callDraft: CompartmentDraft | undefined
       for (let attempt = 0; attempt < 2; attempt += 1) {
