@@ -594,7 +594,15 @@ function refreshBaseline(
       ...frozenEpochFingerprint === undefined ? {} : { projectEpochFingerprint: frozenEpochFingerprint },
       updatedAt: now,
     }
-    : { ...(previous as BaselineState), updatedAt: now }
+    : {
+      ...(previous as BaselineState),
+      updatedAt: now,
+      // The system prompt is not part of the m[0] bytes, so a changed fingerprint
+      // does NOT force a fold — but the stamp must still track the prompt the
+      // session is running under, or a later HARD fold would compare against a
+      // value from several prompts ago and fire for no reason.
+      ...input.systemHash === undefined ? {} : { systemHash: input.systemHash },
+    }
 
   const sets = hard
     ? { baseline: compartments, delta: [] as Compartment[] }

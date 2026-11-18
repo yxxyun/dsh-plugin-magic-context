@@ -41,6 +41,11 @@ try {
   // One row per (session, moment): the pass's estimate and the FIRST usage the
   // provider reported at or after it — a pass runs, then the request it sized
   // goes out, so the bill comes after, not before.
+  // `estSystemPromptTokens` marks the CURRENT estimate shape (surface + system
+  // prompt). Rows written before it existed under-report by however large the
+  // system prompt is — measured at ~10k tokens — so mixing the two eras measures
+  // nothing. `--all` opts into the mixed reading for comparison.
+  const onlyCurrentShape = !process.argv.includes('--all')
   const rows = db.prepare(`
     SELECT p.session_id,
            p.at            AS pass_at,
@@ -55,6 +60,7 @@ try {
      WHERE p.kind = 'pass'
        AND p.at > ?
        AND json_extract(p.data, '$.estSurfaceTokens') IS NOT NULL
+       ${onlyCurrentShape ? "AND json_extract(p.data, '$.estSystemPromptTokens') IS NOT NULL" : ''}
      ORDER BY p.at DESC
   `).all(since)
 
@@ -74,6 +80,7 @@ try {
   const p10 = at(0.1)
   const p90 = at(0.9)
 
+  console.log(`shape:  ${onlyCurrentShape ? 'surface + system prompt (current)' : 'mixed (--all)'}`)
   console.log(`pairs:  ${pairs.length}`)
   console.log(`factor: ${factor.toFixed(3)}  (actual / estimated, median)`)
   console.log(`band:   p10 ${p10.toFixed(3)} .. p90 ${p90.toFixed(3)}  (spread ${(p90 / p10).toFixed(3)})`)

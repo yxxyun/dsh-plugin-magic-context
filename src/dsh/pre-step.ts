@@ -1,4 +1,4 @@
-import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
+import { renderContextSnapshot, renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { createHash } from 'node:crypto'
 /**
  * The preStep band: the real-user-turn counter, cross-project drift
@@ -912,10 +912,26 @@ export function observeSystemPrompt(deps: Pick<PreStepDeps, 'ctx'>): void {
       async (assembly: unknown, _context: unknown, next: () => Promise<unknown>) => {
         const assembled = await next()
         try {
-          const rendered = renderPrompt(assembled as Parameters<typeof renderPrompt>[0])
-          if (typeof rendered === 'string' && rendered.length > 0) {
-            latestSystemPromptFingerprint = createHash('md5').update(rendered).digest('hex')
-            latestSystemPromptTokens = estimateTokens(rendered)
+          const prompt = assembled as Parameters<typeof renderPrompt>[0] & {
+            contexts?: ReadonlyArray<{ name: string }>
+            tools?: ReadonlyArray<{ name: string; description?: string; parameters?: unknown }>
+          }
+          // `renderPrompt` renders SECTIONS ONLY (`lib/index.js`): dynamic
+          // contexts and the tool schemas reach the provider as separate
+          // segments. Counting only the sections under-reported the block by
+          // tens of thousands of tokens on a tool-heavy session (measured
+          // 2026-11-18: estimate 172k vs actual 408k).
+          const rendered = renderPrompt(prompt)
+          const contexts = prompt.contexts === undefined || prompt.contexts.length === 0
+            ? ''
+            : renderContextSnapshot(prompt)
+          const tools = prompt.tools === undefined || prompt.tools.length === 0
+            ? ''
+            : JSON.stringify(prompt.tools)
+          const full = `${rendered}\n\n${contexts}\n\n${tools}`
+          if (full.length > 0) {
+            latestSystemPromptFingerprint = createHash('md5').update(full).digest('hex')
+            latestSystemPromptTokens = estimateTokens(full)
           }
         } catch (observeError) {
           // Observation only: never cost the turn. Say it once so the next
