@@ -223,7 +223,9 @@ describe('journal integration (real agent loop)', () => {
 
       const reader = openStores(dataDir)
       try {
-        const kinds = new Set(reader.listJournal({ limit: 200 }).map(entry => entry.kind))
+        // The trigger writes one skip row per pass (upstream `sessionLog` does
+        // the same), so 200 is no longer a window that covers every kind.
+        const kinds = new Set(reader.listJournal({ limit: 1_000 }).map(entry => entry.kind))
         expect(kinds.has('boot')).toBe(true)
         expect(kinds.has('session-first-seen')).toBe(true)
         expect(kinds.has('pass')).toBe(true)

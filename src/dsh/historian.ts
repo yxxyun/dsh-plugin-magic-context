@@ -149,17 +149,49 @@ export interface HistorianRange {
 }
 
 /**
- * Magic Context's trigger budget: the eligible span must exceed 5% of the
- * context window, clamped to [5k, 50k] tokens, before a call is worth making.
+ * Trigger budget — how large the un-compartmentalised tail may get before a run
+ * is worth paying for. Upstream `deriveTriggerBudget` (derive-budgets.ts:49):
+ *
+ *     usable = main_context x executeThreshold
+ *     budget = clamp(5_000, 50_000, usable x 0.05)
+ *
+ * The basis is the USABLE window (context x threshold), not the raw context.
+ * The earlier port used the raw context, which on a 262k window with a 50%
+ * threshold asked for 13,107 tokens — twice upstream's 6,553 — and made the
+ * trigger twice as reluctant as the implementation it claimed to mirror.
  */
 export function historianTriggerBudget(
   contextWindow: number | undefined,
   assumedWindow: number,
+  executeThresholdPercentage = 100,
   minBudgetTokens = 5_000,
 ): number {
   const window = contextWindow === undefined || contextWindow <= 0 ? assumedWindow : contextWindow
-  const floor = Math.max(1, minBudgetTokens)
-  return Math.max(floor, Math.min(50_000, Math.round(window * 0.05)))
+  const thresholdFraction = Math.max(0, executeThresholdPercentage) / 100
+  const usable = window * thresholdFraction
+  // `historianMinBudgetTokens` overrides upstream's fixed TRIGGER_BUDGET_MIN
+  // (5_000) floor. The floor exists so small windows still accumulate a real
+  // span; a test harness that wants a tiny span lowers it deliberately.
+  const floor = Math.max(1, Math.min(minBudgetTokens, 50_000))
+  return Math.max(floor, Math.min(50_000, Math.round(usable * 0.05)))
+}
+
+/**
+ * Raw-history chunk budget — how much one call may carry. Upstream keeps this
+ * SEPARATE from the trigger budget (`deriveHistorianChunkTokens`,
+ * derive-budgets.ts:74) because it scales with the HISTORIAN model's context, not
+ * the main session's pressure math:
+ *
+ *     chunk = clamp(8_000, 50_000, historian_context x 0.25)
+ *
+ * The port fed one number to both roles, so pointing the historian at a large
+ * model could not widen its chunks — the main window decided it.
+ */
+export function historianChunkTokens(historianContextWindow: number | undefined, assumedWindow: number): number {
+  const window = historianContextWindow === undefined || historianContextWindow <= 0
+    ? assumedWindow
+    : historianContextWindow
+  return Math.max(8_000, Math.min(50_000, Math.round(window * 0.25)))
 }
 
 /** A node whose text OPENS with a reclaim marker (a placeholder, or a manual
@@ -1000,6 +1032,8 @@ export function runHistorian(
     readonly reserveRun?: (tokens: number) => boolean
     /** Live pressure, for the force-band recovery override (upstream pass-through). */
     readonly usagePercentage?: number
+    /** The historian model's own context window, for chunk sizing. */
+    readonly historianContextWindow?: number
   },
 ): Promise<Compartment | undefined> {
   const existing = inFlight.get(input.sessionId)
@@ -1027,6 +1061,8 @@ async function runHistorianExclusive(
     readonly reserveRun?: (tokens: number) => boolean
     /** Live pressure, for the force-band recovery override (upstream pass-through). */
     readonly usagePercentage?: number
+    /** The historian model's own context window, for chunk sizing. */
+    readonly historianContextWindow?: number
   },
 ): Promise<Compartment | undefined> {
   // #802: after a run that published nothing, automatic runs wait for a node
@@ -1087,10 +1123,11 @@ async function runHistorianExclusive(
         nodes: cappedNodes,
         tokens: cappedNodes.reduce((total, node) => total + estimateTokens(node.text), 0),
       }
-  const budget = historianTriggerBudget(
-    input.contextWindow,
+  // The runner's chunk size comes from the HISTORIAN's context, not the main
+  // window's pressure math (upstream `deriveHistorianChunkTokens`).
+  const budget = historianChunkTokens(
+    input.historianContextWindow,
     deps.policy.historianAssumedWindow,
-    deps.policy.historianMinBudgetTokens,
   )
   // No size gate here. Upstream splits the two responsibilities: the TRIGGER
   // (`checkCompartmentTrigger`) decides whether the material is worth a run —

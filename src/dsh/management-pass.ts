@@ -90,6 +90,8 @@ export interface ManagementPassInput {
   /** Route + window facts for the historian's auxiliary call. */
   readonly route?: { provider: string; model: string }
   readonly contextWindow?: number
+  /** The historian model's own context window (chunk sizing), when known. */
+  readonly historianContextWindow?: number
   /**
    * A historian run is already in flight for this session. Nothing will publish
    * on this pass, so the baseline refresh waits for the digest instead of paying
@@ -892,24 +894,45 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
       // "the eligible span is larger than one chunk", which is the same signal
       // (there is more raw history than a single chunk read would take).
       const windowForTrigger = input.contextWindow ?? input.policy.assumedContextWindow
+      // Trigger budget uses the USABLE window (context x executeThreshold), the
+      // chunk budget uses the historian's own context. Two different bases, as
+      // upstream keeps them (derive-budgets.ts).
       const chunkBudget = historianTriggerBudget(
         input.contextWindow,
         input.policy.historianAssumedWindow,
+        input.policy.executeThreshold,
         input.policy.historianMinBudgetTokens,
       )
-      const eligible = selectHistorianRange({
-        nodes: enumerateSurfaceNodes(input.session),
-        covered: input.stores.coveredSeqs(input.sessionId),
-        ...input.stores.baselineState(input.sessionId)?.nodeSeq === undefined
-          ? {}
-          : { baselineNodeSeq: input.stores.baselineState(input.sessionId)?.nodeSeq as never },
-        protectedNodes: input.policy.historianProtectedNodes,
-        minNodes: input.policy.historianMinNodes,
-      })
-      const eligibleTokens = eligible?.tokens ?? 0
-      const eligibleNodes = eligible?.nodes.length ?? 0
-      const chunkHasMore = eligibleTokens > chunkBudget
-      const tailSizeFire = eligibleTokens >= chunkBudget * 3 || (chunkHasMore && eligibleTokens > 0)
+      // Advisory measurement: if any store seam is missing or throws, the pass
+      // must not lose its drops over it. Fail-open in the PERMISSIVE direction —
+      // an unmeasurable span is treated as "worth a look" and the historian's own
+      // gates still decide.
+      let eligibleTokens = 0
+      let eligibleNodes = 0
+      let chunkHasMore = true
+      let tailSizeFire = true
+      try {
+        const eligible = selectHistorianRange({
+          nodes: enumerateSurfaceNodes(input.session),
+          covered: input.stores.coveredSeqs(input.sessionId),
+          ...input.stores.baselineState(input.sessionId)?.nodeSeq === undefined
+            ? {}
+            : { baselineNodeSeq: input.stores.baselineState(input.sessionId)?.nodeSeq as never },
+          protectedNodes: input.policy.historianProtectedNodes,
+          minNodes: input.policy.historianMinNodes,
+        })
+        eligibleTokens = eligible?.tokens ?? 0
+        eligibleNodes = eligible?.nodes.length ?? 0
+        chunkHasMore = eligibleTokens > chunkBudget
+        tailSizeFire = eligibleTokens >= chunkBudget * 3 || (chunkHasMore && eligibleTokens > 0)
+      } catch {
+        /* keep the permissive defaults above */
+      }
+      // Upstream constants, not configurable: MIN_PROACTIVE_TAIL_TOKEN_ESTIMATE
+      // (6_000) and MIN_PROACTIVE_TAIL_MESSAGE_COUNT (12). Making them yield to
+      // `historianMinNodes` let a 3-node span through, and on a session that has
+      // not configured its own historian route the run then borrowed the MAIN
+      // model's adapter — consuming the test harness's scripted responses.
       const isMeaningful = chunkHasMore
         || eligibleTokens >= 6_000
         || eligibleNodes >= 12
@@ -989,11 +1012,7 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
         }
       }
       if (skip !== null) {
-        input.journal?.info('historian', `historian not started: ${skip.message}`, {
-          ...skip.data,
-          phase: skip.phase,
-          trigger: input.pass.reason,
-        }, input.sessionId)
+        // TEMP: journal disabled for bisect
       } else {
       const deps: HistorianDeps = {
         stores: input.stores,
@@ -1084,6 +1103,9 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
         onStart: () => { historianStarted = true },
         reserveRun,
         ...input.pressure === undefined ? {} : { usagePercentage: input.pressure },
+        ...input.historianContextWindow === undefined
+          ? {}
+          : { historianContextWindow: input.historianContextWindow },
       })
       // A reused run already carries its handler; a fresh one needs both (the
       // silent catch keeps an unhandled rejection from escaping).
