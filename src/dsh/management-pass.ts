@@ -626,8 +626,30 @@ function refreshBaseline(
   // checkpoint's own text ride inside m[0] forever: every later refresh
   // re-emitted the foreign summary and rewrote the node, and the GUI lost the
   // card it correlates by `source.kind === 'compact-checkpoint'` + compactionId.
-  const target = nodes.find(node => node.role === 'user' && node.sourceKind !== 'compact-checkpoint')
-  if (target === undefined) return false
+  const target = nodes.find(node =>
+    node.role === 'user'
+    && node.sourceKind !== 'compact-checkpoint'
+    // A `[dropped §N§]` placeholder must not carry the baseline. Prepending the
+    // block to it would stop the text matching PLACEHOLDER_PATTERN, so the node
+    // would no longer read as a placeholder — and the drop lane, which keys on
+    // exactly that, would try to drop it again (and count it as reclaimable)
+    // every pass. Upstream (`isDroppedPlaceholder`, inject-compartments.ts:835)
+    // refuses such a message for the same reason and falls back to synthesising
+    // one; this platform can only replace or append, so the honest move is to
+    // look further down the surface.
+    && !node.isPlaceholder)
+  if (target === undefined) {
+    // No anchor: the history block has nowhere safe to live. Say so — a silent
+    // `return false` here is indistinguishable from "the block was already
+    // current", and the session would keep running without its history.
+    input.journal?.warn(
+      'baseline',
+      'baseline not written: no non-placeholder user message to anchor it to',
+      { mode: hard ? 'hard' : 'soft', epoch: state.epoch },
+      input.sessionId,
+    )
+    return false
+  }
   if (baselineBlockOf(target.text) === block) {
     // Byte-identical: no durable mutation, no priced bust (MC's defer pass).
     if (state.nodeSeq !== target.seq || state.updatedAt !== previous?.updatedAt) {
