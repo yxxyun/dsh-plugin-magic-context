@@ -1677,6 +1677,12 @@ export const Config = z.object({
      * needs. Volatile — a change lands on the next pass.
      */
     historianMaxSpanTokens: z.number().min(0).default(0).volatile(),
+    /**
+     * Tool results at or under this many BYTES, within the newest 20 tool calls,
+     * are left alone: a few hundred bytes of reclaim is not worth losing a
+     * step's actual output. 0 disables the protection.
+     */
+    dropSmallResultFloor: z.number().min(0).default(1_024).volatile(),
     /** Wall-clock budget for one historian run; a spent budget journals `failed`.
      *  120s: large backlogs (600+ pending nodes) measured ~60s+ per digest. */
     historianTimeoutMs: z.number().default(120_000).volatile(),

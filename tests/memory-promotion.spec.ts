@@ -116,7 +116,7 @@ async function boot(options: {
       autoPromote: options.autoPromote ?? true,
       ...options.write === undefined ? {} : { write: options.write },
     },
-    policy: {
+    policy: { dropSmallResultFloor: 0,
       executeThreshold: 50,
       forceThreshold: 50, // digest admission: the force band gates routine runs (see management-pass step 5)
       protectedToolResults: 0,

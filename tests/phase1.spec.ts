@@ -66,7 +66,12 @@ class WindowedAdapter extends MockAdapter {
 }
 
 /** The band the specs below drive: execute early, nobody protected. */
-const TEST_POLICY = { executeThreshold: 50, forceThreshold: 90, protectedToolResults: 0 }
+// `dropSmallResultFloor: 0` disables the newest-window small-result protection:
+// these cases are about queue discipline (mark queues in one band, lands in the
+// next) and use tiny fixture outputs that the protection would correctly skip.
+const TEST_POLICY = {
+  executeThreshold: 50, forceThreshold: 90, protectedToolResults: 0, dropSmallResultFloor: 0,
+}
 
 async function boot(
   adapter: MockAdapter,

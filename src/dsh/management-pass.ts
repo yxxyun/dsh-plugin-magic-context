@@ -460,6 +460,11 @@ export function publishReadyCompartments(
  */
 export const BASELINE_RENDER_EPOCH = 2
 
+/** Upstream `RECENT_TOOL_SKELETON_WINDOW` (apply-operations.ts:53). */
+const RECENT_TOOL_SKELETON_WINDOW = 20
+/** Upstream `SKELETON_REAL_INPUT_MAX_BYTES` (tool-input-size.ts:17). */
+const SKELETON_REAL_INPUT_MAX_BYTES = 1_024
+
 function refreshBaseline(
   input: ManagementPassInput,
   nodes: readonly SurfaceNode[],
@@ -742,6 +747,23 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
     // and the reclaim accounting showed nothing (measured 2026-11-09: one record,
     // 165 tags, estTokens 0).
     const textBySeq = new Map(enumerateSurfaceNodes(input.session).map(node => [node.seq, node.text]))
+    // Newest RECENT_TOOL_SKELETON_WINDOW tool tags whose result is under
+    // SKELETON_REAL_INPUT_MAX_BYTES: too little to reclaim, too much to lose.
+    const newestToolTags = [...toolNodes]
+      .filter(candidate => candidate.tagNumber !== undefined)
+      .sort((left, right) => (right.tagNumber ?? 0) - (left.tagNumber ?? 0))
+      .slice(0, RECENT_TOOL_SKELETON_WINDOW)
+    const smallFloor = input.policy.dropSmallResultFloor > 0
+      ? Math.min(input.policy.dropSmallResultFloor, SKELETON_REAL_INPUT_MAX_BYTES)
+      : 0
+    const recentSmallToolTags = new Set(
+      smallFloor === 0
+        ? []
+        : newestToolTags
+            .filter(candidate => (textBySeq.get(candidate.seq)?.length ?? 0) <= smallFloor)
+            .map(candidate => candidate.tagNumber as number),
+    )
+    let skippedSmall = 0
     for (const tag of input.stores.listPendingDrops(input.sessionId)) {
       const node = toolNodes.find(candidate => candidate.tagNumber === tag)
       if (node === undefined) {
@@ -756,6 +778,15 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
       }
       if (node.isPlaceholder) {
         input.stores.markDropLanded(input.sessionId, tag, node.seq)
+        continue
+      }
+      // Upstream `planNewToolDrop` (apply-operations.ts:132) keeps a SMALL result
+      // inside the newest-call window instead of dropping it: the reclaim is a
+      // few hundred bytes, while the reader loses a step's actual output. It is
+      // a protection, not an optimisation — dropping these is how a session ends
+      // up "drained" with nothing to show for it.
+      if (recentSmallToolTags.has(tag)) {
+        skippedSmall += 1
         continue
       }
       const landedSeq = replaceToolResultContent(input.session, node.seq, dropPlaceholderContent(tag))

@@ -198,7 +198,7 @@ describe('journal integration (real agent loop)', () => {
     await ctx.plugin(AgentLoop, { agents: [] })
     await ctx.plugin(mcDshPlugin, {
       dataDir,
-      policy: { executeThreshold: 50, forceThreshold: 90, protectedToolResults: 0, historianProtectedNodes: 0 },
+      policy: { dropSmallResultFloor: 0, executeThreshold: 50, forceThreshold: 90, protectedToolResults: 0, historianProtectedNodes: 0 },
     })
     ctx.llm.registerAdapter(['mock'], adapter)
     ctx.tools.register(defineContentToolFixture({

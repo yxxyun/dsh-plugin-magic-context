@@ -86,6 +86,14 @@ export interface PressurePolicy {
    */
   readonly historianMaxSpanTokens: number
   /**
+   * Results at or under this many bytes, inside the newest
+   * `RECENT_TOOL_SKELETON_WINDOW` tool calls, are NOT dropped: the reclaim is a
+   * few hundred bytes while the reader loses a step's actual output (upstream
+   * `SKELETON_REAL_INPUT_MAX_BYTES` + `RECENT_TOOL_SKELETON_WINDOW`).
+   * 0 disables the protection.
+   */
+  readonly dropSmallResultFloor: number
+  /**
    * Wall-clock budget for one historian run (including its repair attempt).
    * A provider that never settles must not leave the run unaccounted: the
    * historian journals a terminal `failed` when this budget is spent.
@@ -124,6 +132,7 @@ export const DEFAULT_POLICY: PressurePolicy = {
   historianProtectedNodes: 8,
   historianMinNodes: 3,
   historianMaxSpanTokens: 0,
+  dropSmallResultFloor: 1_024,
   historianTimeoutMs: 120_000,
   historianMaxTokens: 8192,
   historianMaxTokensCeiling: 32_768,
