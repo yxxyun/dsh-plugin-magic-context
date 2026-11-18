@@ -155,52 +155,6 @@ const SCHEMA_DDL = `
 `
 
 /**
- * Adapter-owned DDL that must exist even on an inherited corpus.
- *
- * `ensureOwnCorpusStore` deliberately never touches an existing file, so the
- * chunk table cannot ride `SCHEMA_DDL`: a corpus imported from the v95 store is
- * non-empty on first run and would never execute it. This runs separately, uses
- * only `IF NOT EXISTS`, and never alters an inherited table.
- */
-const ADAPTER_ADDITIONS_DDL = `
-  CREATE TABLE IF NOT EXISTS memory_chunks (
-    memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-    chunk_index INTEGER NOT NULL,
-    model_id TEXT NOT NULL,
-    start_char INTEGER NOT NULL,
-    chunk_text TEXT NOT NULL,
-    embedding BLOB NOT NULL,
-    PRIMARY KEY(memory_id, chunk_index, model_id)
-  );
-  CREATE INDEX IF NOT EXISTS idx_memory_chunks_model ON memory_chunks(model_id);
-`
-
-/**
- * Make sure the adapter's own additions exist, on a new OR inherited corpus.
- *
- * Idempotent and fail-open: a corpus that cannot be opened for this is still
- * usable for everything except chunk retrieval, which reports its own reason.
- *
- * @param dbPath - the corpus database the openers already use.
- * @returns whether the additions are present, and why not when they are not.
- */
-export function ensureAdapterTables(dbPath: string): { outcome: 'ready' | 'failed'; detail?: string } {
-  try {
-    if (!existsSync(dbPath)) return { outcome: 'failed', detail: 'no corpus yet' }
-    const db = new DatabaseSync(dbPath)
-    try {
-      db.exec('PRAGMA busy_timeout = 5000')
-      db.exec(ADAPTER_ADDITIONS_DDL)
-    } finally {
-      db.close()
-    }
-    return { outcome: 'ready' }
-  } catch (error) {
-    return { outcome: 'failed', detail: error instanceof Error ? error.message : String(error) }
-  }
-}
-
-/**
  * Make sure an own-corpus store exists at `dbPath`. Idempotent, fail-open:
  * every non-`exists` outcome still lets the caller open the store and hit
  * the same refusals the openers would have raised anyway. An EXISTING file

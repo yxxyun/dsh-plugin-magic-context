@@ -21,7 +21,7 @@ import type { PressurePolicy } from '../core/policy.ts'
 import { machineDomainConfigOf } from './machine-domain-config.ts'
 import { openMemoryBridge, DEFAULT_SHARE_CATEGORIES, resolveIdentitySpec, type ActivePeerDomain } from '../core/memory-bridge.ts'
 import { openMemoryWriter, type MemoryWriter } from '../core/memory-write.ts'
-import { ensureAdapterTables, ensureOwnCorpusStore } from '../core/corpus-store.ts'
+import { ensureOwnCorpusStore } from '../core/corpus-store.ts'
 import { GIT_COMMIT_DDL } from '../core/git-commit-store.ts'
 import { searchGitCommits, type GitCommitHit } from '../core/git-commit-search.ts'
 import { indexCommitsForProject } from '../core/git-commit-indexer.ts'
@@ -228,15 +228,6 @@ export function openMemoryLane(
       } catch {
         // best effort only — the meta row is observability, not a gate
       }
-    }
-    // The chunk table is the adapter's own addition, so it must be laid down on
-    // an INHERITED corpus too — `ensureOwnCorpusStore` returns 'exists' for a
-    // non-empty file and never touches it, which would leave `memory_chunks`
-    // absent forever on this install. Fail-open: the vector lane reports its own
-    // reason when the table is missing.
-    const additions = ensureAdapterTables(target)
-    if (additions.outcome !== 'ready') {
-      ctx.logger.warn(`magic-context dsh adapter: chunk table unavailable (${additions.detail ?? 'unknown'})`)
     }
   }
   // WP10 projection at MOUNT: the machine domain row's existence and enabled

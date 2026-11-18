@@ -84,11 +84,9 @@ const PHASE_BASE = [
   'tests/token-estimate.spec.ts',
   // Memory chunking: no gap between consecutive spans, every chunk opens on a word
   // (not mid-token), and the first/last chunks reach the ends of the source.
-  'tests/memory-chunk.spec.ts',
   // Chunk vectors: replace-not-append (a shrunk memory must not leave orphans),
   // best-chunk ranking (averaging reproduces the dilution chunking removes), and
   // byte-exact round-trip (a view into a statement buffer is freed by the next query).
-  'tests/chunk-store.spec.ts',
   // Git commit lane: the parse contract (US/RS not NUL, four-separator split,
   // full-object-name check), eviction by COMMIT time, the conditional upsert, and
   // the FTS + semantic merge.

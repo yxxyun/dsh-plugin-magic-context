@@ -130,25 +130,46 @@ provider_overflow + 本轮没折 → 拒绝」这一条。disarm 需要可信测
 **保留 text 口径的地方**：渲染、tier 选择、保留窗口内的内容判断——它们关心的是文本
 本身，不是账单。
 
-## 自创且未启用（上游无对应，且没有运行路径用它们）
+## 自创部分已清理（2026-11-18）
 
-审计方法：对 `src/core/*.ts` 与 `src/dsh/*.ts` 逐个查「有没有别的文件 import 它」。
+审计方法：对 `src/core/*.ts` 与 `src/dsh/*.ts` 逐个查「有没有别的文件 import 它」，再对
+每个导出查调用点。工具是 `scripts/unwired-modules.mjs`，可复跑。
 
-| 模块 | 行数 | 状态 |
+### 删掉了什么（-954 行）
+
+| 文件 | 行数 | 理由 |
 |---|---|---|
-| `core/memory-chunk.ts`（226） | 分块函数 | 只被 `tests/memory-chunk.spec.ts` 与 `scripts/backfill-chunks.mjs` 引用 |
-| `core/chunk-store.ts` 的 `memory_chunks` 读写 | 分块向量存储 | 只有 `cosineScore`（一个纯数学函数）被生产代码使用；读 `memory_chunks` 的函数**没有调用方** |
-| `scripts/backfill-chunks.mjs` | 回填脚本 | 手动运行；维护 tick 不会自己分块（脚本注释里明确说了） |
+| `src/core/memory-chunk.ts` | 226 | 分块函数，只有测试和 backfill 脚本引用 |
+| `src/core/chunk-store.ts` | ~155 | `memory_chunks` 的读写；4 个 chunk 专属导出**零生产引用** |
+| `src/core/corpus-store.ts` 的 `ADAPTER_ADDITIONS_DDL` + `ensureAdapterTables` | 47 | 唯一的用途就是建那张没人读的表 |
+| `src/dsh/memory-lane.ts` 的建表调用 | 8 | 同上 |
+| `scripts/backfill-chunks.mjs` | — | 手动回填脚本 |
+| `tests/chunk-store.spec.ts` + `tests/memory-chunk.spec.ts` | 363 | 对应两个被删模块 |
 
-**判断依据**：上游的 chunk 是 **compartment 级**（`chunk-embedding-writer.ts`，对摘要分块），
-`grep chunkMemory` 在 `mc-upstream` 里零命中——memory 分块在上游不存在。
+**为什么判定是自创**：上游 `grep chunkMemory` 在 `mc-upstream` 里零命中。它的 chunk 是
+**compartment 级**（`chunk-embedding-writer.ts` 对摘要分块），memory 级分块不存在。
 
-所以这是一条完整的、自创的、没人读的链：建表 → 分块 → 脚本回填 → 存储 → **无人查询**。
+### 保住了什么
 
-**处置建议**：不删。删除是破坏性操作，且 `memory_chunks` 里可能已有数据。正确的下一步
-是先决定「要不要 memory 级向量检索」——要，就补上读路径并承认这是自创扩展；不要，再
-连同表一起清理。在那之前，它存在于库里但不参与任何决策，这一点写在这里比留在代码里
-干净。
+`cosineScore` 有 **8 处生产引用**（`curate-memories` / `git-commit-search` /
+`primer-cluster` / `primer-search`），它只是恰好住在 `chunk-store.ts` 里。已迁到
+`src/core/vector-math.ts`，四个 import 跟着改。
+
+这也说明为什么删除前必须逐个查调用点：删模块会带走活着的邻居。
+
+### 用户数据库里的残留（未动）
+
+`memories.db` 里 `memory_chunks` 表**仍然存在，221 行数据**。代码已不再建、不再读、不再写。
+没有 DROP，因为删除数据是不可逆的，而这张表的存在不影响任何行为。
+
+要彻底清理时：
+
+```sql
+DROP TABLE memory_chunks;
+DROP INDEX IF EXISTS idx_memory_chunks_model;
+```
+
+先确认不需要这些向量再做——它们对应的记忆内容本身还在 `memories` 表里。
 
 ## 已接线（但通过 CLI 而非运行路径）
 

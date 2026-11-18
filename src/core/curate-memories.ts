@@ -35,7 +35,7 @@ import type { Journal } from './journal.ts'
 import { LlmDeadlineError, withDeadline } from './llm-deadline.ts'
 import { memoryContentHash, type MemoryRecord, type MemoryWriter } from './memory-write.ts'
 import type { LlmSeamMessage } from './types.ts'
-import { cosineScore } from './chunk-store.ts'
+import { cosineScore } from './vector-math.ts'
 import {
   assessCurateMutationSafety,
   type CurateCandidateRow,

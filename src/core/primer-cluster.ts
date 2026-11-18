@@ -25,7 +25,7 @@
  * never compared: cosine across spaces is meaningless, and the guard is
  * `sameEmbeddingSpace` rather than a try/catch.
  */
-import { cosineScore } from './chunk-store.ts'
+import { cosineScore } from './vector-math.ts'
 import {
   normalizePrimerQuestion,
   primerOccurrenceKey,

@@ -15,7 +15,7 @@
  * answer was wrong or obsolete, and surfacing it again would undo that decision.
  */
 import type { DatabaseSync } from 'node:sqlite'
-import { cosineScore } from './chunk-store.ts'
+import { cosineScore } from './vector-math.ts'
 import {
   buildPrimerClusters,
   clusterEligibleForPromotion,

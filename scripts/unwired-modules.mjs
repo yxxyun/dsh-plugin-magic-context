@@ -5,7 +5,8 @@
  * The question this answers: "is this file actually wired, or does it only exist?"
  * A module reached only by its own test is not wired — that is exactly how
  * `wire-accuracy.ts` sat unused for a round while passing 11 tests, and how the
- * `memory_chunks` chain ended up complete but never read.
+ * `memory_chunks` chain ended up complete but never read — that one was found
+ * this way and deleted (see ALIGNMENT.md).
  *
  * Usage: node scripts/unwired-modules.mjs
  */

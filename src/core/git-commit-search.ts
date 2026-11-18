@@ -21,7 +21,7 @@
  * is what a user means by "when did this change".
  */
 import type { DatabaseSync } from 'node:sqlite'
-import { cosineScore } from './chunk-store.ts'
+import { cosineScore } from './vector-math.ts'
 import type { GitCommit } from './git-log.ts'
 
 /** Weights shared with the memory lane so merged rankings stay comparable. */
