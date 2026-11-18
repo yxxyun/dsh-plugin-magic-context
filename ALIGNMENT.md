@@ -54,7 +54,7 @@
 | `tag-messages.ts`（1,401） | `seams.ts` + `tool-bridge.ts` | 打标；DSH 的 tag 由 `ctx_reduce` 分配，机制不同 |
 | `compartment-runner-*.ts`（2,855） | `historian.ts` | 上游拆成 incremental / historian / host-runner 三个文件 |
 | `auto-search-worker-client.ts`（976） | `memory-search.ts` + 工具面 | 上游是 worker 进程 |
-| `system-prompt-hash.ts`（882） | — | 用于检测 system prompt 变化触发 HARD；本地用 `renderEpoch` + 路由变化，**未实现 system hash** |
+| `system-prompt-hash.ts`（882） | `core/...` → `pre-step.ts` 的 `observeSystemPrompt` | **已实现**（f79ae2e 判定 + 7a74899 观察点）。曾长期不工作：观察点写在 `systemPrompt.context` 的回调里，而那个回调的参数是 `AssembleContext` 不是 `PromptAssembly`，`renderPrompt` 拿到它就抛错、被空 catch 吞掉。真机 `baseline_state.system_hash` 每行都是 null 才暴露出来 |
 
 ## 紧急 fail-closed 全链（已接线）
 
@@ -160,7 +160,12 @@ provider_overflow + 本轮没折 → 拒绝」这一条。disarm 需要可信测
 
 ## 已知缺口
 
-0. **trusted wire 测量**：disarm 分支因此不激活。上游从请求的实际字节数取，本地只有
+0. **`system_hash` 的落库尚未验证**：观察链已通（`estSystemPromptTokens` 在真机上有值，
+约 10.5k），但 `baseline_state.system_hash` 仍是 null —— `refreshBaseline` 只在 execute
+band 内运行，而这个会话的压力长期停在 50% 阈值以下（48% 上下浮动），只有 TTL 折或阈值
+跨过才会写。代码路径没有疑问，缺的是一次触发。
+
+1. **trusted wire 测量**：disarm 分支因此不激活。上游从请求的实际字节数取，本地只有
    chars/4。做法是记录每次请求的 provider 回报用量，与本地估算做回归——需要先积累数据。
 
 1. **`freezeReasoningOnBustingPass`**（`transform-postprocess-phase.ts:590`）：缓存必然
