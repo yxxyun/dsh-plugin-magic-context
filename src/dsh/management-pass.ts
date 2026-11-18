@@ -34,6 +34,7 @@ import { effectiveForceThreshold } from '../core/escalation-bands.ts'
 import { DRAIN_FAILURE_BACKOFF_MS, reserveDrain, selectPerRunCap } from '../core/drain-budget.ts'
 import { resolvedEmergencyDrainLatch } from '../core/drain-latch.ts'
 import { dropsSuffice } from '../core/drop-projection.ts'
+import { historianTriggerBudget, selectHistorianRange } from './historian.ts'
 import { reclaimForEmergency } from './emergency.ts'
 import { runHistorian, type HistorianDeps, type HistorianLlm } from './historian.ts'
 import type { CompartmentLease } from '../core/compartment-lease.ts'
@@ -883,6 +884,35 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
     // local invention, and it fired the expensive lane for the wrong reason while
     // still holding it when the material was genuinely there.
     if (input.historian !== undefined) {
+      // Upstream step 5 (`tail_size`) runs BEFORE the proactive floor on
+      // purpose: enough narratable material fires a digest regardless of how low
+      // the pressure is. Thresholds are upstream's, verbatim —
+      // TAIL_SIZE_TRIGGER_MULTIPLIER = 3, MIN_PROACTIVE_TAIL_TOKEN_ESTIMATE =
+      // 6_000, MIN_PROACTIVE_TAIL_MESSAGE_COUNT = 12 — and `chunkHasMore` maps to
+      // "the eligible span is larger than one chunk", which is the same signal
+      // (there is more raw history than a single chunk read would take).
+      const windowForTrigger = input.contextWindow ?? input.policy.assumedContextWindow
+      const chunkBudget = historianTriggerBudget(
+        input.contextWindow,
+        input.policy.historianAssumedWindow,
+        input.policy.historianMinBudgetTokens,
+      )
+      const eligible = selectHistorianRange({
+        nodes: enumerateSurfaceNodes(input.session),
+        covered: input.stores.coveredSeqs(input.sessionId),
+        ...input.stores.baselineState(input.sessionId)?.nodeSeq === undefined
+          ? {}
+          : { baselineNodeSeq: input.stores.baselineState(input.sessionId)?.nodeSeq as never },
+        protectedNodes: input.policy.historianProtectedNodes,
+        minNodes: input.policy.historianMinNodes,
+      })
+      const eligibleTokens = eligible?.tokens ?? 0
+      const eligibleNodes = eligible?.nodes.length ?? 0
+      const chunkHasMore = eligibleTokens > chunkBudget
+      const tailSizeFire = eligibleTokens >= chunkBudget * 3 || (chunkHasMore && eligibleTokens > 0)
+      const isMeaningful = chunkHasMore
+        || eligibleTokens >= 6_000
+        || eligibleNodes >= 12
       // Upstream step 6 (`proactive floor`): below `executeThreshold - 2` the
       // historian is not supposed to fire at all. The redundancy projection only
       // makes sense INSIDE the bands — evaluated at 18% it always says "drops are
@@ -916,21 +946,54 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
         windowTokens: windowForProjection,
         executeThresholdPercentage: input.policy.executeThreshold,
       }) === true
-      if (belowProactiveFloor) {
-        input.journal?.info(
-          'historian',
-          `historian not started: ${input.pressure?.toFixed(1) ?? '?'}% is below the ${String(proactiveFloor)}% proactive floor`,
-          { phase: 'below-proactive-floor', pressure: input.pressure, proactiveFloor, trigger: input.pass.reason },
-          input.sessionId,
-        )
+      // The decision chain, in upstream's order (`checkCompartmentTrigger`).
+      // The order matters: tail_size sits ABOVE the proactive floor so enough
+      // material fires regardless of pressure, and the floor sits ABOVE the
+      // redundancy projection so "drops are enough" is only ever asked inside
+      // the bands.
+      const forceBandHit = input.pressure !== undefined && input.pressure >= forceBand
+      let skip: { phase: string; message: string; data: Record<string, unknown> } | null = null
+      if (idlePoke) {
+        // Platform difference: DSH's cache-ttl idle poke has no upstream twin.
+        // The cache is already gone, so this is the cheapest moment to rewrite.
+      } else if (forceBandHit) {
+        if (dropsEnough) {
+          skip = {
+            phase: 'redundancy-skip',
+            message: `drops reclaimed ${String(reclaimedThisPass)} tok, already under the `
+              + `${String(Math.round(input.policy.executeThreshold * 0.75))}% target — no digest needed`,
+            data: { reclaimedThisPass, pressure: input.pressure, band: 'force' },
+          }
+        }
+      } else if (tailSizeFire) {
+        // Enough narratable material, pressure irrelevant (upstream `tail_size`).
+      } else if (belowProactiveFloor) {
+        skip = {
+          phase: 'below-proactive-floor',
+          message: `${input.pressure?.toFixed(1) ?? '?'}% is below the ${String(proactiveFloor)}% proactive floor`,
+          data: { pressure: input.pressure, proactiveFloor },
+        }
       } else if (dropsEnough) {
-        input.journal?.info(
-          'historian',
-          `historian redundancy skip: drops reclaimed ${String(reclaimedThisPass)} tok, already under the `
+        skip = {
+          phase: 'redundancy-skip',
+          message: `drops reclaimed ${String(reclaimedThisPass)} tok, already under the `
             + `${String(Math.round(input.policy.executeThreshold * 0.75))}% target — no digest needed`,
-          { phase: 'redundancy-skip', reclaimedThisPass, pressure: input.pressure, trigger: input.pass.reason },
-          input.sessionId,
-        )
+          data: { reclaimedThisPass, pressure: input.pressure, band: 'proactive' },
+        }
+      } else if (!isMeaningful) {
+        skip = {
+          phase: 'not-meaningful',
+          message: `eligible head is below meaningfulness (${String(eligibleNodes)} nodes, `
+            + `~${String(eligibleTokens)} tok)`,
+          data: { eligibleNodes, eligibleTokens },
+        }
+      }
+      if (skip !== null) {
+        input.journal?.info('historian', `historian not started: ${skip.message}`, {
+          ...skip.data,
+          phase: skip.phase,
+          trigger: input.pass.reason,
+        }, input.sessionId)
       } else {
       const deps: HistorianDeps = {
         stores: input.stores,

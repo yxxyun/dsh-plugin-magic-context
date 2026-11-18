@@ -1092,18 +1092,15 @@ async function runHistorianExclusive(
     deps.policy.historianAssumedWindow,
     deps.policy.historianMinBudgetTokens,
   )
-  // The trigger is about the BACKLOG, the cap is about the RUN. Comparing the
-  // capped size here would make a cap equal to the budget disable the historian
-  // entirely — every span would arrive already cut down to less than the
-  // threshold that justifies running. Measured 2026-11-18: with
-  // historianMaxSpanTokens = 13107 = the trigger budget, the RCC session
-  // escalated on every pass from 07:13 onward and never started a single run.
-  if (input.forcedRange === undefined && range.tokens < budget) {
-    deps.logger.info(
-      `magic-context historian: eligible span ${String(range.tokens)} tokens is below the ${String(budget)}-token trigger`,
-    )
-    return undefined
-  }
+  // No size gate here. Upstream splits the two responsibilities: the TRIGGER
+  // (`checkCompartmentTrigger`) decides whether the material is worth a run —
+  // tail size, proactive floor, meaningfulness, redundancy — and the runner
+  // simply executes an admitted run. Keeping a second threshold in the runner
+  // is what made a span cap equal to the trigger budget disable the historian
+  // outright (2026-11-18: every pass escalated, none started). `budget` now
+  // only sizes the chunks. A local call path that arrives without a trigger
+  // (`forcedRange`) is admitted by definition.
+  void budget
 
   const now = deps.now?.() ?? Date.now()
   const first = cappedRange.nodes[0] as SurfaceNode

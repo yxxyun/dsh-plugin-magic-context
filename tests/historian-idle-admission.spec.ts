@@ -61,7 +61,7 @@ function surfaceSession() {
       return { seq }
     },
   }
-  session.append('user', { turn: 1, message: { role: 'user', content: [{ type: 'text', text: 'hello' }] } })
+  session.append('user/message', { turn: 1, message: { role: 'user', content: [{ type: 'text', text: 'hello' }] } })
   return session
 }
 
@@ -86,8 +86,16 @@ function baseStores(): AdapterStores {
 const historianSeam = () => ({ llm: { complete: async () => ({ text: '', usage: undefined }) } as never })
 
 function pass(reason: 'cache-ttl-idle' | 'execute-threshold', pressure: number | undefined, extra: Record<string, unknown> = {}) {
+  const session = surfaceSession()
+  // Enough messages to clear upstream `isMeaningful` (>= 12 ELIGIBLE nodes after
+  // the 8 protected ones): these cases
+  // test the pressure gate, and a 1-message surface is correctly rejected as
+  // "below meaningfulness" long before pressure is consulted.
+  for (let index = 0; index < 24; index += 1) {
+    session.append('assistant/message', { message: { role: 'assistant', content: [{ type: 'text', text: 'x'.repeat(400) }] } })
+  }
   return {
-    session: surfaceSession() as never,
+    session: session as never,
     sessionId: `mc-admission-${reason}-${String(pressure)}`,
     stores: baseStores(),
     policy: DEFAULT_POLICY, // execute 65 / force 85
