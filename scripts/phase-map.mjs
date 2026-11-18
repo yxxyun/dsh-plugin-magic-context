@@ -45,6 +45,7 @@ const PHASE_BASE = [
   'tests/emergency-fail-closed.spec.ts',
   'tests/provider-limit.spec.ts',
   'tests/emergency-arming.spec.ts',
+  'tests/fail-closed-join.spec.ts',
   // Anti-idle gates ported from upstream mc-upstream a1ca346: the derived force
   // band, the rolling drain budget, the emergency latch, and the post-drop
   // projection that decides when summarisation is the only lever left.

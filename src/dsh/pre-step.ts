@@ -38,6 +38,9 @@ import {
   wireStrandedResults,
 } from './seams.ts'
 import { runManagementPass } from './management-pass.ts'
+import { evaluateEmergencyFailClosed } from '../core/emergency-fail-closed.ts'
+import { provenLimitKey } from '../core/provider-limit.ts'
+import { appendMagicContextEntry } from './session-notice.ts'
 import { historianInFlight } from './historian.ts'
 import { syncMachineDomain } from '../core/machine-domain.ts'
 import type { HistorianLlm } from './historian.ts'
@@ -159,6 +162,10 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
   const { memoryRecall, memoryWriter, profileWriter, visibleMemoryIdsBySession } = lane
   /** Consecutive defers per session, keyed by reason, to log transitions only. */
   const deferStreak = new Map<string, { reason: string; count: number }>()
+  /** Did this turn's pass fold m[0]? The fail-closed gate needs it. */
+  let baselineUpdatedThisPass = false
+  /** This turn's pressure reading, hoisted for the fail-closed gate. */
+  let pressureThisTurn: number | undefined
   /** One-shot flag: a drifted pre-step payload must warn once, not every step. */
   let payloadDriftWarned = false
 
@@ -354,6 +361,7 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
       // lives inside the band forever.
       const policy = withTokenThreshold(configured, pressureWindow)
       const pressure = pressurePercent(latest, pressureWindow)
+      pressureThisTurn = pressure
       // A reading recorded before the injected surface last changed measures a
       // prompt that no longer exists (a compartment landed / the baseline was
       // refreshed after it). It stays the only size signal for the pass decision,
@@ -677,7 +685,8 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
         // impossible (no surface ⇒ no usage and no wire defects ⇒ defer), so it
         // is journaled as an anomaly rather than silently dropped.
         if (liveBoolean(config.sessionNotices, true)) {
-          const notice = appendSessionNotice({ session: payload.agent.session, result: outcome })
+          baselineUpdatedThisPass = outcome.baselineUpdated === true
+      const notice = appendSessionNotice({ session: payload.agent.session, result: outcome })
           if (notice.ok) {
             journal?.info('session-notice', notice.summary, { seq: notice.seq }, sessionId)
           } else if (notice.reason === 'headless-surface') {
@@ -714,6 +723,73 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
       // with the tagged messages (MC per-turn fail-open). The next pass
       // re-decides from durable state.
       ctx.logger.warn(`magic-context: management pass failed (continuing): ${detail}`)
+    }
+
+    // ── Emergency fail-closed ────────────────────────────────────────────────
+    // Upstream decides this AFTER the reclaim pass (`evaluateEmergencyFailClosed`,
+    // transform-postprocess-phase.ts:1901), because the pass is what makes the
+    // wire smaller: aborting before it would refuse a request the pass just
+    // fixed. Only a session armed BY A PROVIDER OVERFLOW may abort, and only when
+    // this pass did not fold — otherwise the request describes a wire the
+    // provider has already rejected (`:1930`).
+    try {
+      const drain = stores.getDrainState(sessionId)
+      const armed = (drain.overflowArmedAt ?? 0) > 0
+      if (armed) {
+        const route = requestContextOf(payload.agent.session)
+        const provenRaw = route.provider === undefined || route.model === undefined
+          ? undefined
+          : stores.getMeta(provenLimitKey(route.provider, route.model))
+        const provenLimit = provenRaw === undefined ? undefined : Number(provenRaw)
+        const failClosed = evaluateEmergencyFailClosed({
+          usagePercentage: pressureThisTurn ?? 0,
+          emergencyRecoveryArmed: armed,
+          emergencyRecoveryOrigin: drain.overflowOrigin ?? null,
+          foldMaterializedThisPass: baselineUpdatedThisPass,
+          ...provenLimit === undefined || !Number.isFinite(provenLimit)
+            ? {}
+            : { providerProvenLimitTokens: provenLimit },
+          ...route.contextWindow === undefined ? {} : { contextLimitTokens: route.contextWindow },
+        })
+        if (failClosed.shouldAbort) {
+          journal?.warn(
+            'error',
+            `emergency fail-closed: ${failClosed.reason} — request refused`,
+            { scope: 'fail-closed', reason: failClosed.reason, pressure: pressureThisTurn },
+            sessionId,
+          )
+          // Tell the user why the turn did not happen: a rejection with no
+          // explanation reads as a hang.
+          try {
+            // `appendMagicContextEntry` rather than `appendSessionNotice`: the
+            // latter summarises a PASS result, and this is not one.
+            appendMagicContextEntry(
+              payload.agent.session,
+              failClosed.refusalMessage ?? (
+                'Magic Context: the previous request exceeded the context window and nothing has '
+                + 'reclaimed enough since. The request was refused instead of being sent to fail again.'
+              ),
+              'Magic Context · request refused (context window exceeded)',
+            )
+          } catch {
+            // A notice is courtesy; the rejection is the point.
+          }
+          return { kind: 'reject' }
+        }
+        if (failClosed.reason === 'trusted-final-wire-disarm' && failClosed.disarm !== undefined) {
+          stores.putDrainState(sessionId, { ...drain, overflowArmedAt: 0, overflowOrigin: undefined })
+          journal?.info(
+            'emergency-reclaim',
+            `disarmed: ${String(failClosed.disarm.finalWireTokens)} of ${String(failClosed.disarm.provenLimitTokens)} tokens`,
+            { finalWireTokens: failClosed.disarm.finalWireTokens, limit: failClosed.disarm.provenLimitTokens },
+            sessionId,
+          )
+        }
+      }
+    } catch (failClosedError) {
+      // A gate that throws must not wedge the turn: same fail-open rule as the
+      // rest of the pre-step band.
+      ctx.logger.warn(`magic-context: fail-closed evaluation failed (continuing): ${errText(failClosedError)}`)
     }
 
     return { ...decision, messages: hintAppendix === undefined ? messages : [...messages, hintAppendix] }
