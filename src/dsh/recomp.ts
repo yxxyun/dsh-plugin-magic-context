@@ -22,7 +22,7 @@ import { estimateTokens } from '../core/token-estimate.ts'
 import type { Journal } from '../core/journal.ts'
 import type { PressurePolicy } from '../core/policy.ts'
 import type { AdapterStores } from '../core/stores.ts'
-import { callHistorian, historianTriggerBudget, type HistorianLlm } from './historian.ts'
+import { callHistorian, historianChunkTokens, type HistorianLlm } from './historian.ts'
 import { nodesForSeqs, requestContextOf, type SessionSeq, type SurfaceNode } from './seams.ts'
 
 export const RECOMP_USAGE = 'Usage: /ctx-recomp [all | last:<n> | <startSeq>-<endSeq>]'
@@ -172,10 +172,12 @@ export async function recompactCompartments(
   const failed: Array<{ compartmentId: number; reason: string }> = []
   // The same 5%-of-window budget (5k..50k) the automatic path uses, so an
   // oversized span digests in chunks with a merge call instead of truncating.
-  const chunkTokens = historianTriggerBudget(
-    input.contextWindow,
+  // A manual recomp is one chunk of raw history, sized by the HISTORIAN model's
+  // context (upstream `deriveHistorianChunkTokens`), not by the main session's
+  // trigger budget — those two numbers scale on different bases.
+  const chunkTokens = historianChunkTokens(
+    undefined,
     policy.historianAssumedWindow,
-    policy.historianMinBudgetTokens,
   )
   for (const target of input.targets) {
     // The compartment stores its covered seqs as plain numbers (they round-trip

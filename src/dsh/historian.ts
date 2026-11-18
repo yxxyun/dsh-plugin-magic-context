@@ -33,6 +33,7 @@ import type { CompartmentLease } from '../core/compartment-lease.ts'
 import type { LlmSeamMessage } from '../core/types.ts'
 import { errText } from '../core/types.ts'
 import { spanRequestMessages, type SessionSeq, type SurfaceNode } from './seams.ts'
+import { deriveProtectedTailTokenTarget, protectedNodeCount } from '../core/protected-tail.ts'
 
 /** The narrow LLM seam the historian needs (satisfied by `ctx.llm`). */
 export interface HistorianLlm {
@@ -1045,6 +1046,43 @@ export function runHistorian(
   return run
 }
 
+/**
+ * How many trailing nodes the historian must NOT touch.
+ *
+ * Upstream derives this from the window and the live pressure
+ * (`deriveProtectedTailTokenTarget`): a high-pressure session protects a smaller
+ * tail so compression can actually free room. A fixed node count did the
+ * opposite — the same 8 messages stayed protected at 20% and at 90%.
+ *
+ * `policy.historianProtectedNodes` remains the floor: a profile that wants a
+ * wider live window keeps saying so, and the derived target only widens it.
+ */
+function protectTailNodes(
+  nodes: readonly SurfaceNode[],
+  deps: { readonly policy: PressurePolicy },
+  input: { readonly contextWindow?: number; readonly usagePercentage?: number },
+): number {
+  const minimum = Math.max(0, deps.policy.historianProtectedNodes)
+  // An explicit 0 means "protect nothing": the token derivation is a floor-raiser,
+  // never a protector in its own right. (Harnesses and recomp paths rely on it to
+  // reach the whole surface.)
+  if (minimum === 0) return 0
+  const target = deriveProtectedTailTokenTarget({
+    contextLimit: input.contextWindow ?? deps.policy.assumedContextWindow,
+    executeThresholdPercentage: deps.policy.executeThreshold,
+    usagePercentage: input.usagePercentage ?? 0,
+  })
+  const derived = protectedNodeCount(
+    nodes.map(node => estimateTokens(node.text)),
+    target.N,
+    minimum,
+  )
+  // Never protect the whole surface: at least `historianMinNodes` must stay
+  // eligible, otherwise a short session is "protected" into permanent silence.
+  const ceiling = Math.max(0, nodes.length - Math.max(1, deps.policy.historianMinNodes))
+  return Math.min(ceiling, Math.max(minimum, derived))
+}
+
 async function runHistorianExclusive(
   deps: HistorianDeps,
   input: {
@@ -1108,7 +1146,11 @@ async function runHistorianExclusive(
       nodes: input.nodes,
       covered: deps.stores.coveredSeqs(input.sessionId),
       ...input.baselineNodeSeq === undefined ? {} : { baselineNodeSeq: input.baselineNodeSeq },
-      protectedNodes: deps.policy.historianProtectedNodes,
+      // Protect the tail by TOKEN budget derived from window and pressure
+      // (upstream `deriveProtectedTailTokenTarget`), not by a fixed node count.
+      // `historianProtectedNodes` stays as the minimum, so a profile that wants a
+      // wider live window can still say so.
+      protectedNodes: protectTailNodes(input.nodes, deps, input),
       minNodes: deps.policy.historianMinNodes,
     })
   if (range === undefined) return undefined
