@@ -1,3 +1,5 @@
+import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
+import { createHash } from 'node:crypto'
 /**
  * The preStep band: the real-user-turn counter, cross-project drift
  * observation, maintenance identity registration, and the pressure decision
@@ -562,6 +564,9 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
           policy,
           logger: ctx.logger,
           pass,
+          ...latestSystemPromptFingerprint === undefined
+            ? {}
+            : { systemHash: latestSystemPromptFingerprint },
           pressure,
           ...pressureStale ? { pressureStale: true } : {},
           ...journal === undefined ? {} : { journal },
@@ -723,6 +728,43 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
  * a band fires — an empty text contributes nothing. The listeners dispose with
  * the inject fiber (a scope reload re-runs the whole inject).
  */
+/**
+ * The system-prompt fingerprint the LAST assembly produced.
+ *
+ * Upstream keys a HARD fold on it (`system-prompt-hash.ts:739`): the system
+ * prompt precedes every message, so a change there makes the provider rewrite its
+ * cache from that block onward anyway — folding the baseline on the same turn is
+ * free, and serving the old prefix wastes the whole rewrite.
+ *
+ * One value, not a map: a system prompt is assembled immediately before the turn
+ * it belongs to, so the assembly observed most recently IS the one the next pass
+ * runs under. Two sessions assembling concurrently would race here — the pass
+ * would then compare against the other session's prompt and fold once for
+ * nothing. That is a wasted fold, not a wrong result, and the alternative is
+ * threading a scope key through an API that does not hand one to the callback.
+ */
+let latestSystemPromptFingerprint: string | undefined
+
+/**
+ * MD5 of the rendered system prompt — the same digest and the same material the
+ * upstream fingerprint uses (`systemPromptFingerprint`, prompt-surface-runtime.ts:71),
+ * so a value recorded here means what an upstream value means.
+ *
+ * `renderPrompt` is the host's own renderer; using it (rather than hashing the
+ * assembly object) keeps the digest tied to the bytes the provider will see.
+ */
+function fingerprintOf(assembly: unknown): string | undefined {
+  if (assembly === undefined || assembly === null) return undefined
+  const rendered = renderPrompt(assembly as Parameters<typeof renderPrompt>[0])
+  if (typeof rendered !== 'string' || rendered.length === 0) return undefined
+  return createHash('md5').update(rendered).digest('hex')
+}
+
+/** Test seam: the digest of the most recent assembly, or undefined. */
+export function currentSystemPromptFingerprint(): string | undefined {
+  return latestSystemPromptFingerprint
+}
+
 export function injectReduceGuidance(deps: PreStepDeps): void {
   const { ctx, config, stores, journal, reduceTracker, lane } = deps
   if (liveBoolean(config.reduceGuidance, true) === false) return
@@ -741,6 +783,11 @@ export function injectReduceGuidance(deps: PreStepDeps): void {
       name: 'magic-context-reduce',
       order: 910,
       text: (assembly: unknown) => {
+        try {
+          latestSystemPromptFingerprint = fingerprintOf(assembly)
+        } catch {
+          // Observation only: a fingerprint failure must not cost the turn.
+        }
         try {
           const agent = (assembly as { agent?: { session?: Session } }).agent
           const session = agent?.session

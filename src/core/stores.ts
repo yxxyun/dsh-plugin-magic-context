@@ -23,7 +23,7 @@ import { openCompartmentLease, type CompartmentLease, type LeaseDatabase } from 
 import { openDreamLease, type DreamLease, type DreamLeaseOptions } from './dream-lease.ts'
 import type { TagRecord, TagTarget, UsageRecord } from './types.ts'
 
-export const SCHEMA_VERSION = 17
+export const SCHEMA_VERSION = 18
 
 /** The m[0]/m[1] baseline identity for one session. */
 export interface BaselineState {
@@ -50,6 +50,11 @@ export interface BaselineState {
    * compartments created in the same millisecond and inverts on a clock step back.
    */
   readonly maxCompartmentId?: number
+  /**
+   * Fingerprint of the system prompt this baseline was composed under
+   * (upstream `systemPromptFingerprint`). A change forces a HARD fold.
+   */
+  readonly systemHash?: string
   /** Identity of the injected project-memory digest (change ⇒ HARD). */
   readonly memoriesDigest?: string
   /**
@@ -1176,6 +1181,21 @@ const MIGRATIONS: readonly Migration[] = [
       db.exec('ALTER TABLE baseline_state ADD COLUMN max_compartment_id INTEGER NOT NULL DEFAULT 0')
     },
   },
+  {
+    // v18: the system-prompt fingerprint the m[0] baseline was composed under.
+    //
+    // Upstream keys a HARD fold on it (`system-prompt-hash.ts:739`): the system
+    // prompt precedes every message, so when it changes the provider rewrites its
+    // cache from that point onward no matter what the messages pass does — which
+    // makes folding the baseline on the same turn free. Without the stamp the
+    // adapter kept serving a prefix the provider had already invalidated.
+    version: 18,
+    up: (db) => {
+      const columns = db.prepare('PRAGMA table_info(baseline_state)').all() as Array<{ name: string }>
+      if (columns.some(column => column.name === 'system_hash')) return
+      db.exec('ALTER TABLE baseline_state ADD COLUMN system_hash TEXT')
+    },
+  },
 ]
 
 /**
@@ -1626,6 +1646,7 @@ export function openStores(dataDir: string): AdapterStores {
     profile_watermark: number | null; profile_m0_digest: string | null
     render_epoch: number | null
     max_compartment_id: number | null
+    system_hash: string | null
     updated_at: number
   }
 
@@ -1651,6 +1672,7 @@ export function openStores(dataDir: string): AdapterStores {
       ...row.max_compartment_id === null || row.max_compartment_id === 0
         ? {}
         : { maxCompartmentId: row.max_compartment_id },
+      ...row.system_hash === null ? {} : { systemHash: row.system_hash },
       updatedAt: row.updated_at,
     }
   }
@@ -1658,8 +1680,8 @@ export function openStores(dataDir: string): AdapterStores {
   const saveBaselineState = (state: BaselineState): void => {
     db.prepare(
       'INSERT INTO baseline_state(session_id, epoch, node_seq, provider, model, frozen_at, memories_digest, '
-        + 'max_memory_id, max_memory_mutation_id, project_epoch_fingerprint, profile_watermark, profile_m0_digest, render_epoch, max_compartment_id, updated_at) '
-        + 'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) '
+        + 'max_memory_id, max_memory_mutation_id, project_epoch_fingerprint, profile_watermark, profile_m0_digest, render_epoch, max_compartment_id, system_hash, updated_at) '
+        + 'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) '
         + 'ON CONFLICT(session_id) DO UPDATE SET epoch = excluded.epoch, node_seq = excluded.node_seq, '
         + 'provider = excluded.provider, model = excluded.model, frozen_at = excluded.frozen_at, '
         + 'memories_digest = excluded.memories_digest, max_memory_id = excluded.max_memory_id, '
@@ -1667,6 +1689,7 @@ export function openStores(dataDir: string): AdapterStores {
         + 'project_epoch_fingerprint = excluded.project_epoch_fingerprint, '
         + 'profile_watermark = excluded.profile_watermark, '
         + 'profile_m0_digest = excluded.profile_m0_digest, render_epoch = excluded.render_epoch, '
+        + 'max_compartment_id = excluded.max_compartment_id, system_hash = excluded.system_hash, '
         + 'updated_at = excluded.updated_at',
     ).run(
       state.sessionId,
@@ -1683,6 +1706,7 @@ export function openStores(dataDir: string): AdapterStores {
       state.profileM0Digest ?? null,
       state.renderEpoch ?? 0,
       state.maxCompartmentId ?? 0,
+      state.systemHash ?? null,
       state.updatedAt,
     )
   }

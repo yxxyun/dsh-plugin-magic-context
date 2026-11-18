@@ -116,6 +116,8 @@ export interface ManagementPassInput {
   /** Validation-period activity journal (optional). */
   readonly journal?: Journal
   /** Project memories to inject (already rendered, in MC render order). */
+  /** Fingerprint of the system prompt for THIS pass (absent = not observed). */
+  readonly systemHash?: string
   readonly memories?: {
     readonly digest: string
     readonly lines: readonly string[]
@@ -514,6 +516,15 @@ function refreshBaseline(
   // because the cached bytes still matched the cached bytes.
   const renderEpochChanged = previous !== undefined
     && (previous.renderEpoch ?? 0) !== BASELINE_RENDER_EPOCH
+  // Upstream `system-prompt-hash.ts:739`: when the system prompt changes, the
+  // provider rewrites its cache from that block onward whatever the messages pass
+  // does — so folding the baseline on the same turn costs nothing. Both sides
+  // must be present: a session whose hash has not been observed yet must not fold
+  // on every pass while it stays unknown.
+  const systemHashChanged = previous !== undefined
+    && previous.systemHash !== undefined
+    && input.systemHash !== undefined
+    && previous.systemHash !== input.systemHash
   const memoriesChanged = previous !== undefined
     && previous.memoriesDigest !== undefined
     && memories !== undefined
@@ -554,7 +565,7 @@ function refreshBaseline(
   // costs nothing that is not already lost and folds m[1] back into m[0] for
   // the requests that follow. Off ⇒ the pass only lands queued work.
   const ttlFold = input.policy.ttlRebuild === true && input.pass.reason === 'cache-ttl-idle'
-  const hard = ttlFold || previous === undefined || routeChanged || memoriesChanged || epochChanged || cursorUpgrade || profileChanged || renderEpochChanged  // Freeze targets for a HARD fold. Falling back to the previous values keeps a
+  const hard = ttlFold || previous === undefined || routeChanged || memoriesChanged || epochChanged || cursorUpgrade || profileChanged || renderEpochChanged || systemHashChanged  // Freeze targets for a HARD fold. Falling back to the previous values keeps a
   // pass that has no mutation lane (bridge unavailable) from rewinding them.
   const frozenCursor = updates?.cursor ?? previous?.maxMemoryMutationId
   const frozenEpochFingerprint = updates?.projectEpochFingerprint ?? previous?.projectEpochFingerprint
@@ -671,6 +682,7 @@ function refreshBaseline(
         ...memories === undefined ? {} : { memoriesDigest: memories.digest },
         renderEpoch: BASELINE_RENDER_EPOCH,
         maxCompartmentId: highestCompartmentId(sets.baseline),
+        ...input.systemHash === undefined ? {} : { systemHash: input.systemHash },
       })
     }
     return false
@@ -694,6 +706,7 @@ function refreshBaseline(
     ...memories === undefined ? {} : { memoriesDigest: memories.digest },
     renderEpoch: BASELINE_RENDER_EPOCH,
     maxCompartmentId: highestCompartmentId(sets.baseline),
+    ...input.systemHash === undefined ? {} : { systemHash: input.systemHash },
   })
   input.journal?.info(
     'baseline',
