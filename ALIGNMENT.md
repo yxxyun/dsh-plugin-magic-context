@@ -56,16 +56,26 @@
 | `auto-search-worker-client.ts`（976） | `memory-search.ts` + 工具面 | 上游是 worker 进程 |
 | `system-prompt-hash.ts`（882） | — | 用于检测 system prompt 变化触发 HARD；本地用 `renderEpoch` + 路由变化，**未实现 system hash** |
 
-## 已移植但未接线
+## 紧急 fail-closed 全链（已接线）
 
-| 行为 | 上游位置 | 本地 | 状态 |
+| 环节 | 上游位置 | 本地 | commit |
 |---|---|---|---|
-| 紧急 fail-closed 判定 | `transform-postprocess-phase.ts:1901` | `core/emergency-fail-closed.ts`（10 条测试） | **判定已完成。pre-step 确认可以中止 turn**（`{ kind: 'reject' }`）。接线还差 arm 状态持久化 |
-| provider 证明的 limit 解析 | `providerProvenLimitTokens`（:1915） | `core/provider-limit.ts`（10 条测试） | **已接线**：overflow 时从 `failure.message` 解析并存 `meta`，journal `provider-limit` |
+| 判定 | `transform-postprocess-phase.ts:1901` | `core/emergency-fail-closed.ts`（10 条测试） | f726f39 |
+| provider 证明的 limit | `providerProvenLimitTokens`（:1915） | `core/provider-limit.ts`（10 条）→ `meta: proven.limit.<p>\|<m>` | 33818a5 |
+| arm 状态 | `needsEmergencyRecovery` + `emergencyRecoveryOrigin`（storage-meta-persisted.ts:2138） | `drain_state.overflow_armed_at/origin`（schema v19） | 29d0f74 |
+| pre-step 消费 | 同上 | `{ kind: 'reject' }` + 会话内说明 | 2895e72 |
+| join 测试 | — | `tests/fail-closed-join.spec.ts`（6 条） | 2895e72 |
+
+**能力边界**：本地没有 trusted 的 wire 测量（chars/4 是估算），所以只走「armed +
+provider_overflow + 本轮没折 → 拒绝」这一条。disarm 需要可信测量，代码路径在、暂时
+不会触发——这是诚实的能力边界，不是逻辑缺失。
 
 ## 已知缺口
 
-0. **`freezeReasoningOnBustingPass`**（`transform-postprocess-phase.ts:590`）：缓存必然
+0. **trusted wire 测量**：disarm 分支因此不激活。上游从请求的实际字节数取，本地只有
+   chars/4。做法是记录每次请求的 provider 回报用量，与本地估算做回归——需要先积累数据。
+
+1. **`freezeReasoningOnBustingPass`**（`transform-postprocess-phase.ts:590`）：缓存必然
    失效的那一轮把 assistant 的 reasoning 块剥掉。thinking 文本通常很大，缓存既然已废，
    剥掉是纯收益。**未做**：本地 `replaceSurfaceRange` 是真的替换（原内容只能靠
    `sourceEventSeqs` 追溯），不可逆；上游只是记 id、渲染时跳过。做之前要先实测
