@@ -104,16 +104,22 @@ describe('tier ladder', () => {
   })
 
   it('degrades by positional age (compartments), never by the clock', () => {
+    // Upstream curve at importance 50 / pressure 1: half-life 24 compartments,
+    // boundaries at z = 0.201 / 0.729 / 1.322 (decay-curve.ts).
     expect(selectTier(50, 0)).toBe('p1')
-    expect(selectTier(50, 3)).toBe('p2')
-    expect(selectTier(50, 8)).toBe('p3')
-    expect(selectTier(50, 20)).toBe('p4')
-    // importance promotes one step, never beyond p1
-    expect(selectTier(90, 3)).toBe('p1')
-    expect(selectTier(90, 20)).toBe('p3')
-    // low importance demotes one step, never beyond p4
-    expect(selectTier(10, 0)).toBe('p2')
-    expect(selectTier(10, 20)).toBe('p4')
+    expect(selectTier(50, 4)).toBe('p1')   // z = 4/24 = 0.167
+    expect(selectTier(50, 5)).toBe('p2')   // z = 5/24 = 0.208
+    expect(selectTier(50, 18)).toBe('p3')  // z = 0.750
+    expect(selectTier(50, 32)).toBe('p4')  // z = 1.333
+    // High importance stretches the half-life instead of nudging one band:
+    // 90 -> F = 2^1.6 = 3.03, so age 32 is z = 32/72.7 = 0.44 -> still P2.
+    expect(selectTier(90, 32)).toBe('p2')
+    // Low importance compresses it: 10 -> F = 2^-1.6 = 0.33, half-life 7.9.
+    // Age 0 is still P1 for everyone (z is 0), but by age 8 it is already at
+    // z = 1.01 — P3, where importance 50 would still be at P1.
+    expect(selectTier(10, 0)).toBe('p1')
+    expect(selectTier(10, 8)).toBe('p3')
+    expect(selectTier(50, 8)).toBe('p2')
     // Positional age, not wall-clock age — the clock is not an input at all,
     // which is what makes the rendered block byte-stable (upstream
     // `mc-core/src/decay.rs:61-62`: "`a` is the 0-based age").

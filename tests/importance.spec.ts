@@ -38,11 +38,11 @@ describe('importance parsing', () => {
     expect(parseHistorianOutput(wrap(' importance="140"')).importance).toBe(100)
   })
 
-  it('an explicit 0 decays fast — it is the lowest score, not a default', () => {
-    // selectTier penalises importance <= 20 by one tier.
-    const low = selectTier(0, 0)
-    const mid = selectTier(50, 0)
-    expect(low).not.toBe(mid)
+  it('an explicit 0 decays much faster than an absent-score 50', () => {
+    // Age 0 is P1 for every score (z is 0), so compare where they diverge:
+    // importance 0 halves the half-life four times over vs 50.
+    expect(selectTier(0, 10)).toBe('p4')
+    expect(selectTier(50, 10)).toBe('p2')
   })
 })
 

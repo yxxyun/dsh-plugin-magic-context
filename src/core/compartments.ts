@@ -92,6 +92,7 @@ export function compactedPlaceholder(compartmentId: number): string {
  */
 export { estimateTokens } from './token-estimate.ts'
 import { estimateTokens as estimateTokensImpl } from './token-estimate.ts'
+import { tier } from './decay-curve.ts'
 /**
  * Pick the detail tier for one compartment from its importance and its
  * POSITIONAL age (0 = newest), never its wall-clock age.
@@ -102,18 +103,22 @@ import { estimateTokens as estimateTokensImpl } from './token-estimate.ts'
  * budget_pressure, anchor_overlap)`. Time never enters the render, which is
  * what makes `same inputs → same bytes` true (`m0_compose.rs:1-9`).
  *
- * Adapter-side approximation of the decay curve (documented divergence): the
- * same four bands, measured in compartments rather than minutes — the newest
- * three keep full fidelity, then 3–7, 8–19, and everything older collapses to
- * the p4 skeleton. Importance still nudges one step.
+ * This used to be an approximation — "the same four bands, measured in
+ * compartments rather than minutes, importance nudges one step" — which had no
+ * budget-pressure term at all, so a tight history budget could not relax the
+ * curve. It now calls upstream's curve (`decay-curve.ts`): the half-life is
+ * `24 x 2^((importance-50)/25) / pressure` and the band boundaries are the
+ * geometric means of the measured tier costs.
  */
-export function selectTier(importance: number, positionalAge: number): CompartmentTier {
+export function selectTier(
+  importance: number,
+  positionalAge: number,
+  budgetPressure = 1,
+): CompartmentTier {
   const bands: readonly CompartmentTier[] = ['p1', 'p2', 'p3', 'p4']
-  const age = Math.max(0, Math.floor(positionalAge))
-  let index = age < 3 ? 0 : age < 8 ? 1 : age < 20 ? 2 : 3
-  if (importance >= 80) index -= 1
-  else if (importance <= 20) index += 1
-  return bands[Math.min(bands.length - 1, Math.max(0, index))] as CompartmentTier
+  // `tier()` takes a 1-based index from newest; our callers pass 0-based age.
+  const band = tier(Math.max(0, Math.floor(positionalAge)) + 1, importance, budgetPressure)
+  return bands[Math.min(bands.length - 1, Math.max(0, band - 1))] as CompartmentTier
 }
 
 /** The text of one compartment at its natural tier. */
