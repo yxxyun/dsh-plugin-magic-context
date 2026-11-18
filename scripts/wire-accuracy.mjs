@@ -41,15 +41,16 @@ try {
   // One row per (session, moment): the pass's estimate and the FIRST usage the
   // provider reported at or after it — a pass runs, then the request it sized
   // goes out, so the bill comes after, not before.
-  // `estSystemPromptTokens` marks the CURRENT estimate shape (surface + system
-  // prompt). Rows written before it existed under-report by however large the
-  // system prompt is — measured at ~10k tokens — so mixing the two eras measures
-  // nothing. `--all` opts into the mixed reading for comparison.
+  // `estWireTokens` marks the CURRENT estimate shape: every content block plus
+  // the system prompt. The older `estSurfaceTokens` key has meant three different
+  // things over this project's life (text only, then + system prompt, then wire
+  // tokens), so a report that reads it mixes eras — and one pre-wire sample was
+  // enough to dominate p90. `--all` opts into the mixed reading for comparison.
   const onlyCurrentShape = !process.argv.includes('--all')
   const rows = db.prepare(`
     SELECT p.session_id,
            p.at            AS pass_at,
-           json_extract(p.data, '$.estSurfaceTokens') AS estimated,
+           json_extract(p.data, '$.estWireTokens') AS estimated,
            (SELECT u.input_tokens + COALESCE(u.cache_read_tokens, 0) + COALESCE(u.cache_write_tokens, 0)
               FROM usage_records u
              WHERE u.session_id = p.session_id
@@ -63,7 +64,7 @@ try {
       FROM journal p
      WHERE p.kind = 'pass'
        AND p.at > ?
-       AND json_extract(p.data, '$.estSurfaceTokens') IS NOT NULL
+       AND json_extract(p.data, '$.estWireTokens') IS NOT NULL
        ${onlyCurrentShape ? "AND json_extract(p.data, '$.estSystemPromptTokens') IS NOT NULL" : ''}
      ORDER BY p.at DESC
   `).all(since)

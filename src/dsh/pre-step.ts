@@ -406,6 +406,12 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
         // tool-heavy request (measured 2.4x). `surfaceWireTokens` charges every
         // block, so this number means what the provider will bill.
         estSurfaceTokens: surfaceWireTokens(payload.agent.session) + (latestSystemPromptTokens ?? 0),
+        // A FIELD NAME THAT MEANS ONE THING. `estSurfaceTokens` changed meaning
+        // twice (text-only, then + system prompt, then wire tokens), so rows from
+        // different eras sit under one key and no reader can tell them apart —
+        // the accuracy report's spread was dominated by one pre-wire sample.
+        // Anything that compares estimates against reality reads THIS key.
+        estWireTokens: surfaceWireTokens(payload.agent.session) + (latestSystemPromptTokens ?? 0),
         ...latestSystemPromptTokens === undefined ? {} : { estSystemPromptTokens: latestSystemPromptTokens },
         pressure: pressure === undefined ? undefined : Number(pressure.toFixed(1)),
         // Visible in the pass row: a stale reading explains why a high
