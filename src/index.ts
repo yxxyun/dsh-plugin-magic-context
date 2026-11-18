@@ -85,7 +85,7 @@ import { liveJournal } from './dsh/live-journal.ts'
 import { createTelemetryService } from './dsh/telemetry.ts'
 import { createDashboardService } from './dsh/dashboard.ts'
 import { openMemoryLane } from './dsh/memory-lane.ts'
-import { injectReduceGuidance, preStepListener, type PreStepProjects } from './dsh/pre-step.ts'
+import { injectReduceGuidance, observeSystemPrompt, preStepListener, type PreStepProjects } from './dsh/pre-step.ts'
 import { ensureDreamSchedules, runDueDreamTasks } from './core/dream-runner.ts'
 import { buildDreamHandlers } from './dsh/dream-handlers.ts'
 import { resolveDreamConfig } from './dsh/dream-config.ts'
@@ -748,6 +748,10 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
   injectReduceGuidance({
     ctx, config, stores, journal, llm, reduceTracker, lane, projects, seenSessions, activePolicy,
   })
+  // The system prompt's fingerprint and size come from the ASSEMBLY waterfall —
+  // the `text` provider inside `systemPrompt.context` receives an AssembleContext,
+  // not the assembled prompt (see observeSystemPrompt's docstring).
+  observeSystemPrompt({ ctx })
 
 
   // ── Usage recording from durable assistant/message events (Phase 0) ───────

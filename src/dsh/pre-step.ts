@@ -891,6 +891,50 @@ export function currentSystemPromptFingerprint(): string | undefined {
   return latestSystemPromptFingerprint
 }
 
+/**
+ * Observe every assembled system prompt.
+ *
+ * The obvious place — the `text` provider inside `systemPrompt.context` — is the
+ * WRONG one: its argument is `AssembleContext` (`{ scope, signal }`), not a
+ * `PromptAssembly`. Passing it to `renderPrompt` throws, and an early empty catch
+ * made that silent: `baseline_state.system_hash` was null in every row while the
+ * code looked correct (measured 2026-11-18).
+ *
+ * The waterfall event is the one that carries the assembled prompt. Wrapping
+ * `next()` and recording afterwards also makes the value the REAL assembly —
+ * every other contributor has already had its say.
+ */
+export function observeSystemPrompt(deps: Pick<PreStepDeps, 'ctx'>): void {
+  const { ctx } = deps
+  try {
+    ;(ctx as unknown as { on(name: string, handler: (...args: never[]) => unknown): void }).on(
+      'system-prompt/assemble',
+      async (assembly: unknown, _context: unknown, next: () => Promise<unknown>) => {
+        const assembled = await next()
+        try {
+          const rendered = renderPrompt(assembled as Parameters<typeof renderPrompt>[0])
+          if (typeof rendered === 'string' && rendered.length > 0) {
+            latestSystemPromptFingerprint = createHash('md5').update(rendered).digest('hex')
+            latestSystemPromptTokens = estimateTokens(rendered)
+          }
+        } catch (observeError) {
+          // Observation only: never cost the turn. Say it once so the next
+          // silent failure is diagnosable.
+          if (!systemPromptObservationWarned) {
+            systemPromptObservationWarned = true
+            ctx.logger?.warn?.(
+              `magic-context: system prompt observation failed (continuing): ${errText(observeError)}`,
+            )
+          }
+        }
+        return assembled
+      },
+    )
+  } catch (hookError) {
+    ctx.logger?.warn?.(`magic-context: could not observe system prompts: ${errText(hookError)}`)
+  }
+}
+
 export function injectReduceGuidance(deps: PreStepDeps): void {
   const { ctx, config, stores, journal, reduceTracker, lane } = deps
   if (liveBoolean(config.reduceGuidance, true) === false) return
@@ -909,19 +953,6 @@ export function injectReduceGuidance(deps: PreStepDeps): void {
       name: 'magic-context-reduce',
       order: 910,
       text: (assembly: unknown) => {
-        try {
-          latestSystemPromptFingerprint = fingerprintOf(assembly)
-        } catch (fingerprintError) {
-          // Observation only: a fingerprint failure must not cost the turn. But
-          // say it ONCE — a silent catch here is why `system_hash` sat at null in
-          // every baseline row while the code looked correct.
-          if (!systemPromptObservationWarned) {
-            systemPromptObservationWarned = true
-            ctx.logger?.warn(
-              `magic-context: system prompt observation failed (continuing): ${errText(fingerprintError)}`,
-            )
-          }
-        }
         try {
           const agent = (assembly as { agent?: { session?: Session } }).agent
           const session = agent?.session
