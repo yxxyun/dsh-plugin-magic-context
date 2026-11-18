@@ -39,6 +39,7 @@ const PHASE_BASE = [
   'tests/memory-line-format.spec.ts',
   'tests/memory-grouping.spec.ts',
   'tests/historian-memory-block.spec.ts',
+  'tests/memory-budget-source.spec.ts',
   // Anti-idle gates ported from upstream mc-upstream a1ca346: the derived force
   // band, the rolling drain budget, the emergency latch, and the post-drop
   // projection that decides when summarisation is the only lever left.

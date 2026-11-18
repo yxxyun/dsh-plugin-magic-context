@@ -489,7 +489,7 @@ export function publishReadyCompartments(
  * header format. Every existing baseline then folds once, instead of surviving
  * as a mismatch nobody can see.
  */
-export const BASELINE_RENDER_EPOCH = 5
+export const BASELINE_RENDER_EPOCH = 6
 
 /** Upstream `RECENT_TOOL_SKELETON_WINDOW` (apply-operations.ts:53). */
 const RECENT_TOOL_SKELETON_WINDOW = 20

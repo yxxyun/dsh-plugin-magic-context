@@ -26,7 +26,7 @@
  * honoring the authority guard — invariants owned by Magic Context's storage
  * layer. The adapter recalls; it does not fork the memory store.
  */
-import { compareMemoryPriority } from './memory-budget.ts'
+import { compareMemoryPriority, trimToBudgetBySource } from './memory-budget.ts'
 import { DatabaseSync } from 'node:sqlite'
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
@@ -1218,17 +1218,17 @@ export function openMemoryBridge(options: MemoryBridgeOptions): MemoryBridge {
             // the result is a priority prefix. `continue` (the previous behaviour)
             // packed more rows by skipping the big one, which made the visible set
             // depend on byte-level fit — one edit reshuffled what the model saw.
-            const ordered = [...usable].sort(comparePriority)
-            const selected: MemoryRow[] = []
-            let used = 0
-            for (const row of ordered) {
-              if (selected.length >= request.limit) break
-              const cost = estimateTokens(renderMemoryLine(row))
-              if (used + cost > budgetTokens) break
-              used += cost
-              selected.push(row)
-            }
-            return selected
+            // Upstream `trimWorkspaceMemoriesToBudgetV2`: permanent first, then a
+            // per-source floor, then everything else by priority. With domain
+            // peers in play a single-pool pick let one source fill the budget and
+            // the other disappear from the prompt with nothing erroring.
+            return trimToBudgetBySource(
+              usable,
+              budgetTokens,
+              row => row.projectPath,
+              row => estimateTokens(renderMemoryLine(row)),
+              request.limit,
+            )
           }
           const poolSelected = pick(pool, request.budgetTokens)
           // MC budgets the additions at 25% of the memory injection budget.

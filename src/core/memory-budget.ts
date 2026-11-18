@@ -86,3 +86,91 @@ export function trimToBudget<T extends RankableMemory>(
   }
   return selected
 }
+
+/**
+ * Budget selection with per-source fairness — upstream
+ * `trimWorkspaceMemoriesToBudgetV2` (inject-compartments.ts:2063).
+ *
+ * The plain `trimToBudget` treats every row as one pool. That is wrong as soon as
+ * memory comes from more than one source: a project that also reads domain peers
+ * can have the peers' rows — or its own — fill the whole budget, so one source
+ * silently disappears from the prompt while the other crowds it out.
+ *
+ * Upstream's order, reproduced here:
+ *
+ *   1. permanent rows first, in priority order, still bounded by the budget;
+ *   2. the REMAINING budget is split evenly per source as a per-source floor, and
+ *      each source fills its own floor in priority order;
+ *   3. whatever is left is handed out by priority across all sources.
+ *
+ * Step 2 is a floor, not a cap: a source that does not use its share leaves it in
+ * the pot for step 3.
+ *
+ * Note the deliberate difference from `trimToBudget`: this one SKIPS a row that
+ * does not fit and keeps going (`continue`), because a floor pass per source
+ * cannot stop at the first oversize row — it would starve every later row of that
+ * source. The final pass still cannot exceed the budget.
+ */
+export function trimToBudgetBySource<T extends RankableMemory>(
+  memories: readonly T[],
+  budgetTokens: number,
+  sourceOf: (memory: T) => string | undefined,
+  costOf: (memory: T) => number,
+  limit?: number,
+): T[] {
+  const selected: T[] = []
+  const taken = new Set<number>()
+  let used = 0
+  const admit = (memory: T, cost: number): void => {
+    selected.push(memory)
+    taken.add(memory.id)
+    used += cost
+  }
+  const fits = (cost: number): boolean => used + cost <= budgetTokens
+  const capped = (): boolean => limit !== undefined && selected.length >= limit
+  const ordered = [...memories].sort(compareMemoryPriority)
+
+  // 1. permanent
+  for (const memory of ordered) {
+    if (capped()) break
+    if (memory.permanent !== true) continue
+    const cost = costOf(memory)
+    if (!fits(cost)) continue
+    admit(memory, cost)
+  }
+
+  // 2. per-source floor
+  const sources = new Map<string, T[]>()
+  for (const memory of ordered) {
+    if (memory.permanent === true || taken.has(memory.id)) continue
+    const source = sourceOf(memory)
+    if (source === undefined || source === '') continue
+    const list = sources.get(source)
+    if (list === undefined) sources.set(source, [memory])
+    else list.push(memory)
+  }
+  const floorTokens = Math.max(0, budgetTokens - used) / Math.max(1, sources.size)
+  for (const rows of sources.values()) {
+    let memberTokens = 0
+    for (const memory of rows) {
+      if (capped()) break
+      if (taken.has(memory.id)) continue
+      const cost = costOf(memory)
+      if (memberTokens + cost > floorTokens) continue
+      if (!fits(cost)) continue
+      admit(memory, cost)
+      memberTokens += cost
+    }
+  }
+
+  // 3. everything left, by priority
+  for (const memory of ordered) {
+    if (capped()) break
+    if (taken.has(memory.id)) continue
+    const cost = costOf(memory)
+    if (!fits(cost)) continue
+    admit(memory, cost)
+  }
+
+  return selected
+}
