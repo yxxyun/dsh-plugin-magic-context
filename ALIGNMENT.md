@@ -70,6 +70,34 @@
 provider_overflow + 本轮没折 → 拒绝」这一条。disarm 需要可信测量，代码路径在、暂时
 不会触发——这是诚实的能力边界，不是逻辑缺失。
 
+## 自创且未启用（上游无对应，且没有运行路径用它们）
+
+审计方法：对 `src/core/*.ts` 与 `src/dsh/*.ts` 逐个查「有没有别的文件 import 它」。
+
+| 模块 | 行数 | 状态 |
+|---|---|---|
+| `core/memory-chunk.ts`（226） | 分块函数 | 只被 `tests/memory-chunk.spec.ts` 与 `scripts/backfill-chunks.mjs` 引用 |
+| `core/chunk-store.ts` 的 `memory_chunks` 读写 | 分块向量存储 | 只有 `cosineScore`（一个纯数学函数）被生产代码使用；读 `memory_chunks` 的函数**没有调用方** |
+| `scripts/backfill-chunks.mjs` | 回填脚本 | 手动运行；维护 tick 不会自己分块（脚本注释里明确说了） |
+
+**判断依据**：上游的 chunk 是 **compartment 级**（`chunk-embedding-writer.ts`，对摘要分块），
+`grep chunkMemory` 在 `mc-upstream` 里零命中——memory 分块在上游不存在。
+
+所以这是一条完整的、自创的、没人读的链：建表 → 分块 → 脚本回填 → 存储 → **无人查询**。
+
+**处置建议**：不删。删除是破坏性操作，且 `memory_chunks` 里可能已有数据。正确的下一步
+是先决定「要不要 memory 级向量检索」——要，就补上读路径并承认这是自创扩展；不要，再
+连同表一起清理。在那之前，它存在于库里但不参与任何决策，这一点写在这里比留在代码里
+干净。
+
+## 已接线（但通过 CLI 而非运行路径）
+
+| 模块 | 行数 | 接在哪 |
+|---|---|---|
+| `core/domain-reconcile.ts` | 668 | `scripts/domain-reconcile.mjs`（SQL 与 IO 在脚本侧，判定是纯函数） |
+
+这是合理的形态：域复核对齐是一次性的运维动作，不需要进 pre-step。
+
 ## 已知缺口
 
 0. **trusted wire 测量**：disarm 分支因此不激活。上游从请求的实际字节数取，本地只有
