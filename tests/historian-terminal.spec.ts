@@ -718,6 +718,31 @@ describe('#802: a run that published nothing waits for a newer message', () => {
     })
   }
 
+  it('fires onStart only when a provider call is really paid for', async () => {
+    // The drain budget is charged in this callback. 2026-11-18: 12 escalations
+    // between 07:59 and 08:11 never reached a `start` row (nothing eligible) but
+    // were charged 6,554 tok each, so the budget ran out while zero digests were
+    // produced. Charging has to follow the start row, not the intention.
+    await withStore(async (stores) => {
+      // Case A: nothing eligible -> no start row -> no charge.
+      let fired = 0
+      const journalA = recordingJournal([])
+      await runHistorian(
+        { stores, policy, llm: answerLlm(digest()).llm as HistorianLlm, logger: silent, journal: journalA, route },
+        { sessionId: SESSION, session: stub(1), nodes: [], contextWindow: 10_000, onStart: () => { fired++ } },
+      ).catch(() => undefined)
+      expect(fired).toBe(0)
+
+      // Case B: a real run -> exactly one charge.
+      const journalB = recordingJournal([])
+      await runHistorian(
+        { stores, policy, llm: answerLlm(digest()).llm as HistorianLlm, logger: silent, journal: journalB, route },
+        { sessionId: `${SESSION}-b`, session: stub(20), nodes: wideNodes(20), contextWindow: 10_000, onStart: () => { fired++ } },
+      )
+      expect(fired).toBe(1)
+    })
+  })
+
   it('still runs when the span cap equals the trigger budget', async () => {
     // Regression, 2026-11-18: capping the span and then comparing the CAPPED
     // size against the trigger budget disabled the historian outright. With

@@ -622,6 +622,18 @@ export async function callHistorian(
      * with the chunk count, capped at 600s (MC's historian budget).
      */
     readonly chunkTokens?: number
+    /**
+     * Fired once the run is past every gate and the `start` row is written —
+     * i.e. when a provider call is actually about to be paid for.
+     *
+     * The drain budget needs this rather than "did the pass ask for a run":
+     * measured 2026-11-18, the RCC session escalated 12 times between 07:59 and
+     * 08:11 while every one of those calls returned before its `start` row
+     * (nothing eligible), and each was charged 6,554 tok anyway — so the budget
+     * was spent while no digest was ever produced, which is the exact opposite
+     * of what a budget is for.
+     */
+    readonly onStart?: () => void
   },
 ): Promise<CompartmentDraft> {
   const route = deps.route ?? input.route
@@ -696,6 +708,7 @@ export async function callHistorian(
     timeoutMs,
     ...merging ? { chunks: chunks.length } : {},
   }, input.sessionId)
+  input.onStart?.()
   let terminal = false
   let attempts = 0
   let failure: Error | undefined
@@ -969,6 +982,7 @@ export function runHistorian(
     readonly session: Parameters<typeof spanRequestMessages>[0]
     /** Explicit span (the manual/region path); default is the eligibility scan. */
     readonly forcedRange?: readonly SurfaceNode[]
+    readonly onStart?: () => void
   },
 ): Promise<Compartment | undefined> {
   const existing = inFlight.get(input.sessionId)
@@ -991,6 +1005,7 @@ async function runHistorianExclusive(
     readonly signal?: AbortSignal
     readonly session: Parameters<typeof spanRequestMessages>[0]
     readonly forcedRange?: readonly SurfaceNode[]
+    readonly onStart?: () => void
   },
 ): Promise<Compartment | undefined> {
   // #802: after a run that published nothing, automatic runs wait for a node
@@ -1088,6 +1103,7 @@ async function runHistorianExclusive(
       // D1/D3: an oversized span digests in ~budget-token chunks with a merge
       // call; the run budget scales with the chunk count (capped 600s).
       chunkTokens: budget,
+      ...input.onStart === undefined ? {} : { onStart: input.onStart },
       ...input.route === undefined ? {} : { route: input.route },
       ...input.signal === undefined ? {} : { signal: input.signal },
       ...input.nodes.find(node => node.role === 'system')?.seq === undefined

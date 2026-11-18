@@ -872,6 +872,9 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
     // the idle-gap cache loss as publish cost and pushed every digest into the
     // paid window. Reverted by measurement, not by taste.)
     let historianRequested = false
+    // Charged only when a provider call is actually paid for: see `onStart` in
+    // historian.ts. `historianRequested` stays for the release/return shape.
+    let historianStarted = false
     const idlePoke = input.pass.reason === 'cache-ttl-idle'
     // Drop starvation: this pass already landed everything it could, and the
     // surface barely moved. Below the force band the historian is normally held
@@ -1010,6 +1013,7 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
           : { baselineNodeSeq: input.stores.baselineState(input.sessionId)?.nodeSeq as SessionSeq },
         ...input.contextWindow === undefined ? {} : { contextWindow: input.contextWindow },
         ...input.route === undefined ? {} : { route: input.route },
+        onStart: () => { historianStarted = true },
       })
       // A reused run already carries its handler; a fresh one needs both (the
       // silent catch keeps an unhandled rejection from escaping).
@@ -1057,7 +1061,7 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
           ((input.contextWindow ?? input.policy.assumedContextWindow) * input.policy.executeThreshold) / 100,
         ),
       )
-      const historianCharge = historianRequested
+      const historianCharge = historianStarted
         ? Math.max(1, Math.min(input.policy.historianMaxTokens, Math.round(usableForCharge * 0.05)))
         : 0
       const window = chargeDrain(
