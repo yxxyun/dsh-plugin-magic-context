@@ -113,6 +113,8 @@ export interface ManagementPassInput {
   readonly memories?: {
     readonly digest: string
     readonly lines: readonly string[]
+    /** The same pool grouped by category (upstream `<CATEGORY>` blocks). */
+    readonly groups?: readonly { readonly category: string; readonly lines: readonly string[] }[]
     /** Memories written after the m[0] watermark → rendered in m[1]. */
     readonly newLines?: readonly string[]
     /** Ids of {@link newLines}, so `<memory-updates>` cannot duplicate them. */
@@ -481,7 +483,7 @@ export function publishReadyCompartments(
  * header format. Every existing baseline then folds once, instead of surviving
  * as a mismatch nobody can see.
  */
-export const BASELINE_RENDER_EPOCH = 4
+export const BASELINE_RENDER_EPOCH = 5
 
 /** Upstream `RECENT_TOOL_SKELETON_WINDOW` (apply-operations.ts:53). */
 const RECENT_TOOL_SKELETON_WINDOW = 20
@@ -607,6 +609,9 @@ function refreshBaseline(
     baseline: sets.baseline,
     delta: sets.delta,
     memories: memories?.lines ?? [],
+    ...memories?.groups === undefined || memories.groups.length === 0
+      ? {}
+      : { memoryGroups: memories.groups },
     ...profilePoolLines.length === 0 ? {} : { profileLines: profilePoolLines },
     ...profileDeltaLines.length === 0 ? {} : { newProfileLines: profileDeltaLines },
     ...memories?.newLines === undefined ? {} : { newMemories: memories.newLines },

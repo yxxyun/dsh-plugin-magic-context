@@ -205,7 +205,7 @@ describe('magic-context dsh adapter (phase 2: historian, baseline, memories, eng
       expect(text).toContain(BASELINE_OPEN)
       expect(text).toContain('HISTORIAN-A-P1')
       expect(text).toContain('<compartment-delta>')
-      expect(text).toContain('<project-memories>')
+      expect(text).toContain('<project-memory>')
       expect(text).toContain('never commit secrets')
 
       // Channel A of the live session stream: the action-bearing pass appended

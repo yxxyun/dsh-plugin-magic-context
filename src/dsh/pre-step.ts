@@ -582,6 +582,9 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
               memories: {
                 digest: memories?.digest ?? '',
                 lines: memories?.lines ?? [],
+                // Grouped form: renders `<CATEGORY>` runs (upstream
+                // `renderMemoryBlockV2`) instead of a flat tagged list.
+                groups: memories?.groups ?? [],
                 newLines: memories?.newLines ?? [],
                 // An `update` on a memory that is still above the watermark
                 // writes a mutation-log row without changing the id, so the row

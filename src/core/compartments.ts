@@ -372,6 +372,12 @@ export function renderBaseline(input: {
   readonly delta: readonly Compartment[]
   readonly memories: readonly string[]
   /**
+   * The same pool, grouped by category. When present it wins over `memories`:
+   * upstream `renderMemoryBlockV2` renders `<CATEGORY>` groups (a category named
+   * once per group) instead of a flat list of category-tagged lines.
+   */
+  readonly memoryGroups?: readonly { readonly category: string; readonly lines: readonly string[] }[]
+  /**
    * Memories written AFTER the m[0] watermark (Magic Context's additive lane).
    * They render in the delta region, never in m[0]: a new memory must not
    * rebuild the cached prefix.
@@ -479,7 +485,16 @@ export function renderBaseline(input: {
   // happened reads as the session's own voice, and the standing instructions
   // follow it. The previous order put the memories first, which made the digest
   // of m[0] depend on which of the two blocks was non-empty.
-  if (input.memories.length > 0) {
+  const memoryGroups = input.memoryGroups ?? []
+  if (memoryGroups.length > 0) {
+    // Upstream `renderMemoryBlockV2`: one `<CATEGORY>` tag per run, the bare line
+    // inside. The wrapper is `project-memory` (singular), matching upstream.
+    const body: string[] = []
+    for (const group of memoryGroups) {
+      body.push(`<${group.category}>`, ...group.lines, `</${group.category}>`)
+    }
+    sections.push(['<project-memory>', ...body, '</project-memory>'].join('\n'))
+  } else if (input.memories.length > 0) {
     sections.push(['<project-memories>', ...input.memories, '</project-memories>'].join('\n'))
   }
   // m[1] begins here: every section below is delta-shaped and may change without

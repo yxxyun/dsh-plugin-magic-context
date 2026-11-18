@@ -37,11 +37,14 @@ function allText(request: { messages: AnyMessage[] } | undefined): string {
     message.content.filter(block => block.type === 'text').map(block => block.text ?? '').join('')).join('\n')
 }
 
-/** The `<project-memories>` section of an injected baseline (the m[0] pool). */
+/** The `<project-memory>` section of an injected baseline (the m[0] pool). */
 function projectMemoriesSection(text: string): string {
-  const start = text.indexOf('<project-memories>')
+  // Upstream renders `<project-memory>` (singular) with `<CATEGORY>` groups; the
+  // plural tag only survives on the flat-list fallback path.
+  const tag = text.includes('<project-memory>') ? 'project-memory' : 'project-memories'
+  const start = text.indexOf(`<${tag}>`)
   if (start === -1) return ''
-  const end = text.indexOf('</project-memories>', start)
+  const end = text.indexOf(`</${tag}>`, start)
   return end === -1 ? '' : text.slice(start, end)
 }
 

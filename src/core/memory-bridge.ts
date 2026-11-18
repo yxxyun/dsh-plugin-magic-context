@@ -112,10 +112,22 @@ export interface MemoryRecallRequest {
   readonly scoring?: MemoryRecallScoring
 }
 
+/** One `<CATEGORY>` group of memory lines (upstream `renderMemoryBlockV2`). */
+export interface MemoryGroup {
+  readonly category: string
+  readonly lines: readonly string[]
+}
+
 export interface MemoryRecallResult {
   /** The m[0] pool: rows at or below the watermark (all rows when unset). */
   readonly rows: readonly MemoryRow[]
   readonly lines: readonly string[]
+  /**
+   * The same pool, grouped by category (upstream `renderMemoryBlockV2`: memories
+   * render inside `<CATEGORY>` tags, with the category carried ONCE per group
+   * instead of once per line). `lines` stays for callers that want a flat list.
+   */
+  readonly groups: readonly MemoryGroup[]
   /** Identity of the injected pool set: a change forces a HARD baseline rebuild. */
   readonly digest: string
   /** The m[1] additions: rows above the watermark. */
@@ -470,6 +482,27 @@ function comparePriority(left: MemoryRow, right: MemoryRow): number {
 
 function categoryRank(category: string): number {
   return memoryCategoryOrder(category)
+}
+
+/**
+ * Group rendered memory lines by category, preserving arrival order (the caller
+ * already sorted by category priority, so a group is contiguous).
+ *
+ * Upstream `renderMemoryBlockV2` (inject-compartments.ts:2332) emits
+ * `<CATEGORY> ... </CATEGORY>` around each run and renders the bare
+ * `#<id>: <content>` inside, so the category appears ONCE per group rather than
+ * on every line. `lines` stays for flat-list callers.
+ */
+export function groupMemoryLines(rows: readonly MemoryRow[]): MemoryGroup[] {
+  const groups: Array<{ category: string; lines: string[] }> = []
+  for (const row of rows) {
+    const category = row.category || 'MEMORY'
+    const line = renderMemoryLine(row)
+    const last = groups[groups.length - 1]
+    if (last !== undefined && last.category === category) last.lines.push(line)
+    else groups.push({ category, lines: [line] })
+  }
+  return groups
 }
 
 /**
@@ -1187,6 +1220,7 @@ export function openMemoryBridge(options: MemoryBridgeOptions): MemoryBridge {
           return {
             rows: orderedPool,
             lines: orderedPool.map(renderMemoryLine),
+            groups: groupMemoryLines(orderedPool),
             digest,
             newRows: orderedAdditions,
             newLines: orderedAdditions.map(renderMemoryLine),
