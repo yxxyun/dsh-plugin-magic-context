@@ -971,6 +971,70 @@ export async function callHistorian(
  * the gate entirely, mirroring upstream's "near-full and emergency paths
  * still get one attempt".
  */
+const FAILURE_COUNT_KEY_PREFIX = 'historian_failures:'
+const FAILURE_NOTICE_KEY_PREFIX = 'historian_failure_notice:'
+
+/**
+ * Consecutive historian failures for this session (upstream tracks the same
+ * number to decide when the conversation itself should speak up).
+ *
+ * Fail-open like every other meta read here: an unreadable store reports zero,
+ * which can only make the adapter quieter, never louder.
+ */
+export function historianFailureCount(stores: AdapterStores, sessionId: string): number {
+  try {
+    const raw = stores.getMeta(`${FAILURE_COUNT_KEY_PREFIX}${sessionId}`)
+    const parsed = raw === undefined || raw === '' ? 0 : Number.parseInt(raw, 10)
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0
+  } catch {
+    return 0
+  }
+}
+
+/** Increment and return the new consecutive-failure count. */
+export function recordHistorianFailure(stores: AdapterStores, sessionId: string): number {
+  const next = historianFailureCount(stores, sessionId) + 1
+  try {
+    stores.setMeta(`${FAILURE_COUNT_KEY_PREFIX}${sessionId}`, String(next))
+  } catch {
+    /* advisory only */
+  }
+  return next
+}
+
+/** Clear the counter after a run that published something. */
+export function clearHistorianFailures(stores: AdapterStores, sessionId: string): void {
+  try {
+    stores.setMeta(`${FAILURE_COUNT_KEY_PREFIX}${sessionId}`, '')
+    stores.setMeta(`${FAILURE_NOTICE_KEY_PREFIX}${sessionId}`, '')
+  } catch {
+    /* advisory only */
+  }
+}
+
+/**
+ * Whether a notice for `count` failures should be appended. Upstream speaks up
+ * once at the threshold and then only when the situation gets materially worse,
+ * so a persistently broken setting does not repaint the conversation every turn.
+ */
+export function shouldNoticeHistorianFailures(
+  stores: AdapterStores,
+  sessionId: string,
+  count: number,
+  threshold: number,
+): boolean {
+  if (count < threshold) return false
+  try {
+    const raw = stores.getMeta(`${FAILURE_NOTICE_KEY_PREFIX}${sessionId}`)
+    const last = raw === undefined || raw === '' ? 0 : Number.parseInt(raw, 10)
+    if (Number.isFinite(last) && last >= threshold && count < last * 2) return false
+    stores.setMeta(`${FAILURE_NOTICE_KEY_PREFIX}${sessionId}`, String(count))
+    return true
+  } catch {
+    return false
+  }
+}
+
 const NO_PROGRESS_KEY_PREFIX = 'historian_no_progress:'
 
 interface HistorianNoProgress {
@@ -1253,6 +1317,9 @@ async function runHistorianExclusive(
     // #802: a stored compartment IS progress — release the watermark so the
     // next automatic run is judged on its own merits.
     clearHistorianNoProgress(deps.stores, input.sessionId)
+    // A published compartment ends the failure streak, and it also cancels the
+    // "already warned" marker so a future streak can speak up again.
+    clearHistorianFailures(deps.stores, input.sessionId)
     deps.logger.info(
       `magic-context historian: compartment §C${String(compartment.compartmentId)}§ stored `
         + `(${String(cappedRange.nodes.length)} nodes, ~${String(cappedRange.tokens)} tokens, importance ${String(draft.importance)})`,
@@ -1314,12 +1381,14 @@ async function runHistorianExclusive(
   } catch (error) {
     // #802: nothing was published — the surface must grow past `last.seq`
     // before the automatic lane pays for this span again.
+    const kind = classifyFailure(error)
     writeHistorianNoProgress(deps.stores, input.sessionId, {
       endSeq: last.seq,
       at: deps.now?.() ?? Date.now(),
-      kind: classifyFailure(error),
+      kind,
       recoveryAttempted: false,
     })
+    recordHistorianFailure(deps.stores, input.sessionId)
     throw error
   } finally {
     // Release on every exit path: success, thrown failure, and the early returns

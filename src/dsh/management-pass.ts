@@ -35,6 +35,12 @@ import { DRAIN_FAILURE_BACKOFF_MS, reserveDrain, selectPerRunCap } from '../core
 import { resolvedEmergencyDrainLatch } from '../core/drain-latch.ts'
 import { dropsSuffice } from '../core/drop-projection.ts'
 import { historianTriggerBudget, selectHistorianRange } from './historian.ts'
+import { historianFailureCount, shouldNoticeHistorianFailures } from './historian.ts'
+import {
+  buildHistorianFailureNotice,
+  HISTORIAN_PERSISTENT_FAILURE_THRESHOLD,
+} from '../core/user-facing-codes.ts'
+import { appendMagicContextEntry } from './session-notice.ts'
 import { reclaimForEmergency } from './emergency.ts'
 import { runHistorian, type HistorianDeps, type HistorianLlm } from './historian.ts'
 import type { CompartmentLease } from '../core/compartment-lease.ts'
@@ -1124,6 +1130,25 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
             detail: why,
             errorName: error instanceof Error ? error.name : typeof error,
           }, input.sessionId)
+          // Speak to the person, not just the journal (upstream
+          // `buildHistorianFailureNotice`): once the streak hits the threshold the
+          // setting is wrong, and "it will retry automatically" stops being true.
+          // The RCC session failed 21 times over six hours without a word.
+          const streak = historianFailureCount(input.stores, input.sessionId)
+          if (shouldNoticeHistorianFailures(
+            input.stores,
+            input.sessionId,
+            streak,
+            HISTORIAN_PERSISTENT_FAILURE_THRESHOLD,
+          )) {
+            const notice = buildHistorianFailureNotice(streak)
+            const appended = appendMagicContextEntry(input.session, notice, 'History compression failed')
+            input.journal?.info('historian', `historian failure notice appended (streak ${String(streak)})`, {
+              phase: 'failure-notice',
+              streak,
+              appended: appended.ok,
+            }, input.sessionId)
+          }
         }))
       historianRequested = true
       }
