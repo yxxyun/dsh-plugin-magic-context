@@ -50,6 +50,15 @@ export interface EmergencyFailClosedInput {
   readonly emergencyRecoveryArmed: boolean
   readonly emergencyRecoveryOrigin: 'provider_overflow' | 'proactive_model_shrink' | null
   readonly foldMaterializedThisPass: boolean
+  /**
+   * Whether uncompressed history remains for the historian to digest.
+   *
+   * Decides WHICH refusal notice applies, never whether to refuse: a request over
+   * the proven limit cannot be sent either way. Omitted reads as "none left",
+   * which is the safe reading — it tells the person to change models rather than
+   * to retry a send that would fail again.
+   */
+  readonly historyRemains?: boolean
   readonly finalWireEstimate?: FinalWireEstimate
   /** A limit parsed from a provider overflow response, never a catalog default. */
   readonly providerProvenLimitTokens?: number
@@ -62,10 +71,29 @@ export const EMERGENCY_BAND_PERCENTAGE = 95
 /** Below this share of the proven limit, a trusted measurement disarms the latch. */
 export const DISARM_RATIO = 0.8
 
+/**
+ * Two notices, because the two situations need different actions from the person
+ * reading them.
+ *
+ * Upstream draws the same distinction (`dreamer`-adjacent `recovery-fit.ts`,
+ * added after v0.49.41): a request the historian can still shrink deserves "send
+ * again", while one it cannot deserves "this model will not fit this
+ * conversation". A single message saying "refused, too long" is accurate in both
+ * cases and useless in both.
+ */
+export const REFUSAL_NOTICE_RECOVERABLE =
+  'Magic Context: this message would exceed the context window, and older history '
+  + 'is still being summarized so it fits. Send it again to continue.'
+
+export const REFUSAL_NOTICE_EXHAUSTED =
+  'Magic Context: this conversation no longer fits the context window and there is '
+  + 'no older history left to summarize. Switch to a model with a larger window to continue.'
+
 function refusalMessageFor(
   estimate: FinalWireEstimate | undefined,
   limit: number | undefined,
   protectedTokens: number | undefined,
+  historyRemains: boolean,
 ): string | undefined {
   if (estimate === undefined || estimate.refusalGrade !== true) return undefined
   if (limit === undefined || !Number.isFinite(limit) || limit <= 0) return undefined
@@ -74,9 +102,10 @@ function refusalMessageFor(
   const protectedNote = protectedTokens === undefined
     ? ''
     : ` (${String(protectedTokens)} of it is the protected tail, which cannot be reclaimed)`
-  return `Magic Context: the request would exceed the context window — about ${String(Math.round(tokens))} `
-    + `tokens against a proven limit of ${String(limit)}${protectedNote}. Nothing more can be reclaimed; `
-    + 'the request is refused instead of sending it to fail.'
+  const detail = `about ${String(Math.round(tokens))} tokens against a proven limit of ${String(limit)}${protectedNote}`
+  return historyRemains
+    ? `${REFUSAL_NOTICE_RECOVERABLE} ${detail}.`
+    : `${REFUSAL_NOTICE_EXHAUSTED} ${detail}.`
 }
 
 export function evaluateEmergencyFailClosed(
@@ -88,6 +117,7 @@ export function evaluateEmergencyFailClosed(
     estimate,
     input.contextLimitTokens ?? limit,
     input.protectedToolTokens,
+    input.historyRemains === true,
   )
   if (refusalMessage !== undefined) {
     return { shouldAbort: true, reason: 'refusal-grade-final-wire-over-limit', refusalMessage }

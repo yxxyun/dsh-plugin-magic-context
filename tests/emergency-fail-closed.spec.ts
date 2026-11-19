@@ -32,6 +32,31 @@ describe('evaluateEmergencyFailClosed', () => {
     expect(decision.refusalMessage).toContain('262144')
   })
 
+  it('tells the person to retry when history can still be summarized', () => {
+    const decision = evaluateEmergencyFailClosed({
+      ...base,
+      usagePercentage: 99,
+      historyRemains: true,
+      finalWireEstimate: { tokens: 300_000, trusted: true, refusalGrade: true, refusalTokens: 300_000 },
+      providerProvenLimitTokens: 262_144,
+    })
+    expect(decision.shouldAbort).toBe(true)
+    expect(decision.refusalMessage).toContain('Send it again')
+  })
+
+  it('tells the person to change models when nothing is left to summarize', () => {
+    // Omitting `historyRemains` reads as "none left": the safe reading, because
+    // "send again" against a dead end wastes the person's attempt.
+    const decision = evaluateEmergencyFailClosed({
+      ...base,
+      usagePercentage: 99,
+      finalWireEstimate: { tokens: 300_000, trusted: true, refusalGrade: true, refusalTokens: 300_000 },
+      providerProvenLimitTokens: 262_144,
+    })
+    expect(decision.shouldAbort).toBe(true)
+    expect(decision.refusalMessage).toContain('Switch to a model with a larger window')
+  })
+
   it('does not abort on a refusal-grade estimate that still fits', () => {
     const decision = evaluateEmergencyFailClosed({
       ...base,

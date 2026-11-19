@@ -33,6 +33,7 @@ import {
   type PreStepPayload,
   type Session,
   type UserMessage,
+  enumerateSurfaceNodes,
   enumerateSurfaceToolResults,
   requestContextOf,
   wireStrandedResults,
@@ -807,12 +808,33 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
           })),
         ))
         const wire = calibratedWireEstimate(surfaceTokens(payload.agent.session), accuracy)
+        // The nodes past the last published compartment are what a historian can
+        // still digest. When there are none, "send again" is advice that cannot
+        // work, and the refusal says so instead.
+        const lastCompartmentEnd = stores.baselineState(sessionId)?.maxCompartmentId
+        const historyRemains = lastCompartmentEnd === undefined
+          ? true
+          : enumerateSurfaceNodes(payload.agent.session).some(node => Number(node.seq) > lastCompartmentEnd)
         const failClosed = evaluateEmergencyFailClosed({
           usagePercentage: pressureThisTurn ?? 0,
           emergencyRecoveryArmed: armed,
           emergencyRecoveryOrigin: drain.overflowOrigin ?? null,
           foldMaterializedThisPass: baselineUpdatedThisPass,
-          ...wire.trusted ? { finalWireEstimate: { tokens: wire.tokens, trusted: true } } : {},
+          historyRemains,
+          ...wire.trusted
+            ? {
+              finalWireEstimate: {
+                tokens: wire.tokens,
+                trusted: true,
+                // A trusted measurement ABOVE the proven limit is what makes a
+                // refusal legitimate: sending it would 400. Below the limit the
+                // estimate is just a size, not evidence of failure.
+                ...provenLimit !== undefined && Number.isFinite(provenLimit) && provenLimit > 0 && wire.tokens > provenLimit
+                  ? { refusalGrade: true, refusalTokens: wire.tokens }
+                  : {},
+              },
+            }
+            : {},
           ...provenLimit === undefined || !Number.isFinite(provenLimit)
             ? {}
             : { providerProvenLimitTokens: provenLimit },
