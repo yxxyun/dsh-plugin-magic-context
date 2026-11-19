@@ -42,6 +42,7 @@ import { evaluateEmergencyFailClosed } from '../core/emergency-fail-closed.ts'
 import { provenLimitKey } from '../core/provider-limit.ts'
 import { calibratedWireEstimate, pairEstimateSamples, summarise } from '../core/wire-accuracy.ts'
 import { surfaceTokens, surfaceWireTokens } from './management-pass.ts'
+import { compareServed, noteServed } from '../core/served-check.ts'
 import { appendMagicContextEntry } from './session-notice.ts'
 import { historianInFlight } from './historian.ts'
 import { syncMachineDomain } from '../core/machine-domain.ts'
@@ -168,6 +169,8 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
   let baselineUpdatedThisPass = false
   /** This turn's pressure reading, hoisted for the fail-closed gate. */
   let pressureThisTurn: number | undefined
+  /** The band this turn's pass landed in; scopes the served check's permission. */
+  let passKindThisTurn: 'execute' | 'defer' | undefined
   /** One-shot flag: a drifted pre-step payload must warn once, not every step. */
   let payloadDriftWarned = false
 
@@ -382,6 +385,7 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
         // so it forces the execute band regardless of pressure.
         wireDefects: wireStrandedResults(payload.agent.session).length,
       })
+      passKindThisTurn = pass.kind === 'execute' ? 'execute' : 'defer'
       const usage = latest === undefined ? undefined : {
         input: latest.inputTokens ?? 0,
         cacheRead: latest.cacheReadTokens ?? 0,
@@ -390,6 +394,18 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
       if (context.provider !== undefined && context.model !== undefined) {
         deps.noteSessionRoute?.({ provider: context.provider, model: context.model })
       }
+      // Compare BEFORE this pass touches the surface, so the answer describes the
+      // previous request's bytes against what the host is about to send.
+      const served = compareServed(sessionId, payload.agent.session)
+      const servedView = served.known
+        ? {
+          prefixIntact: served.prefixIntact,
+          appended: served.appended,
+          rewroteInPlace: served.rewroteInPlace,
+          previousHadPermission: served.previousHadPermission,
+          ...served.firstChangeIndex === undefined ? {} : { firstChangeIndex: served.firstChangeIndex },
+        }
+        : { known: false }
       const sessionCwd = payload.agent.session.header?.cwd
       if (sessionCwd !== undefined) deps.noteSessionCwd?.(sessionCwd)
       const basePassData = {
@@ -425,6 +441,13 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
           ? undefined
           : `${context.provider}/${context.model}`,
         usage,
+        // The served check (upstream `hooks/magic-context/served-check.ts`): did
+        // the bytes the LAST request sent survive into this one? A pass without
+        // rebuild permission may only append; anything else invalidates the
+        // provider's cached prefix. Measured only — it changes no byte here.
+        // `known: false` means this process has not served this session since it
+        // started, which is unknown rather than equal.
+        served: servedView,
       }
       if (pass.kind === 'execute') {
         // The project identity is resolved once per pass (the git lookup is
@@ -836,6 +859,15 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
       ctx.logger.warn(`magic-context: fail-closed evaluation failed (continuing): ${errText(failClosedError)}`)
     }
 
+    // Record what this request is about to send. `execute` is the only band that
+    // may rewrite history, so it is the only one that gets rebuild permission
+    // here — a defer or a nudge that edits the surface is exactly what the check
+    // exists to catch. Wrapped because a measurement must never fail a turn.
+    try {
+      noteServed(sessionId, payload.agent.session, passKindThisTurn === 'execute', Date.now())
+    } catch (servedError) {
+      ctx.logger.warn(`magic-context: served check failed (continuing): ${errText(servedError)}`)
+    }
     return { ...decision, messages: hintAppendix === undefined ? messages : [...messages, hintAppendix] }
   }
 }

@@ -48,6 +48,9 @@ const PHASE_BASE = [
   'tests/fail-closed-join.spec.ts',
   'tests/wire-accuracy.spec.ts',
   'tests/wire-tokens.spec.ts',
+  // The served check measures one invariant — a pass without rebuild permission
+  // may only append — and changes nothing. Baseline: it pins the measurement.
+  'tests/served-check.spec.ts',
   // Anti-idle gates ported from upstream mc-upstream a1ca346: the derived force
   // band, the rolling drain budget, the emergency latch, and the post-drop
   // projection that decides when summarisation is the only lever left.
