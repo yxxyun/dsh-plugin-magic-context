@@ -2317,7 +2317,14 @@ export function openStores(dataDir: string): AdapterStores {
     (db.prepare(
       'SELECT * FROM dream_schedule WHERE enabled = 1 AND next_due_at IS NOT NULL AND next_due_at <= ? '
         + 'ORDER BY next_due_at ASC, task ASC LIMIT ?',
-    ).all(now, Math.max(1, Math.min(200, limit ?? 20))) as unknown as DreamScheduleDbRow[]).map(toDreamSchedule)
+    // No practical cap by default. Upstream's `planDueTasks`
+    // (dreamer/task-scheduler.ts:258) collects EVERY due task for the project and
+    // runs them; this table spans all projects, and the old default of 20 against
+    // 65 rows meant the same short-interval tasks (auto-stage, every 90 s) always
+    // occupied the window while `verify` (every 2 h) never got a slot — measured
+    // 2026-11-19: verify last ran at 14:29, was due at 16:27, and 16:32 ran
+    // auto-stage again. A caller that wants a bound can still pass `limit`.
+    ).all(now, Math.max(1, Math.min(1_000, limit ?? 1_000))) as unknown as DreamScheduleDbRow[]).map(toDreamSchedule)
 
   const recordDreamRun: AdapterStores['recordDreamRun'] = (input) => {
     // Both writes in one transaction: a crash between them would leave a task

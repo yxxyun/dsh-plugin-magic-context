@@ -438,7 +438,30 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
    * call) rather than once at mount is what makes an edit apply to the next run
    * without a restart.
    */
-  const readDreamConfig = () => resolveDreamConfig((config as { dream?: unknown }).dream)
+  /**
+   * One-shot diagnostic: the live dream config as the runtime actually sees it.
+   *
+   * `verifyExtraRoots` is declared in the schema and set in the profile, yet the
+   * verify lane ran with `extraRoots` empty (`referencesFound: 0` while
+   * `C:/data/code` was configured) and never reported the index ceiling. Either
+   * the profile value is not reaching `config.dream`, or the getter is being read
+   * before the config settles. This row answers which, once per mount.
+   */
+  let dreamConfigLogged = false
+  const readDreamConfig = () => {
+    const raw = (config as { dream?: unknown }).dream
+    const resolved = resolveDreamConfig(raw)
+    if (!dreamConfigLogged) {
+      dreamConfigLogged = true
+      const rawRoots = (raw as { verifyExtraRoots?: unknown } | undefined)?.verifyExtraRoots
+      journal?.info('engine', 'dream config observed at first read', {
+        rawIsObject: typeof raw === 'object' && raw !== null,
+        rawRoots: Array.isArray(rawRoots) ? rawRoots : null,
+        resolvedRoots: resolved.verifyExtraRoots,
+      })
+    }
+    return resolved
+  }
   const dreamHandlers = buildDreamHandlers({
     ...lane.promotePrimers === undefined ? {} : { promotePrimers: lane.promotePrimers },
     classify: {
