@@ -587,7 +587,24 @@ function refreshBaseline(
   // costs nothing that is not already lost and folds m[1] back into m[0] for
   // the requests that follow. Off ⇒ the pass only lands queued work.
   const ttlFold = input.policy.ttlRebuild === true && input.pass.reason === 'cache-ttl-idle'
-  const hard = ttlFold || previous === undefined || routeChanged || memoriesChanged || epochChanged || cursorUpgrade || profileChanged || renderEpochChanged || systemHashChanged  // Freeze targets for a HARD fold. Falling back to the previous values keeps a
+  const hard = ttlFold || previous === undefined || routeChanged || memoriesChanged || epochChanged || cursorUpgrade || profileChanged || renderEpochChanged || systemHashChanged
+  // WHY, not just whether. Reading it back out of the journal used to need a
+  // database query and a guess, because only `mode: 'hard'` was recorded while
+  // nine conditions can produce it. The order is the diagnostic priority: a
+  // session's first pass is the benign case and is named first so it is never
+  // mistaken for a cache bust.
+  const hardReason = !hard
+    ? undefined
+    : ttlFold ? 'ttl-fold'
+      : previous === undefined ? 'first-pass'
+        : routeChanged ? 'route-changed'
+          : systemHashChanged ? 'system-prompt-changed'
+            : renderEpochChanged ? 'render-epoch'
+              : epochChanged ? 'epoch-fingerprint'
+                : memoriesChanged ? 'memories-digest'
+                  : profileChanged ? 'profile-changed'
+                    : cursorUpgrade ? 'cursor-upgrade'
+                      : undefined  // Freeze targets for a HARD fold. Falling back to the previous values keeps a
   // pass that has no mutation lane (bridge unavailable) from rewinding them.
   const frozenCursor = updates?.cursor ?? previous?.maxMemoryMutationId
   const frozenEpochFingerprint = updates?.projectEpochFingerprint ?? previous?.projectEpochFingerprint

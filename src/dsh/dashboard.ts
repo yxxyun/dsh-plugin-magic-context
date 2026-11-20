@@ -202,6 +202,119 @@ export function createDashboardService(deps: DashboardDeps): DashboardService {
         tags: safe(() => deps.stores.journalSumField('drop-landed', 'count', since24h()), 0),
         estTokens: safe(() => deps.stores.journalSumField('drop-landed', 'estTokens', since24h()), 0),
       },
+      // Cache accounting over the same 24h window, and the shape of the misses.
+      // The hit rate answers "how much did we lose"; the buckets answer "when",
+      // which is the only part a reader can act on: measured 2026-11-19, 59 of
+      // 1,118 request pairs accounted for 92% of the miss tokens and all of them
+      // were gaps past the provider's 5-minute cache TTL.
+      cache24h: cacheWindow(),
+      // What the newest pass did to the cacheable prefix, and why the newest
+      // baseline folded. Both are single-row reads: the panel already renders
+      // one-line summaries, so the dashboard mirrors that shape.
+      servedLast: servedLast(),
+    }
+  }
+
+  /**
+   * Cache usage over the window, split by the gap since the previous request.
+   *
+   * The gap is the diagnostic: a miss inside a burst is our own doing (a pass
+   * edited history it had no permission to touch), while a miss after a gap is
+   * the provider expiring its cache and costs nothing we could have avoided.
+   * Reporting one number would blur exactly the distinction this card exists for.
+   */
+  const cacheWindow = (): Record<string, unknown> => {
+    const rows = safe(() => deps.stores.listUsageSince(since24h()), [])
+    const bySession = new Map<string, Array<{ at: number; read: number; input: number; write: number }>>()
+    for (const row of rows) {
+      const list = bySession.get(row.sessionId) ?? []
+      list.push({
+        at: row.recordedAt,
+        read: row.cacheReadTokens ?? 0,
+        input: row.inputTokens ?? 0,
+        write: row.cacheWriteTokens ?? 0,
+      })
+      bySession.set(row.sessionId, list)
+    }
+    let read = 0
+    let input = 0
+    let write = 0
+    let reported = false
+    let requests = 0
+    let missTokens = 0
+    const buckets: Record<string, { miss: number; total: number }> = {
+      'lt1m': { miss: 0, total: 0 },
+      '1to5m': { miss: 0, total: 0 },
+      '5to15m': { miss: 0, total: 0 },
+      'gt15m': { miss: 0, total: 0 },
+    }
+    for (const list of bySession.values()) {
+      list.sort((left, right) => left.at - right.at)
+      for (let index = 0; index < list.length; index += 1) {
+        const row = list[index] as { at: number; read: number; input: number; write: number }
+        if (row.read <= 0 && row.write <= 0) continue
+        reported = true
+        requests += 1
+        read += row.read
+        input += row.input
+        write += row.write
+        missTokens += row.input
+        const previous = index === 0 ? undefined : list[index - 1]
+        if (previous === undefined) continue
+        const gap = row.at - previous.at
+        const key = gap < 60_000 ? 'lt1m' : gap < 300_000 ? '1to5m' : gap < 900_000 ? '5to15m' : 'gt15m'
+        const bucket = buckets[key] as { miss: number; total: number }
+        bucket.miss += row.input
+        bucket.total += row.input + row.read + row.write
+      }
+    }
+    const total = read + input + write
+    return {
+      reported,
+      requests,
+      readTokens: read,
+      inputTokens: input,
+      writeTokens: write,
+      missTokens,
+      ...reported && total > 0 ? { hitRate: read / total } : {},
+      buckets,
+    }
+  }
+
+  /** The newest pass's served comparison and the newest HARD rebuild's reason. */
+  const servedLast = (): Record<string, unknown> => {
+    let served: Record<string, unknown> | undefined
+    let hardRebuild: Record<string, unknown> | undefined
+    for (const entry of safe(() => deps.stores.listJournal({ limit: 200 }), [])) {
+      if (served === undefined && entry.kind === 'pass' && entry.data !== undefined) {
+        const view = entry.data.served
+        if (view !== null && typeof view === 'object') {
+          const record = view as Record<string, unknown>
+          served = record.known === false
+            ? { known: false }
+            : {
+              known: true,
+              prefixIntact: record.prefixIntact === true,
+              rewroteInPlace: record.rewroteInPlace === true,
+              previousWasFirst: record.previousWasFirst === true,
+              ...typeof record.firstChangeIndex === 'number' ? { firstChangeIndex: record.firstChangeIndex } : {},
+              ...typeof record.appended === 'number' ? { appended: record.appended } : {},
+              at: entry.at,
+            }
+        }
+      }
+      if (hardRebuild === undefined && entry.kind === 'baseline' && entry.data !== undefined && entry.data.mode === 'hard') {
+        hardRebuild = {
+          at: entry.at,
+          ...typeof entry.data.hardReason === 'string' ? { reason: entry.data.hardReason } : {},
+          ...typeof entry.data.epoch === 'number' ? { epoch: entry.data.epoch } : {},
+        }
+      }
+      if (served !== undefined && hardRebuild !== undefined) break
+    }
+    return {
+      ...served === undefined ? {} : { served },
+      ...hardRebuild === undefined ? {} : { hardRebuild },
     }
   }
 
@@ -595,8 +708,18 @@ const PAGE = `<!doctype html>
   // ── overview ─────────────────────────────────────────────────────────────
   function renderOverview(data) {
     var t = data.totals || {}
+    // The cache card leads: it is the one figure the other numbers explain.
+    var cache = data.cache24h || {}
+    var cacheValue = cache.reported !== true || typeof cache.hitRate !== 'number'
+      ? '—'
+      : Math.round(cache.hitRate * 100) + '%'
+    var cacheHint = cache.reported !== true
+      // Never print 0% for "the provider reported nothing": that reads as a
+      // total miss and sends the reader hunting a problem that may not exist.
+      ? 'provider 未上报缓存用量'
+      : num(cache.missTokens) + ' miss · ' + num(cache.requests) + ' 次请求'
     write('ov-cards',
-      card('会话', num(t.sessions), '在线 ' + num(t.liveSessions)) +
+      card('缓存命中', cacheValue, cacheHint) +
       card('压缩快照', num(t.compartments), '已落地 ' + num(t.landedCompartments)) +
       card('待落地回收', num(t.pendingDrops)) +
       card('笔记', num(t.notes)) +

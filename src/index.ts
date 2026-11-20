@@ -1278,6 +1278,82 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
         }
       },
       maintenanceLast: maintenance.maintenanceLast,
+      /**
+       * Cache accounting from `usage_records`.
+       *
+       * Three-way, never a bare number: a provider that omits usage makes the
+       * hit rate UNKNOWABLE, and printing 0% for that reads as a total miss.
+       * Without a session the scope is every row in the window the store keeps,
+       * which is what the dashboard's overview shows.
+       */
+      cacheStats: (sessionId?: string) => {
+        try {
+          const rows = sessionId === undefined
+            ? stores.listUsageSince(Date.now() - 24 * 60 * 60 * 1000)
+            : stores.listUsage(sessionId)
+          let read = 0
+          let input = 0
+          let write = 0
+          let reported = false
+          let requests = 0
+          let missed = 0
+          for (const row of rows) {
+            const cacheRead = row.cacheReadTokens ?? 0
+            const cacheWrite = row.cacheWriteTokens ?? 0
+            const inputTokens = row.inputTokens ?? 0
+            if (cacheRead <= 0 && cacheWrite <= 0) continue
+            reported = true
+            requests += 1
+            read += cacheRead
+            input += inputTokens
+            write += cacheWrite
+            if (cacheRead === 0) missed += 1
+          }
+          const total = read + input + write
+          return {
+            reported,
+            readTokens: read,
+            inputTokens: input,
+            writeTokens: write,
+            requests,
+            missedRequests: missed,
+            ...reported && total > 0 ? { hitRate: read / total } : {},
+          }
+        } catch {
+          return undefined
+        }
+      },
+      /**
+       * The served check's newest comparison, read from the journal.
+       *
+       * Reading the recorded `served` payload (rather than re-running the
+       * comparison) keeps this a pure read: the panel must not need a live
+       * Session, and a comparison recomputed here would describe a surface the
+       * panel is not looking at.
+       */
+      servedCheck: (sessionId?: string) => {
+        try {
+          for (const entry of stores.listJournal({ limit: 120, ...(sessionId === undefined ? {} : { sessionId }) })) {
+            if (entry.kind !== 'pass' || entry.data === undefined) continue
+            const served = entry.data.served
+            if (served === null || typeof served !== 'object') continue
+            const view = served as Record<string, unknown>
+            if (view.known === false) return { known: false }
+            return {
+              known: true,
+              prefixIntact: view.prefixIntact === true,
+              rewroteInPlace: view.rewroteInPlace === true,
+              previousWasFirst: view.previousWasFirst === true,
+              ...typeof view.firstChangeIndex === 'number' ? { firstChangeIndex: view.firstChangeIndex } : {},
+              ...typeof view.appended === 'number' ? { appended: view.appended } : {},
+              at: entry.at,
+            }
+          }
+          return { known: false }
+        } catch {
+          return undefined
+        }
+      },
       startedAt,
     })
     const service = telemetry

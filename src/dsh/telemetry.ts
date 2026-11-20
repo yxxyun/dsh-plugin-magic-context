@@ -73,6 +73,54 @@ export interface TelemetryDeps {
     readonly updated?: number
     readonly archived?: number
   } | undefined
+  /**
+   * Cache accounting for the panel's scope.
+   *
+   * Reported as a THREE-WAY answer, never a bare number: a provider that omits
+   * usage makes the hit rate unknowable, and printing 0% for "never reported"
+   * would read as a catastrophic miss rate. Upstream's CacheDiagnostics draws
+   * the same line (`CACHE_NOT_REPORTED` vs a real 0).
+   */
+  readonly cacheStats?: (sessionId?: string) => {
+    /** False when no request in scope reported cache usage at all. */
+    readonly reported: boolean
+    readonly readTokens?: number
+    readonly inputTokens?: number
+    readonly writeTokens?: number
+    /** read / (read + input + write); undefined when `reported` is false. */
+    readonly hitRate?: number
+    /** Requests whose cache read was zero, i.e. the ones that paid full price. */
+    readonly missedRequests?: number
+    readonly requests?: number
+  } | undefined
+  /**
+   * The served check's newest comparison for the panel's scope.
+   *
+   * `undefined` when this process has served nothing for the session — which is
+   * reported as unknown, not as a healthy prefix.
+   */
+  readonly servedCheck?: (sessionId?: string) => {
+    readonly known: boolean
+    readonly prefixIntact?: boolean
+    readonly rewroteInPlace?: boolean
+    readonly previousWasFirst?: boolean
+    readonly firstChangeIndex?: number
+    readonly appended?: number
+  } | undefined
+}
+
+/** Run a reader, swallow its throw: a panel must never lose every number to one. */
+function safe<T>(read: () => T | undefined): { unwrap: (key: string) => Record<string, unknown> } {
+  return {
+    unwrap: (key) => {
+      try {
+        const value = read()
+        return value === undefined ? {} : { [key]: value }
+      } catch {
+        return {}
+      }
+    },
+  }
 }
 
 export interface TelemetryService {
@@ -282,6 +330,39 @@ export function createTelemetryService(deps: TelemetryDeps): TelemetryService {
       ...(surfaceTokens !== undefined ? { surfaceLedger: { tokens: surfaceTokens, ...(surfaceWindow !== undefined ? { window: surfaceWindow } : {}) } } : {}),
       ...(memoryStats !== undefined ? { memoryStats } : {}),
       ...(maintenanceLast !== undefined ? { maintenanceLast } : {}),
+      // The three blocks the panel was missing. Each is built defensively: a
+      // reader that throws must leave the number absent (the panel prints "—")
+      // rather than take the whole summary down.
+      ...safe(() => deps.cacheStats?.(sessionId)).unwrap('cacheStats'),
+      ...safe(() => deps.servedCheck?.(sessionId)).unwrap('servedCheck'),
+      ...hardRebuildBlock(),
+    }
+  }
+
+  /**
+   * Why the newest baseline was a HARD rebuild.
+   *
+   * The reason is computed in the management pass and only its presence reached
+   * the journal, so answering "why did m[0] fold" needed a database query. The
+   * pass now records the condition names; this surfaces the newest row's.
+   */
+  const hardRebuildBlock = (): Record<string, unknown> => {
+    try {
+      for (const entry of deps.stores.listJournal({ limit: 60 })) {
+        if (entry.kind !== 'baseline' || entry.data === undefined) continue
+        if (entry.data.mode !== 'hard') continue
+        const reason = typeof entry.data.hardReason === 'string' ? entry.data.hardReason : undefined
+        return {
+          lastHardRebuild: {
+            at: entry.at,
+            ...reason === undefined ? {} : { reason },
+            ...typeof entry.data.epoch === 'number' ? { epoch: entry.data.epoch } : {},
+          },
+        }
+      }
+      return {}
+    } catch {
+      return {}
     }
   }
 

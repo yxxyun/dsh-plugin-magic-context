@@ -1157,6 +1157,32 @@ window.__ModuleLoader__.load({
           updated: num(health.maintenanceLast.updated),
           archived: num(health.maintenanceLast.archived),
         },
+        // Cache accounting: `reported` decides whether a percentage may be
+        // printed at all. A provider that omits usage leaves the hit rate
+        // UNKNOWABLE, and showing 0% for that reads as a total miss.
+        cacheStats: obj(health.cacheStats) === undefined ? undefined : {
+          reported: health.cacheStats.reported === true,
+          hitRate: num(health.cacheStats.hitRate),
+          missedRequests: num(health.cacheStats.missedRequests),
+          requests: num(health.cacheStats.requests),
+          readTokens: num(health.cacheStats.readTokens),
+        },
+        // The served check: did the bytes the previous request sent survive?
+        servedCheck: obj(health.servedCheck) === undefined ? undefined : {
+          known: health.servedCheck.known === true,
+          prefixIntact: health.servedCheck.prefixIntact === true,
+          rewroteInPlace: health.servedCheck.rewroteInPlace === true,
+          previousWasFirst: health.servedCheck.previousWasFirst === true,
+          firstChangeIndex: num(health.servedCheck.firstChangeIndex),
+          appended: num(health.servedCheck.appended),
+        },
+        // Why the newest baseline folded. Absent means no HARD rebuild has been
+        // recorded since the process started.
+        lastHardRebuild: obj(health.lastHardRebuild) === undefined ? undefined : {
+          at: num(health.lastHardRebuild.at),
+          reason: typeof health.lastHardRebuild.reason === 'string' ? health.lastHardRebuild.reason : undefined,
+          epoch: num(health.lastHardRebuild.epoch),
+        },
       }
     }
 
@@ -1968,6 +1994,13 @@ window.__ModuleLoader__.load({
         : pressure >= 50 ? '#d08700'
         : '#22a06b'
       const pressureText = pressure === undefined ? '' : Math.round(pressure) + '%'
+      // The pill stays one number. A cache percentage joins it only when it is
+      // KNOWABLE and materially bad, because a pill that always prints two
+      // figures stops being a glance.
+      const cacheRate = health.cacheStats !== undefined && health.cacheStats.reported
+        ? health.cacheStats.hitRate
+        : undefined
+      const cacheBad = cacheRate !== undefined && cacheRate < 0.9
       // Shortest possible line: the pressure, or the error count when red.
       const collapsed = state.status === 'unavailable'
         ? 'MC · —'
@@ -1975,9 +2008,11 @@ window.__ModuleLoader__.load({
           ? 'MC · …'
           : errors > 0
             ? 'MC · ' + errors + ' err'
-            : pressureText !== ''
-              ? 'MC · ' + pressureText
-              : 'MC · ' + passes + ' pass'
+            : cacheBad
+              ? 'MC · ' + Math.round(cacheRate * 100) + '%'
+              : pressureText !== ''
+                ? 'MC · ' + pressureText
+                : 'MC · ' + passes + ' pass'
       const lastSeen = timeOf(health.lastEventAt)
       const scopeLabel = health.scope === 'session' ? 'this session' : 'all sessions'
       // The pill's hover bubble mirrors the native pills' tooltip (one dark
@@ -2168,6 +2203,31 @@ window.__ModuleLoader__.load({
         ? health.memoryStats.total
         : health.projectMemories
       const mt = health.maintenanceLast
+      // Cache: a percentage may only be printed when a request actually reported
+      // cache usage. "Not reported" is a dash, never 0% — the difference is the
+      // one this panel exists to stop confusing.
+      const cache = health.cacheStats
+      const cacheText = cache === undefined || !cache.reported
+        ? 'C —'
+        : cache.hitRate === undefined
+          ? 'C —'
+          : 'C ' + Math.round(cache.hitRate * 100) + '%'
+      // Served: did the previous request's bytes survive into this one?
+      const served = health.servedCheck
+      const servedText = served === undefined || !served.known
+        ? 'S ?'
+        : served.prefixIntact
+          ? 'S ok'
+          : served.previousWasFirst
+            // The session was born, not broken — say so instead of alarming.
+            ? 'S new'
+            : served.rewroteInPlace
+              ? 'S ✗ rewrite'
+              : served.firstChangeIndex !== undefined
+                ? 'S ✗ @' + served.firstChangeIndex
+                : 'S ✗'
+      const hard = health.lastHardRebuild
+      const hardText = hard === undefined || hard.reason === undefined ? '' : 'H ' + hard.reason
       const summaryRows = [
         kv([
           pressureExact !== undefined ? 'O ' + pressureExact + '%' : '',
@@ -2185,6 +2245,7 @@ window.__ModuleLoader__.load({
           mt !== undefined && mt.updated ? 'R ' + fmtInt(mt.updated) : '',
           errorsSinceBoot > 0 ? 'E ' + fmtInt(errorsSinceBoot) : '',
         ]),
+        kv([cacheText, servedText, hardText]),
       ]
 
       const records = recordsOf(state.recent, t)

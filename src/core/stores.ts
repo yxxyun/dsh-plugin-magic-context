@@ -307,6 +307,15 @@ export interface AdapterStores {
   listTags(sessionId: string): TagRecord[]
   recordUsage(record: UsageRecord): void
   listUsage(sessionId: string): UsageRecord[]
+  /**
+   * Usage rows across every session since `since`.
+   *
+   * Exists for the dashboard's cache accounting: the per-session reader answers
+   * "how is THIS conversation doing", the window reader answers "how are we
+   * doing overall", and the two must not be derived from each other (a session
+   * that never reported would silently remove itself from a global average).
+   */
+  listUsageSince(since: number): UsageRecord[]
   /** Newest usage row by seq, or undefined before the first response. */
   latestUsage(sessionId: string): UsageRecord | undefined
   /**
@@ -1385,6 +1394,25 @@ export function openStores(dataDir: string): AdapterStores {
       throw error
     }
   }
+
+  const listUsageSince = (since: number): UsageRecord[] =>
+    (db.prepare(`SELECT * FROM usage_records WHERE recorded_at > ? ORDER BY recorded_at`).all(since) as Array<{
+      session_id: string; seq: number; turn: number; step: number; provider: string; model: string
+      input_tokens: number | null; output_tokens: number | null; cache_read_tokens: number | null; cache_write_tokens: number | null
+      recorded_at: number
+    }>).map(row => ({
+      sessionId: row.session_id,
+      seq: row.seq,
+      turn: row.turn,
+      step: row.step,
+      provider: row.provider,
+      model: row.model,
+      inputTokens: row.input_tokens ?? undefined,
+      outputTokens: row.output_tokens ?? undefined,
+      cacheReadTokens: row.cache_read_tokens ?? undefined,
+      cacheWriteTokens: row.cache_write_tokens ?? undefined,
+      recordedAt: row.recorded_at,
+    }))
 
   const listUsage = (sessionId: string): UsageRecord[] =>
     (db.prepare(`SELECT * FROM usage_records WHERE session_id = ? ORDER BY seq`).all(sessionId) as Array<{
@@ -2548,6 +2576,7 @@ export function openStores(dataDir: string): AdapterStores {
     listTags,
     recordUsage,
     listUsage,
+    listUsageSince,
     latestUsage,
     workMetrics,
     compartmentLease,
