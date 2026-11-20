@@ -119,6 +119,23 @@ describe('compareServed', () => {
     expect(result.appended).toBe(0)
   })
 
+  it('names the first pass as the benign cause of an index-0 change', () => {
+    forgetServed('s-first')
+    // The first request of a session establishes m[0]; the next comparison must
+    // be able to say so instead of reading as a broken prefix.
+    noteServed('s-first', session([{ text: 'a' }]), false, 1, true)
+    const result = compareServed('s-first', session([{ text: 'aaaa' }]))
+    expect(result.firstChangeIndex).toBe(0)
+    expect(result.previousWasFirst).toBe(true)
+  })
+
+  it('does not mark a later pass as first', () => {
+    forgetServed('s-later')
+    noteServed('s-later', session([{ text: 'a' }]), false, 1, true)
+    noteServed('s-later', session([{ text: 'a' }]), false, 2, false)
+    expect(compareServed('s-later', session([{ text: 'b' }])).previousWasFirst).toBe(false)
+  })
+
   it('keeps records per session', () => {
     forgetServed('s-a')
     forgetServed('s-b')

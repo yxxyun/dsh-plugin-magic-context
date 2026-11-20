@@ -43,7 +43,7 @@ import { evaluateEmergencyFailClosed } from '../core/emergency-fail-closed.ts'
 import { provenLimitKey } from '../core/provider-limit.ts'
 import { calibratedWireEstimate, pairEstimateSamples, summarise } from '../core/wire-accuracy.ts'
 import { surfaceTokens, surfaceWireTokens } from './management-pass.ts'
-import { compareServed, noteServed } from '../core/served-check.ts'
+import { compareServed, noteServed, servedRecord } from '../core/served-check.ts'
 import { appendMagicContextEntry } from './session-notice.ts'
 import { historianInFlight } from './historian.ts'
 import { syncMachineDomain } from '../core/machine-domain.ts'
@@ -404,6 +404,7 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
           appended: served.appended,
           rewroteInPlace: served.rewroteInPlace,
           previousHadPermission: served.previousHadPermission,
+          ...served.previousWasFirst ? { previousWasFirst: true } : {},
           ...served.firstChangeIndex === undefined ? {} : { firstChangeIndex: served.firstChangeIndex },
         }
         : { known: false }
@@ -886,7 +887,16 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
     // here — a defer or a nudge that edits the surface is exactly what the check
     // exists to catch. Wrapped because a measurement must never fail a turn.
     try {
-      noteServed(sessionId, payload.agent.session, passKindThisTurn === 'execute', Date.now())
+      noteServed(
+        sessionId,
+        payload.agent.session,
+        passKindThisTurn === 'execute',
+        Date.now(),
+        // No record before this call means the session was never served by this
+        // process: its first request establishes m[0], and the next comparison
+        // will legitimately see index 0 change.
+        servedRecord(sessionId) === undefined,
+      )
     } catch (servedError) {
       ctx.logger.warn(`magic-context: served check failed (continuing): ${errText(servedError)}`)
     }

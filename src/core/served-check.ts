@@ -59,6 +59,17 @@ export interface ServedRecord {
   readonly shapes: readonly MessageShape[]
   /** Whether the pass that produced this record was allowed to rebuild. */
   readonly hadRebuildPermission: boolean
+  /**
+   * Whether this was the session's FIRST served request.
+   *
+   * A first request has no baseline yet — `previous === undefined` in the
+   * management pass makes it a HARD rebuild by definition, so the m[0] block
+   * appears between the recorded surface and the next one. That is the session
+   * being born, not a prefix being broken: measured 2026-11-20, all three
+   * `firstChangeIndex: 0` rows belonged to three different sessions, each 38-78
+   * seconds after its own first pass.
+   */
+  readonly firstServed: boolean
   readonly at: number
 }
 
@@ -75,6 +86,14 @@ export interface ServedComparison {
   readonly rewroteInPlace: boolean
   /** Whether the PREVIOUS pass had permission, which excuses a rewrite. */
   readonly previousHadPermission: boolean
+  /**
+   * The previous pass was the session's first, so m[0] appeared in between.
+   *
+   * Reported alongside a broken prefix instead of suppressing it: the index is
+   * still true, and a comparison that hid its own inputs would be worse than one
+   * that names a benign cause.
+   */
+  readonly previousWasFirst: boolean
 }
 
 /**
@@ -129,10 +148,12 @@ export function noteServed(
   session: Session,
   hadRebuildPermission: boolean,
   now: number,
+  firstServed = false,
 ): ServedRecord {
   const record: ServedRecord = {
     shapes: surfaceShapes(session),
     hadRebuildPermission,
+    firstServed,
     at: now,
   }
   served.set(sessionId, record)
@@ -167,6 +188,7 @@ export function compareServed(sessionId: string, session: Session): ServedCompar
       appended: shapes.length,
       rewroteInPlace: false,
       previousHadPermission: false,
+      previousWasFirst: false,
     }
   }
   const previous = record.shapes
@@ -190,5 +212,6 @@ export function compareServed(sessionId: string, session: Session): ServedCompar
     appended,
     rewroteInPlace: !prefixIntact && appended === 0,
     previousHadPermission: record.hadRebuildPermission,
+    previousWasFirst: record.firstServed,
   }
 }
