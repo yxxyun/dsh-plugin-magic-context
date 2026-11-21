@@ -714,7 +714,7 @@ function refreshBaseline(
     input.journal?.warn(
       'baseline',
       'baseline not written: no non-placeholder user message to anchor it to',
-      { mode: hard ? 'hard' : 'soft', epoch: state.epoch },
+      { mode: hard ? 'hard' : 'soft', epoch: state.epoch, ...hardReason === undefined ? {} : { hardReason } },
       input.sessionId,
     )
     return false
@@ -761,6 +761,11 @@ function refreshBaseline(
     {
       mode: hard ? 'hard' : 'soft',
       epoch: state.epoch,
+      // WHY it folded. Nine conditions produce a HARD rebuild and only `mode`
+      // was recorded, so answering "why did m[0] fold" needed a database query
+      // and a guess. The order in `hardReason` is the diagnostic priority:
+      // `first-pass` is the benign case and must never read as a cache bust.
+      ...hardReason === undefined ? {} : { hardReason },
       // Also on the baseline row, for a pass that only refreshes the baseline
       // (no pass row is written then). The accuracy report reads the PASS rows;
       // this one is a convenience for ad-hoc queries.
