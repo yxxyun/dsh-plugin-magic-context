@@ -44,6 +44,7 @@ import { provenLimitKey } from '../core/provider-limit.ts'
 import { calibratedWireEstimate, pairEstimateSamples, summarise } from '../core/wire-accuracy.ts'
 import { surfaceTokens, surfaceWireTokens } from './management-pass.ts'
 import { compareServed, noteServed, servedRecord } from '../core/served-check.ts'
+import { protectedToolTokens } from './emergency.ts'
 import { appendMagicContextEntry } from './session-notice.ts'
 import { historianInFlight } from './historian.ts'
 import { syncMachineDomain } from '../core/machine-domain.ts'
@@ -816,12 +817,29 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
         const historyRemains = lastCompartmentEnd === undefined
           ? true
           : enumerateSurfaceNodes(payload.agent.session).some(node => Number(node.seq) > lastCompartmentEnd)
+        // The tail a reclaim may NOT drop. A request over the limit is only
+        // hopeless when THIS alone cannot fit; otherwise dropping reclaimable
+        // output would have saved it, and refusing would be wrong.
+        const protectedTailTokens = (() => {
+          try {
+            return protectedToolTokens(
+              enumerateSurfaceToolResults(payload.agent.session, callId =>
+                stores.getTag(sessionId, { kind: 'tool-result', callId })),
+              withTokenThreshold(activePolicy(), route.contextWindow),
+              route.contextWindow,
+              pressureThisTurn,
+            )
+          } catch {
+            return undefined
+          }
+        })()
         const failClosed = evaluateEmergencyFailClosed({
           usagePercentage: pressureThisTurn ?? 0,
           emergencyRecoveryArmed: armed,
           emergencyRecoveryOrigin: drain.overflowOrigin ?? null,
           foldMaterializedThisPass: baselineUpdatedThisPass,
           historyRemains,
+          ...protectedTailTokens === undefined ? {} : { protectedToolTokens: protectedTailTokens },
           ...wire.trusted
             ? {
               finalWireEstimate: {

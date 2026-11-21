@@ -89,6 +89,24 @@ export const REFUSAL_NOTICE_EXHAUSTED =
   'Magic Context: this conversation no longer fits the context window and there is '
   + 'no older history left to summarize. Switch to a model with a larger window to continue.'
 
+/**
+ * Whether a refusal is justified, and what to say.
+ *
+ * Two conditions, not one. A request over the limit can still be saved by
+ * dropping reclaimable tool output, so "over the limit" alone is NOT proof it
+ * cannot be sent. Only when the results that may NOT be dropped already exceed
+ * the limit is the turn hopeless — upstream states the rule at
+ * `emergency-fail-closed.ts:71`:
+ *
+ *   "Only protected results that cannot fit by themselves justify a new healthy
+ *    refusal. Other pressure keeps the provider-overflow and fold behavior: a
+ *    complete estimate ... is not a new reason to stop a turn whose protected
+ *    results fit."
+ *
+ * Without the second condition this refuses turns that would have fit after a
+ * reclaim — and since the calibrated estimate runs +17.6% above actual (p90
+ * +19.4%), a bare `> limit` test refuses several percent of legal requests.
+ */
 function refusalMessageFor(
   estimate: FinalWireEstimate | undefined,
   limit: number | undefined,
@@ -99,6 +117,9 @@ function refusalMessageFor(
   if (limit === undefined || !Number.isFinite(limit) || limit <= 0) return undefined
   const tokens = estimate.refusalTokens ?? estimate.tokens
   if (!Number.isFinite(tokens) || tokens <= limit) return undefined
+  // The half that makes the refusal honest. An unmeasured protected tail proves
+  // nothing, so the absence of the number keeps the turn alive.
+  if (protectedTokens === undefined || !Number.isFinite(protectedTokens) || protectedTokens <= limit) return undefined
   const protectedNote = protectedTokens === undefined
     ? ''
     : ` (${String(protectedTokens)} of it is the protected tail, which cannot be reclaimed)`

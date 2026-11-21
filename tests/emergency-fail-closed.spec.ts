@@ -26,10 +26,41 @@ describe('evaluateEmergencyFailClosed', () => {
       ...base,
       finalWireEstimate: { tokens: 300_000, trusted: true, refusalGrade: true, refusalTokens: 300_000 },
       providerProvenLimitTokens: 262_144,
+      // The protected tail must ALSO exceed the limit: otherwise a reclaim could
+      // still save the turn, and refusing would be wrong.
+      protectedToolTokens: 280_000,
     })
     expect(decision.shouldAbort).toBe(true)
     expect(decision.reason).toBe('refusal-grade-final-wire-over-limit')
     expect(decision.refusalMessage).toContain('262144')
+  })
+
+  it('does NOT refuse when only the total is over: a reclaim could still save it', () => {
+    // Upstream's rule (emergency-fail-closed.ts:71): "Only protected results that
+    // cannot fit by themselves justify a new healthy refusal." A request over the
+    // limit whose protected tail still fits is rescued by dropping reclaimable
+    // output, so stopping the turn here would be wrong.
+    const decision = evaluateEmergencyFailClosed({
+      ...base,
+      usagePercentage: 99,
+      finalWireEstimate: { tokens: 300_000, trusted: true, refusalGrade: true, refusalTokens: 300_000 },
+      providerProvenLimitTokens: 262_144,
+      protectedToolTokens: 40_000,
+    })
+    expect(decision.shouldAbort).toBe(false)
+    expect(decision.refusalMessage).toBeUndefined()
+  })
+
+  it('does NOT refuse when the protected tail was never measured', () => {
+    // An absent number proves nothing. The tension: a refusal that fires on
+    // unmeasured evidence stops turns that might have fit.
+    const decision = evaluateEmergencyFailClosed({
+      ...base,
+      usagePercentage: 99,
+      finalWireEstimate: { tokens: 300_000, trusted: true, refusalGrade: true, refusalTokens: 300_000 },
+      providerProvenLimitTokens: 262_144,
+    })
+    expect(decision.shouldAbort).toBe(false)
   })
 
   it('tells the person to retry when history can still be summarized', () => {
@@ -39,6 +70,7 @@ describe('evaluateEmergencyFailClosed', () => {
       historyRemains: true,
       finalWireEstimate: { tokens: 300_000, trusted: true, refusalGrade: true, refusalTokens: 300_000 },
       providerProvenLimitTokens: 262_144,
+      protectedToolTokens: 280_000,
     })
     expect(decision.shouldAbort).toBe(true)
     expect(decision.refusalMessage).toContain('Send it again')
@@ -52,6 +84,7 @@ describe('evaluateEmergencyFailClosed', () => {
       usagePercentage: 99,
       finalWireEstimate: { tokens: 300_000, trusted: true, refusalGrade: true, refusalTokens: 300_000 },
       providerProvenLimitTokens: 262_144,
+      protectedToolTokens: 280_000,
     })
     expect(decision.shouldAbort).toBe(true)
     expect(decision.refusalMessage).toContain('Switch to a model with a larger window')

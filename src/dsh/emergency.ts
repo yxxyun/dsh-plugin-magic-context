@@ -120,6 +120,42 @@ function tokensFor(textLength: number): number {
  * window: the newest results whose cumulative estimate fits the token window,
  * plus at least the newest `policy.protectedToolResults` tagged nodes.
  */
+/**
+ * The token weight of the results a reclaim may NOT drop.
+ *
+ * These are the newest results inside the mass window plus the newest
+ * `protectedToolResults` nodes — the same set `reclaimForEmergency` keeps. Its
+ * only caller today is the fail-closed refusal decision, which needs it for a
+ * different question: a request over the limit can still be saved by dropping
+ * reclaimable output, so refusing is only justified when **this** number alone
+ * already exceeds the limit (upstream `outgoingContextRefusal`,
+ * `emergency-fail-closed.ts:71`).
+ */
+export function protectedToolTokens(
+  nodes: readonly SurfaceToolNode[],
+  policy: PressurePolicy,
+  contextWindow?: number,
+  usagePercentage?: number,
+): number {
+  const tagged = nodes.filter(node => node.tagNumber !== undefined && !node.isPlaceholder)
+  const windowTokens = protectionWindowTokens(contextWindow, {
+    executeThresholdPercentage: policy.executeThreshold,
+    ...usagePercentage === undefined ? {} : { usagePercentage },
+  })
+  let total = 0
+  let mass = 0
+  for (let index = tagged.length - 1; index >= 0; index -= 1) {
+    const node = tagged[index] as SurfaceToolNode
+    const cost = tokensFor(node.textLength)
+    const withinMassWindow = windowTokens !== undefined && mass + cost <= windowTokens
+    const withinCountFloor = tagged.length - 1 - index < policy.protectedToolResults
+    if (!withinMassWindow && !withinCountFloor) break
+    total += cost
+    if (withinMassWindow) mass += cost
+  }
+  return total
+}
+
 export function reclaimForEmergency(
   session: Session,
   nodes: readonly SurfaceToolNode[],
