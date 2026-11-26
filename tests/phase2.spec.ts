@@ -140,6 +140,17 @@ function send(agent: Agent, text: string): void {
   agent.followup(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }))
 }
 
+/**
+ * A turn with enough narratable正文 to clear the historian's chunk floor
+ * (upstream `historian_chunk.rs:1364`). Cases below that name a digest, a
+ * publish or a baseline injection have to send real material: the floor refuses
+ * a span too small for a summary to improve on, which is exactly what a one-word
+ * turn is.
+ */
+function narratable(label: string): string {
+  return `${label}: ` + 'read the failing test, find the wrong assertion, and report what breaks. '.repeat(150)
+}
+
 /** Poll a condition (out-of-band work — the historian — lands asynchronously). */
 async function until(check: () => boolean, timeoutMs = 4000): Promise<void> {
   const deadline = Date.now() + timeoutMs
@@ -174,7 +185,7 @@ describe('magic-context dsh adapter (phase 2: historian, baseline, memories, eng
       // Engine seam: our class owns ctx.compaction, not compaction-basic.
       expect(ctx.compaction?.constructor.name).toBe('MagicContextCompactionEngine')
 
-      send(agent, 'go')
+      send(agent, narratable('go'))
       await idle(ctx, agent)
 
       // The historian really called its own route, out of band, and stored a digest.
@@ -197,7 +208,7 @@ describe('magic-context dsh adapter (phase 2: historian, baseline, memories, eng
 
       // Turn 2 rides the execute band: the compartment is published as a range
       // replacement and the baseline node carries the digest + memories.
-      send(agent, 'more')
+      send(agent, narratable('more'))
       await idle(ctx, agent)
       const request = adapter.requests.at(-1)
       const text = allText(request)
@@ -266,7 +277,7 @@ describe('magic-context dsh adapter (phase 2: historian, baseline, memories, eng
     const { ctx, agent } = await boot({ dataDir })
     const sessionId = agent.session.id
     try {
-      send(agent, 'range one')
+      send(agent, narratable('range one'))
       await idle(ctx, agent)
 
       const reader = openStores(dataDir)
@@ -302,7 +313,7 @@ describe('magic-context dsh adapter (phase 2: historian, baseline, memories, eng
         reader.close()
       }
 
-      send(agent, 'range two')
+      send(agent, narratable('range two'))
       await idle(ctx, agent)
 
       const placeholder = agent.session.snapshotEvents().findLast(event =>

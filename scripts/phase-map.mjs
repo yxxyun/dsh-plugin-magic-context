@@ -21,6 +21,9 @@
 /** Phase 0: the behaviour that already shipped, before any of the takeover work. */
 const PHASE_BASE = [
   'tests/phase-map.spec.ts',
+  'tests/historian-chunk-floor.spec.ts',
+  'tests/memory-pool-digest.spec.ts',
+  'tests/baseline-two-anchors.spec.ts',
   'tests/client-pure.spec.ts',
   'tests/protected-tail.spec.ts',
   'tests/historian-failure.spec.ts',

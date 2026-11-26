@@ -10,6 +10,32 @@
 
 ## [Unreleased]
 
+**缓存命中：把「本不该重写前缀」的四条路堵掉。** 依据 2026-11-26 的实测审计
+（`docs/reports/cache-audit-2026-11-26.md`）：4 天 4451 步、156 次 baseline 重建中
+31 次有害，合计 1,203 万 token 的重复读取，全部落在这四条路上。
+
+### Fixed
+
+- **m[0] 与 m[1] 拆成两块两锚**（上游 `transform.rs:16974-16999` 的两条 frozen unit）。
+  此前两段渲染进同一个 `<magic-context>` 块、挂在**第一条** user 节点上，于是任何 delta
+  变化（compartment 落地、记忆晋升、画像新增）都会重写承载前缀的那个节点，整段缓存
+  重算——18 次 `soft / m[0] 未变` 重建里 15 次有害，587 万 token 为「本来正确的字节」付费。
+  现在 m[0] 落首节点、m[1] 落尾节点（其后的内容本来就每步重写），新增
+  `<magic-context-delta>` 标记，`BASELINE_RENDER_EPOCH` 6 → 7 让旧块折一次。
+- **记忆池 digest 改用渲染行**（上游 `m0_compose.rs:70` 的 `rendered_memory_ids`）。
+  此前哈希 `id:updatedAt`，而 verify / classify / promote 改的 `verification_status`、
+  `classified_at`、`seen_count`、`scope` 都不进 prompt——469 行 active 记忆的
+  `updated_at` 被移动过，6 次 `memories-digest` 重建重读 234 万 token 换来零内容变化。
+- **ttl-fold 补上后半条件**（上游 `transform.rs:3776-3779`）：`idle_ttl_fired` 之外还要求
+  「上次 fold 之后真的来过一次响应」。此前同一段空闲里会连折两次，后一次重写前一次刚
+  写过的前缀（实测 17:10:24 + 17:12:52、00:12:29 + 00:14:21）。回放本库省 89.7 万。
+- **historian 补 chunked-content floor**（上游 `historian_chunk.rs:916,1364`）：正文不足
+  1000 token 不开 run，force band 绕过，窗口 ≤1000 时不适用。此前判据只看节点数，
+  12 个节点 471 token 也能成 compartment —— §C73 就是这样用 471 token 换了 35.6 万的重读。
+- **跳过原因不再被丢弃**：historian 触发链算出的 `skip` 原本落在
+  `// TEMP journal disabled for bisect` 上，审计时无法回答「这一 pass 为什么没摘要」。
+  现在每次跳过写一行 `historian` journal，`data.phase` 即阶段。
+
 **后台任务不再为一次重启付一天的代价。** `skipped` 原本和 `ok` 一样按 cron 推下一个槽位，
 于是「此刻还拿不到路由 / 根目录」这种**环境性**跳过，会把任务直接推过一整天。
 

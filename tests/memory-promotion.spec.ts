@@ -235,7 +235,12 @@ describe('memory write path (promotion, watermark, dedup)', () => {
       ],
     })
     try {
-      send(agent, 'go')
+      // The historian refuses a span whose正文 is under the chunk floor
+      // (upstream `historian_chunk.rs:1364`, `MIN_CHUNK_TOKENS`), so the turn
+      // has to carry enough narratable text to be worth a digest. Written out
+      // rather than faked: this case is about promotion, and promotion only runs
+      // behind a real publish.
+      send(agent, `${'investigate the failing build and report what broke. '.repeat(150)}`)
       await idle(ctx, agent)
       // Turn 2 rides the execute band: the compartment is published, which is
       // also where Magic Context promotes the facts.

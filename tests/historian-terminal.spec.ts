@@ -633,9 +633,14 @@ describe('historian terminal events (real agent loop)', () => {
     const agent = await ctx.agentLoop.create(SessionId(`mc-historian-loop-${String(Date.now())}`), { provider: 'mock', model: 'mock' })
     const reader = openStores(dataDir)
     try {
-      agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+      // Enough narratable正文 to clear the historian's chunk floor
+      // (`historian_chunk.rs:1364`): a one-word turn is refused before the seam
+      // is ever called, which would leave this case asserting nothing.
+      const narratable = (label: string): string =>
+        `${label}: ` + 'read the failing test and report what breaks. '.repeat(150)
+      agent.followup(createUserMessage({ content: [{ type: 'text', text: narratable('go') }], source: { kind: 'user' } }))
       await idle(ctx, agent)
-      agent.followup(createUserMessage({ content: [{ type: 'text', text: 'more' }], source: { kind: 'user' } }))
+      agent.followup(createUserMessage({ content: [{ type: 'text', text: narratable('more') }], source: { kind: 'user' } }))
       await idle(ctx, agent)
 
       const historianRows = (): Array<{ level: string; data?: Record<string, unknown> }> =>

@@ -182,6 +182,25 @@ export function renderCompartment(
 export const BASELINE_OPEN = '<magic-context>'
 export const BASELINE_CLOSE = '</magic-context>'
 
+/**
+ * The m[1] region's own sentinels.
+ *
+ * m[0] and m[1] are rendered into SEPARATE blocks on separate nodes, because
+ * they change on different schedules: m[0] only at a HARD fold, m[1] whenever a
+ * delta lands. One combined block meant a delta change rewrote the block that
+ * carried m[0], so even a SOFT pass busted the whole cached prefix. Measured
+ * 2026-11-26: 15 of 18 `soft / m[0]-unchanged` rebuilds were harmful, costing
+ * 5,865,247 tokens over four days — every one of them for bytes that were
+ * already correct.
+ *
+ * Upstream keeps them apart as two frozen units and therefore two wire messages
+ * (`transform.rs:16974-16999`: `synthetic_m0_message` then
+ * `CkWireMessage::synthetic_user_text` for m1), so a delta edit only invalidates
+ * m1 and what follows it.
+ */
+export const DELTA_OPEN = '<magic-context-delta>'
+export const DELTA_CLOSE = '</magic-context-delta>'
+
 // ── m[1] mutation deltas: Magic Context's `<memory-updates>` block ───────────
 //
 // Contract: `docs/dsh-plugin-memory-write-contract.md` §6. Additive writes
@@ -434,13 +453,25 @@ export function renderBaseline(input: {
    */
   readonly newProfileLines?: readonly string[]
   readonly budgetTokens: number
+  /**
+   * Which region to render. Default `'both'` keeps every existing caller and
+   * golden working; the adapter asks for `'m0'` and `'m1'` separately so the two
+   * land on different nodes.
+   */
+  readonly region?: 'm0' | 'm1' | 'both'
 }): string {
+  const region = input.region ?? 'both'
+  const wantsM0 = region !== 'm1'
+  const wantsM1 = region !== 'm0'
+  /** m[0]: the frozen prefix. Only a HARD fold may change it. */
   const sections: string[] = []
+  /** m[1]: the delta region. Changes without touching m[0]. */
+  const deltaSections: string[] = []
   const profileLines = input.profileLines ?? []
-  if (profileLines.length > 0) {
+  if (wantsM0 && profileLines.length > 0) {
     sections.push(['<user-profile>', ...profileLines, '</user-profile>'].join('\n'))
   }
-  if (input.baseline.length > 0) {
+  if (wantsM0 && input.baseline.length > 0) {
     const ordered = [...input.baseline].sort((left, right) => left.createdAt - right.createdAt)
     // Positional age is measured INSIDE m[0] only.
     //
@@ -486,7 +517,7 @@ export function renderBaseline(input: {
   // follow it. The previous order put the memories first, which made the digest
   // of m[0] depend on which of the two blocks was non-empty.
   const memoryGroups = input.memoryGroups ?? []
-  if (memoryGroups.length > 0) {
+  if (wantsM0 && memoryGroups.length > 0) {
     // Upstream `renderMemoryBlockV2`: one `<CATEGORY>` tag per run, the bare line
     // inside. The wrapper is `project-memory` (singular), matching upstream.
     const body: string[] = []
@@ -494,7 +525,7 @@ export function renderBaseline(input: {
       body.push(`<${group.category}>`, ...group.lines, `</${group.category}>`)
     }
     sections.push(['<project-memory>', ...body, '</project-memory>'].join('\n'))
-  } else if (input.memories.length > 0) {
+  } else if (wantsM0 && input.memories.length > 0) {
     sections.push(['<project-memories>', ...input.memories, '</project-memories>'].join('\n'))
   }
   // m[1] begins here: every section below is delta-shaped and may change without
@@ -504,20 +535,20 @@ export function renderBaseline(input: {
     ...input.baselineIds === undefined ? {} : { baselineIds: new Set(input.baselineIds) },
     ...input.eligibleIds === undefined ? {} : { eligibleIds: new Set(input.eligibleIds) },
   })
-  if (memoryUpdates.block.length > 0) sections.push(memoryUpdates.block)
+  if (wantsM1 && memoryUpdates.block.length > 0) deltaSections.push(memoryUpdates.block)
   const forcedMemoryLines = input.forcedMemoryLines ?? []
   const budgetedNewMemories = input.newMemories ?? []
   const newMemories = budgetedNewMemories.length > 0 || forcedMemoryLines.length > 0
     ? [...budgetedNewMemories, ...forcedMemoryLines]
     : []
-  if (newMemories.length > 0) {
-    sections.push(['<new-memories>', ...newMemories, '</new-memories>'].join('\n'))
+  if (wantsM1 && newMemories.length > 0) {
+    deltaSections.push(['<new-memories>', ...newMemories, '</new-memories>'].join('\n'))
   }
   const newProfileLines = input.newProfileLines ?? []
-  if (newProfileLines.length > 0) {
-    sections.push(['<new-user-profile>', ...newProfileLines, '</new-user-profile>'].join('\n'))
+  if (wantsM1 && newProfileLines.length > 0) {
+    deltaSections.push(['<new-user-profile>', ...newProfileLines, '</new-user-profile>'].join('\n'))
   }
-  if (input.delta.length > 0) {
+  if (wantsM1 && input.delta.length > 0) {
     const ordered = [...input.delta].sort((left, right) => right.createdAt - left.createdAt)
     // m[1] rows always render at P1 (age 0), matching upstream
     // `inject-compartments.ts:3050` `renderCompartmentAtTier(compartment, 1)`.
@@ -525,30 +556,56 @@ export function renderBaseline(input: {
     // landed after the m[0] freeze — so decaying them by their position inside
     // the delta would summarise the freshest history harder than the frozen
     // baseline behind it.
-    sections.push([
+    deltaSections.push([
       '<compartment-delta>',
       ...ordered.map(compartment => renderCompartment(compartment, 0)),
       '</compartment-delta>',
     ].join('\n'))
   }
-  if (sections.length === 0) return ''
-  return [BASELINE_OPEN, ...sections, BASELINE_CLOSE].join('\n')
+  if (sections.length === 0 && deltaSections.length === 0) return ''
+  // One block per requested region, each with its own sentinel pair, so a caller
+  // can put them on different nodes. `'both'` keeps the historical single block.
+  if (region === 'm0') return [BASELINE_OPEN, ...sections, BASELINE_CLOSE].join('\n')
+  if (region === 'm1') return deltaSections.length === 0
+    ? ''
+    : [DELTA_OPEN, ...deltaSections, DELTA_CLOSE].join('\n')
+  return [BASELINE_OPEN, ...sections, ...deltaSections, BASELINE_CLOSE].join('\n')
 }
 
 /** Index of the baseline block inside a message's text, if it carries one. */
-export function findBaselineRange(text: string): { start: number; end: number } | undefined {
-  const start = text.indexOf(BASELINE_OPEN)
+export function findBaselineRange(
+  text: string,
+  region: 'm0' | 'm1' = 'm0',
+): { start: number; end: number } | undefined {
+  const open = region === 'm1' ? DELTA_OPEN : BASELINE_OPEN
+  const closeToken = region === 'm1' ? DELTA_CLOSE : BASELINE_CLOSE
+  const start = text.indexOf(open)
   if (start === -1) return undefined
-  const close = text.indexOf(BASELINE_CLOSE, start + BASELINE_OPEN.length)
+  const close = text.indexOf(closeToken, start + open.length)
   if (close === -1) return undefined
-  return { start, end: close + BASELINE_CLOSE.length }
+  return { start, end: close + closeToken.length }
 }
 
-/** Strip any previously injected baseline block from a message text. */
+/**
+ * Strip every injected block (m[0] and the m[1] delta) from a message text.
+ *
+ * Both, not just the first: when a session is short enough that the m[1] anchor
+ * IS the m[0] anchor, one node carries both sentinel pairs, and stripping only
+ * the first would leave the delta to accumulate another copy on the next pass.
+ * The loop is bounded by the pairs actually present, so it costs one pass over a
+ * string that is already being rewritten.
+ */
 export function stripBaseline(text: string): string {
-  const range = findBaselineRange(text)
-  if (range === undefined) return text
-  return (text.slice(0, range.start) + text.slice(range.end)).trim()
+  let out = text
+  for (let guard = 0; guard < 4; guard += 1) {
+    const m0 = findBaselineRange(out, 'm0')
+    const m1 = findBaselineRange(out, 'm1')
+    if (m0 === undefined && m1 === undefined) break
+    // Remove the EARLIER block first so the later range stays valid.
+    const first = m0 !== undefined && (m1 === undefined || m0.start < m1.start) ? m0 : m1!
+    out = out.slice(0, first.start) + out.slice(first.end)
+  }
+  return out.trim()
 }
 
 export class HistorianOutputError extends Error {

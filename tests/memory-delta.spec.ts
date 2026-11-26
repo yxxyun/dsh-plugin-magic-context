@@ -17,6 +17,8 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   BASELINE_CLOSE,
   BASELINE_OPEN,
+  DELTA_CLOSE,
+  DELTA_OPEN,
   MEMORY_UPDATES_CLOSE,
   MEMORY_UPDATES_HEADER,
   MEMORY_UPDATES_OPEN,
@@ -962,6 +964,25 @@ function blockOf(text: string): string {
   return start === -1 || end === -1 ? '' : text.slice(start, end + BASELINE_CLOSE.length)
 }
 
+/**
+ * EVERY injected block (m[0] plus the m[1] delta).
+ *
+ * `blockOf` is m[0] only, which is what "the frozen prefix did not move" should
+ * measure. A case that compares two different views of the WHOLE injection needs
+ * both regions, now that they live in separate blocks.
+ */
+function injectedOf(text: string): string {
+  const parts: string[] = []
+  for (const [open, close] of [[BASELINE_OPEN, BASELINE_CLOSE], [DELTA_OPEN, DELTA_CLOSE]] as const) {
+    const start = text.indexOf(open)
+    if (start === -1) continue
+    const end = text.indexOf(close, start)
+    if (end === -1) continue
+    parts.push(text.slice(start, end + close.length))
+  }
+  return parts.join('\n')
+}
+
 function makePassHarness(
   memoryOverride: {
     newLines?: readonly string[]
@@ -1185,7 +1206,7 @@ describe('management pass: the m[1] delta lane', () => {
       expect(wired.text()).toContain('<new-memories>')
       expect(unwired.text()).toContain(MEMORY_UPDATES_OPEN)
       // Proof the guard is byte-level, not vacuous:
-      expect(blockOf(wired.text())).not.toBe(blockOf(unwired.text()))
+      expect(injectedOf(wired.text())).not.toBe(injectedOf(unwired.text()))
     } finally {
       wired.stores.close()
       unwired.stores.close()

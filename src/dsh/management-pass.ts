@@ -95,6 +95,15 @@ export interface ManagementPassInput {
    * not apply, because the adapter never refuses to send.
    */
   readonly pressureStale?: boolean
+  /**
+   * When the last model response landed (ms), i.e. the most recent
+   * `usage_records.recorded_at`. Absent = never observed.
+   *
+   * Upstream `ctx.observed_last_response_at_ms` (`transform.rs:3777`): the
+   * idle-TTL fold needs it to tell "the provider really did lose the cache"
+   * apart from "we are folding the same prefix twice inside one idle stretch".
+   */
+  readonly lastResponseAt?: number
   /** Route + window facts for the historian's auxiliary call. */
   readonly route?: { provider: string; model: string }
   readonly contextWindow?: number
@@ -265,16 +274,25 @@ export function surfaceWireTokens(session: Session): number {
   return total
 }
 
-/** The baseline block currently carried by a node, when it has one. */
-function baselineBlockOf(text: string): string | undefined {
-  const range = findBaselineRange(text)
+/** A rendered block currently carried by a node, when it has one. */
+function baselineBlockOf(text: string, region: 'm0' | 'm1' = 'm0'): string | undefined {
+  const range = findBaselineRange(text, region)
   return range === undefined ? undefined : text.slice(range.start, range.end)
 }
 
-/** Compose the baseline block ahead of the node's own (baseline-free) content. */
-function composeBaselineContent(node: SurfaceNode, block: string): ContentBlock[] {
+/**
+ * Compose the injected blocks ahead of the node's own (block-free) content.
+ *
+ * Takes a LIST because one node can carry both regions (short session, single
+ * anchor). Empty blocks are dropped rather than emitted as empty strings: a
+ * text block of `''` still serializes into the request and would count as an
+ * extra segment on every later step.
+ */
+function composeBaselineContent(node: SurfaceNode, blocks: readonly string[]): ContentBlock[] {
   const stripped = stripBaseline(node.text)
-  const content: ContentBlock[] = [{ type: 'text', text: block }]
+  const content: ContentBlock[] = blocks
+    .filter(block => block.length > 0)
+    .map(text => ({ type: 'text' as const, text }))
   if (stripped.length > 0) content.push({ type: 'text', text: stripped })
   return content
 }
@@ -513,10 +531,30 @@ export function publishReadyCompartments(
  * header format. Every existing baseline then folds once, instead of surviving
  * as a mismatch nobody can see.
  */
-export const BASELINE_RENDER_EPOCH = 6
+/**
+ * Bumped when the rendered layout changes shape.
+ *
+ * 7: m[0] and m[1] are two blocks on two anchors. A baseline written by epoch 6
+ * carries the delta INSIDE its m[0] block, and `stripBaseline` would leave it
+ * there while a second delta block accumulated beside it — so every existing
+ * session folds once, and only once.
+ */
+export const BASELINE_RENDER_EPOCH = 7
 
 /** Upstream `RECENT_TOOL_SKELETON_WINDOW` (apply-operations.ts:53). */
 const RECENT_TOOL_SKELETON_WINDOW = 20
+
+/**
+ * Upstream `historian_chunk.rs:916` `MIN_FIT_CHUNK_TOKENS` / the chunked-content
+ * floor at :1364. Below this many tokens of正文 a historian run cannot produce a
+ * summary worth the prefix rewrite that publishing it forces — the fixed prompt
+ * parts take the whole window and the compartment would only restate tool arcs.
+ *
+ * Not configurable upstream, and not configurable here: it prices a model call
+ * against the rewrite it causes, and both sides are facts about the provider,
+ * not about the user's preference.
+ */
+const HISTORIAN_MIN_CHUNK_TOKENS = 1_000
 /** Upstream `SKELETON_REAL_INPUT_MAX_BYTES` (tool-input-size.ts:17). */
 const SKELETON_REAL_INPUT_MAX_BYTES = 1_024
 
@@ -586,7 +624,29 @@ function refreshBaseline(
   // elapsed, i.e. the provider cache is already gone, so re-rendering here
   // costs nothing that is not already lost and folds m[1] back into m[0] for
   // the requests that follow. Off ⇒ the pass only lands queued work.
-  const ttlFold = input.policy.ttlRebuild === true && input.pass.reason === 'cache-ttl-idle'
+  //
+  // Upstream requires a SECOND half (`transform.rs:3776-3779`):
+  //
+  //   idle_fold_due = idle_ttl_fired
+  //     && observed_last_response_at_ms.is_some_and(|r| r > meta.expiry_cutoff_ms)
+  //
+  // i.e. a real response must have arrived SINCE the last fold. Without it two
+  // passes inside one idle stretch both fold, and the second one rewrites a
+  // prefix the first had just rewritten a minute earlier. Measured 2026-11-26:
+  // 17:10:24 and 17:12:52, then 00:12:29 and 00:14:21 — each pair cost a full
+  // re-read (205k / 362k) while nothing had been sent in between.
+  //
+  // `expiry_cutoff_ms` is written at HARD time from the pass clock
+  // (`transform.rs:3971`), which is exactly our `frozenAt`; and `None` (never
+  // observed) reads as "not due", never as "yes". Both readings are kept.
+  const lastResponseAt = input.lastResponseAt
+  const responseSinceFold = previous !== undefined
+    && previous.frozenAt !== undefined
+    && lastResponseAt !== undefined
+    && lastResponseAt > previous.frozenAt
+  const ttlFold = input.policy.ttlRebuild === true
+    && input.pass.reason === 'cache-ttl-idle'
+    && responseSinceFold
   const hard = ttlFold || previous === undefined || routeChanged || memoriesChanged || epochChanged || cursorUpgrade || profileChanged || renderEpochChanged || systemHashChanged
   // WHY, not just whether. Reading it back out of the journal used to need a
   // database query and a guess, because only `mode: 'hard'` was recorded while
@@ -668,7 +728,7 @@ function refreshBaseline(
   // "same inputs → same bytes … never read here from a live clock"), so this
   // call is byte-stable on its own. `frozenAt` still matters: it is what
   // `splitBaselineSets` freezes m[0] against, and a SOFT pass must not move it.
-  const block = renderBaseline({
+  const renderInput = {
     now,
     baseline: sets.baseline,
     delta: sets.delta,
@@ -687,8 +747,15 @@ function refreshBaseline(
     // Otherwise the pending (post-cursor) changes render in m[1].
     ...hard || updates === undefined ? {} : { memoryUpdates: updates.updates },
     budgetTokens: input.policy.baselineTokens,
-  })
-  if (block.length === 0) return false
+  } as const
+  // m[0] and m[1] are rendered as SEPARATE blocks and land on SEPARATE nodes, so
+  // a delta change no longer invalidates the frozen prefix. Upstream keeps them
+  // as two frozen units (`transform.rs:16974-16999`); this is the same split
+  // expressed through two anchors, because the host's surface can only replace a
+  // node in place, not insert a message before the history.
+  const m0Block = renderBaseline({ ...renderInput, region: 'm0' })
+  const m1Block = renderBaseline({ ...renderInput, region: 'm1' })
+  if (m0Block.length === 0 && m1Block.length === 0) return false
 
   // The baseline rides the first ordinary user node — never a compaction
   // checkpoint (host or engine). Attaching it to a checkpoint let that
@@ -719,7 +786,30 @@ function refreshBaseline(
     )
     return false
   }
-  if (baselineBlockOf(target.text) === block) {
+  // The m[1] anchor: the LAST ordinary user node, not the first.
+  //
+  // Everything after it is this turn's own material, which is rewritten every
+  // step anyway (a new tool result is a new node), so a delta edit there costs
+  // nothing that was not already being paid. On the FIRST node it would bust the
+  // frozen prefix for a delta change — which is the defect this split removes.
+  const deltaTarget = m1Block.length === 0
+    ? undefined
+    : [...nodes].reverse().find(node =>
+      node.role === 'user'
+      && node.sourceKind !== 'compact-checkpoint'
+      && !node.isPlaceholder)
+
+  const m0Stale = baselineBlockOf(target.text, 'm0') !== m0Block
+  const m1Stale = m1Block.length === 0
+    // A delta block that should no longer exist (its rows were folded into m[0]
+    // by the HARD that just ran) still has to be removed from the anchor.
+    ? baselineBlockOf(target.text, 'm1') !== undefined
+      || (deltaTarget !== undefined && baselineBlockOf(deltaTarget.text, 'm1') !== undefined)
+    : deltaTarget === undefined
+      ? false
+      : baselineBlockOf(deltaTarget.text, 'm1') !== m1Block
+
+  if (!m0Stale && !m1Stale) {
     // Byte-identical: no durable mutation, no priced bust (MC's defer pass).
     if (state.nodeSeq !== target.seq || state.updatedAt !== previous?.updatedAt) {
       input.stores.saveBaselineState({
@@ -734,18 +824,36 @@ function refreshBaseline(
     }
     return false
   }
-  const landedSeq = replaceSurfaceRange(
-    input.session,
-    target.seq,
-    target.seq,
-    composeBaselineContent(target, block),
-    [target.seq],
-    syntheticNodeId('mc-baseline'),
-    magicContextSource(
+
+  // One node carries both blocks when the m[1] anchor IS the m[0] anchor (a
+  // session with a single user turn). That case is unavoidable and no worse than
+  // before; every longer session gets the split.
+  const sameNode = deltaTarget === undefined || deltaTarget.seq === target.seq
+  const writeNode = (node: SurfaceNode, blocks: readonly string[], label: string): number =>
+    replaceSurfaceRange(
+      input.session,
+      node.seq,
+      node.seq,
+      composeBaselineContent(node, blocks),
+      [node.seq],
+      syntheticNodeId('mc-baseline'),
+      magicContextSource(label),
+    )
+  const landedSeq = sameNode
+    ? writeNode(target, [m0Block, m1Block],
       `Magic Context · baseline ${hard ? 'HARD rebuild' : 'soft refresh'} `
-        + `(m[0] ${String(sets.baseline.length)} · m[1] ${String(sets.delta.length)} · ${String(memories?.lines.length ?? 0)} memories)`,
-    ),
-  )
+        + `(m[0] ${String(sets.baseline.length)} · m[1] ${String(sets.delta.length)} · ${String(memories?.lines.length ?? 0)} memories)`)
+    : (() => {
+      // Write the tail FIRST: replacing the head shifts nothing (a 1:1 replace
+      // keeps the seq), but doing the cheaper region first means a failure there
+      // cannot leave the frozen prefix rewritten with no delta behind it.
+      if (m1Stale) writeNode(deltaTarget!, [m1Block], 'Magic Context · delta refresh (m[1])')
+      return m0Stale
+        ? writeNode(target, [m0Block],
+          `Magic Context · baseline ${hard ? 'HARD rebuild' : 'soft refresh'} `
+            + `(m[0] ${String(sets.baseline.length)} · ${String(memories?.lines.length ?? 0)} memories)`)
+        : target.seq
+    })()
   input.stores.saveBaselineState({
     ...state,
     nodeSeq: landedSeq,
@@ -785,8 +893,11 @@ function refreshBaseline(
         cursor: state.maxMemoryMutationId,
         epochFingerprint: state.projectEpochFingerprint,
       },
-      bytes: block.length,
-      estTokens: estimateTokens(block),
+      // Both regions: the journal answers "how big is the injected block", and
+      // after the split that is m[0] plus the delta, not one of them.
+      bytes: m0Block.length + m1Block.length,
+      estTokens: estimateTokens(m0Block) + estimateTokens(m1Block),
+      ...(sameNode ? { sameAnchor: true } : {}),
       ...memoriesChanged ? { reason: 'memory-digest-changed' } : {},
       ...profileChanged ? { reason: 'profile-digest-changed' } : {},
       ...routeChanged ? { reason: 'route-changed' } : {},
@@ -1081,6 +1192,30 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
       const isMeaningful = chunkHasMore
         || eligibleTokens >= 6_000
         || eligibleNodes >= 12
+      // Upstream `historian_chunk.rs:1364` — the CHUNKED-CONTENT floor:
+      //
+      //   if chunk.token_estimate * source_ratio < config.min_chunk_tokens
+      //      && !config.in_emergency && !config.fold_is_only_reclaim { NoFire }
+      //
+      // It is a different question from `isMeaningful`, which counts NODES: a
+      // tool arc collapses to a one-line summary, so twelve nodes can be 471
+      // tokens of正文 that no summary can improve on. Measured 2026-11-26:
+      // compartment §C73 took 12 nodes / 471 token, published, and the next step
+      // re-read 355,880 tokens — a 471-token compartment bought at 356k.
+      //
+      // Both upstream exceptions apply as written: `in_emergency` is our force
+      // band (the window is about to blow, any reclaim is worth it), and
+      // `fold_is_only_reclaim` is false here because this adapter always has the
+      // drop lane, so a small span never leaves the session with zero reclaim.
+      //
+      // The floor also needs a window big enough to HOLD it: upstream's constant
+      // is justified by "below this the fixed prompt parts take the whole window"
+      // (`historian_chunk.rs:914-916`), which presumes a window far larger than
+      // 1 000 tokens. On a window that small the floor could never be satisfied,
+      // so applying it would disable the historian outright — the same trap that
+      // made a span cap equal to the trigger budget kill every run on 2026-11-18.
+      const belowChunkFloor = windowForTrigger > HISTORIAN_MIN_CHUNK_TOKENS
+        && eligibleTokens < HISTORIAN_MIN_CHUNK_TOKENS
       // Upstream step 6 (`proactive floor`): below `executeThreshold - 2` the
       // historian is not supposed to fire at all. The redundancy projection only
       // makes sense INSIDE the bands — evaluated at 18% it always says "drops are
@@ -1124,7 +1259,19 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
       if (idlePoke) {
         // Platform difference: DSH's cache-ttl idle poke has no upstream twin.
         // The cache is already gone, so this is the cheapest moment to rewrite.
-      } else if (forceBandHit) {
+        //
+        // "Cheap to rewrite" is not "worth a run", though: the chunk floor still
+        // applies, because what it prices is the historian CALL and the quality
+        // of the compartment it produces — neither depends on the cache. A 471-
+        // token span summarised at 03:00 costs the same model call as at noon.
+        if (belowChunkFloor && !forceBandHit) {
+          skip = {
+            phase: 'below-chunk-floor',
+            message: `chunk carries ~${String(eligibleTokens)} tok of正文, under the `
+              + `${String(HISTORIAN_MIN_CHUNK_TOKENS)}-token floor — a digest would not improve it`,
+            data: { eligibleTokens, eligibleNodes, floor: HISTORIAN_MIN_CHUNK_TOKENS, band: 'idle' },
+          }
+        }      } else if (forceBandHit) {
         if (dropsEnough) {
           skip = {
             phase: 'redundancy-skip',
@@ -1132,6 +1279,16 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
               + `${String(Math.round(input.policy.executeThreshold * 0.75))}% target — no digest needed`,
             data: { reclaimedThisPass, pressure: input.pressure, band: 'force' },
           }
+        }
+      } else if (belowChunkFloor) {
+        // A SEPARATE gate from `tail_size` upstream (`historian_chunk.rs:1364`),
+        // so it sits on its own rung: a big tail of tool arcs clears `tail_size`
+        // and still carries almost no正文, while a small tail can be dense.
+        skip = {
+          phase: 'below-chunk-floor',
+          message: `chunk carries ~${String(eligibleTokens)} tok of正文, under the `
+            + `${String(HISTORIAN_MIN_CHUNK_TOKENS)}-token floor — a digest would not improve it`,
+          data: { eligibleTokens, eligibleNodes, floor: HISTORIAN_MIN_CHUNK_TOKENS },
         }
       } else if (tailSizeFire) {
         // Enough narratable material, pressure irrelevant (upstream `tail_size`).
@@ -1157,7 +1314,17 @@ export function runManagementPass(input: ManagementPassInput): ManagementPassRes
         }
       }
       if (skip !== null) {
-        // TEMP: journal disabled for bisect
+        // The skip reason used to be computed and dropped on the floor here
+        // (`// TEMP: journal disabled for bisect`), so the 2026-11-26 audit could
+        // not tell WHY a pass fired no digest without re-deriving the whole chain
+        // — 38 rebuilds carried no `hardReason` at all. One row per skip, with
+        // the phase as `data.phase`, makes the chain readable from the journal.
+        input.journal?.info(
+          'historian',
+          `historian skipped: ${skip.message}`,
+          { phase: skip.phase, ...skip.data, pressure: input.pressure, trigger: input.pass.reason },
+          input.sessionId,
+        )
       } else {
       const deps: HistorianDeps = {
         stores: input.stores,

@@ -88,7 +88,14 @@ function seedBaseline(stores: AdapterStores): void {
   })
 }
 
-function run(stores: AdapterStores, ttlRebuild: boolean, entries: Recorded[], now: number) {
+function run(
+  stores: AdapterStores,
+  ttlRebuild: boolean,
+  entries: Recorded[],
+  now: number,
+  /** `null` = no response has been observed (upstream `None`); omitted = one arrived a minute ago. */
+  lastResponseAt: number | null = now - 60_000,
+) {
   return runManagementPass({
     session: surfaceSession(),
     sessionId: SESSION,
@@ -98,6 +105,7 @@ function run(stores: AdapterStores, ttlRebuild: boolean, entries: Recorded[], no
     pass: { kind: 'execute', reason: 'cache-ttl-idle' },
     pressure: 20,
     now: () => now,
+    ...lastResponseAt === null ? {} : { lastResponseAt },
     memories: { digest: DIGEST, lines: ['- rule A'], newLines: ['- rule B'], newMemoryIds: [2] },
     journal: recordingJournal(entries),
   })
@@ -116,6 +124,39 @@ describe('policy.ttlRebuild', () => {
       run(stores, true, entries, T0 + 10 * 60_000)
       expect(stores.baselineState(SESSION)?.epoch).toBe(2)
       expect(stores.baselineState(SESSION)?.frozenAt).toBe(T0 + 10 * 60_000)
+    } finally {
+      stores.close()
+    }
+  })
+
+  // Upstream `transform.rs:3776-3779`: the fold needs a response SINCE the last
+  // one, because a second fold inside the same idle stretch rewrites a prefix the
+  // first fold had just rewritten. Measured 2026-11-26: 17:10:24 + 17:12:52 and
+  // 00:12:29 + 00:14:21 each paid a full re-read (205k / 362k) with nothing sent
+  // in between.
+  it('an idle pass does NOT fold when no response arrived since the last fold', () => {
+    const stores = openStore()
+    const entries: Recorded[] = []
+    try {
+      seedBaseline(stores)
+      // The last response predates the baseline's own fold: folding again would
+      // rewrite bytes nobody has read.
+      run(stores, true, entries, T0 + 10 * 60_000, T0 - 1)
+      expect(stores.baselineState(SESSION)?.epoch).toBe(1)
+      expect(stores.baselineState(SESSION)?.frozenAt).toBe(T0)
+    } finally {
+      stores.close()
+    }
+  })
+
+  it('an idle pass does NOT fold when no response was ever observed', () => {
+    const stores = openStore()
+    const entries: Recorded[] = []
+    try {
+      seedBaseline(stores)
+      // Upstream reads `None` as "not due", never as "yes".
+      run(stores, true, entries, T0 + 10 * 60_000, null)
+      expect(stores.baselineState(SESSION)?.epoch).toBe(1)
     } finally {
       stores.close()
     }

@@ -68,6 +68,26 @@ export function defaultMemoryDbPath(): string {
   return join(homedir(), '.local', 'share', 'cortexkit', 'magic-context-dsh-poc', 'memories.db')
 }
 
+/**
+ * The m[0] memory pool's identity: a digest of the RENDERED lines, in render
+ * order.
+ *
+ * It must be the bytes, not a row stamp. The pool's digest decides whether the
+ * baseline is rebuilt (`management-pass.ts` `memoriesChanged`), and a rebuild
+ * costs a full prompt re-read. Hashing `id:updated_at` made every metadata-only
+ * write — verify flipping `verification_status`, classify writing `scope`,
+ * a `seen_count` bump — look like a content change: measured 2026-11-26, 469 of
+ * 974 active rows had `updated_at` moved since 11-23 and six `memories-digest`
+ * rebuilds cost 2,337,877 tokens of re-read for content that had not changed.
+ *
+ * Upstream never had the exposure: its m0 identity is `rendered_memory_ids` +
+ * `memory_revision` (`m0_compose.rs:70`, `transform.rs:3972`) — WHICH rows
+ * rendered, never a wall-clock stamp.
+ */
+export function memoryPoolDigest(renderedLines: readonly string[]): string {
+  return createHash('sha1').update(renderedLines.join('\n')).digest('hex')
+}
+
 export interface MemoryRow {
   readonly id: number
   readonly projectPath: string
@@ -1245,9 +1265,23 @@ export function openMemoryBridge(options: MemoryBridgeOptions): MemoryBridge {
           const orderedPool = order(poolSelected)
           const orderedAdditions = order(deltaSelected)
           // Digest covers the m[0] pool ONLY: a new memory may not bust the cache.
-          const digest = createHash('sha1')
-            .update(orderedPool.map(row => `${String(row.id)}:${String(row.updatedAt)}`).join('|'))
-            .digest('hex')
+          //
+          // It hashes the RENDERED LINES, not `id:updatedAt`. `updated_at` is "this
+          // row was written", which verify / classify / promote bump for columns
+          // that never reach the prompt (`verification_status`, `classified_at`,
+          // `seen_count`, `scope`). Hashing it made a pure metadata touch look like
+          // a content change and forced a HARD rebuild. Measured 2026-11-26: 469 of
+          // 974 active rows had `updated_at` moved since 11-23, and six
+          // `memories-digest` rebuilds cost 2,337,877 tokens of re-read for content
+          // that had not changed.
+          //
+          // Upstream never had this exposure: its m0 identity is
+          // `rendered_memory_ids` + `memory_revision` (`m0_compose.rs:70`,
+          // `transform.rs:3972`), i.e. WHICH rows rendered and what the revision is,
+          // never a wall-clock stamp. Hashing the rendered bytes is the same
+          // invariant expressed in one field: the digest changes exactly when m[0]
+          // would have changed.
+          const digest = memoryPoolDigest(orderedPool.map(renderMemoryLine))
           // B1: visibility-qualified max (own eligible + peers eligible AND shared).
           const currentMaxMemoryId = maxVisibleId(identities, peerIdentities, [...shared], request.now)
           return {

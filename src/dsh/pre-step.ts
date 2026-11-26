@@ -619,6 +619,7 @@ export function preStepListener(deps: PreStepDeps): PreStepListener {
           policy,
           logger: ctx.logger,
           pass,
+          ...latest === undefined ? {} : { lastResponseAt: latest.recordedAt },
           ...latestSystemPromptFingerprint === undefined
             ? {}
             : { systemHash: latestSystemPromptFingerprint },

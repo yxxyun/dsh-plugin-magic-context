@@ -42,3 +42,6 @@ npm-debug.log*
 
 # 本轮修复的本地回滚件（不随代码走）
 *.bak-*
+
+# 数据库迁移前的 VACUUM INTO 备份
+backups/
