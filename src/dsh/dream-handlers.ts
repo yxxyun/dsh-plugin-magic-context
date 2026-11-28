@@ -673,6 +673,22 @@ export function buildAutoStageHandler(deps: DreamHandlerDeps): DreamTaskHandler 
     })
     const publishedCount = outcome.published.length
     const refusedCount = outcome.refused.length
+    // WHY each row was refused, counted rather than dropped.
+    //
+    // Measured 2026-11-28: 319 runs, 2197 rows examined, 0 changed, and every
+    // summary said only "nothing staged" — the reason satellite was computed and
+    // thrown away. That is the same shape as the `hardReason` gap: the decision
+    // happened, the number survived, the cause did not. Without it nobody could
+    // tell "the pool is correctly empty" from "every row is being misjudged", and
+    // the lane spent 2871 classifier calls to answer neither.
+    const refusalCounts = new Map<string, number>()
+    for (const item of outcome.skipped) {
+      refusalCounts.set(item.reason, (refusalCounts.get(item.reason) ?? 0) + 1)
+    }
+    const reasons = [...refusalCounts.entries()]
+      .sort((left, right) => right[1] - left[1])
+      .map(([reason, count]) => `${reason} ${String(count)}`)
+      .join(', ')
     return {
       status: 'ok',
       itemsProcessed: outcome.staged.length + outcome.skipped.length,
@@ -683,9 +699,11 @@ export function buildAutoStageHandler(deps: DreamHandlerDeps): DreamTaskHandler 
       tokensUsed: 0,
       summary: outcome.staged.length === 0
         ? `nothing staged${outcome.reason === undefined ? '' : ` (${outcome.reason})`}`
+          + (reasons === '' ? '' : ` — refused: ${reasons}`)
         : `staged ${String(outcome.staged.length)}, published ${String(publishedCount)}, `
           + `refused ${String(refusedCount)}, skipped ${String(outcome.skipped.length)}`
-          + (refusedCount === 0 ? '' : ` (refusals stay pending for review_global)`),
+          + (reasons === '' ? '' : ` (${reasons})`)
+          + (refusedCount === 0 ? '' : ` — refusals stay pending for review_global`),
     }
   }
 }

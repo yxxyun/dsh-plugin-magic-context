@@ -123,13 +123,13 @@ describe('autoStageGlobalCandidates', () => {
   it('routes a machine-classified candidate into the machine pool', async () => {
     const s = storeWithDomains(true, true)
     const contract = makeContract([
-      { id: 11, content: '本机 Python 统一走 uv。', category: 'CONSTRAINTS', seen: 2 },
+      { id: 11, content: '本机 Python 统一走 uv，不要在项目里建 venv，也不要 pip install 到全局。', category: 'CONSTRAINTS', seen: 2 },
     ])
     const result = await autoStageGlobalCandidates({
       store: s,
       corpusDbPath: contract,
       now: NOW,
-      llm: classifyLlm({ '本机 Python 统一走 uv。': { domain: 'machine', reason: 'machine env' } }),
+      llm: classifyLlm({ '本机 Python 统一走 uv，不要在项目里建 venv，也不要 pip install 到全局。': { domain: 'machine', reason: 'machine env' } }),
       route: { provider: 'mock', model: 'mock' },
     })
     expect(result.staged).toHaveLength(1)
@@ -152,14 +152,14 @@ describe('autoStageGlobalCandidates', () => {
   it('publishes a gated candidate straight into the domain', async () => {
     const s = storeWithDomains(true, true)
     const contract = makeContract([
-      { id: 21, content: '本机 Python 统一走 uv。', category: 'CONSTRAINTS', seen: 2 },
+      { id: 21, content: '本机 Python 统一走 uv，不要在项目里建 venv，也不要 pip install 到全局。', category: 'CONSTRAINTS', seen: 2 },
     ])
     const published: Array<{ identity: string; content: string }> = []
     const result = await autoStageGlobalCandidates({
       store: s,
       corpusDbPath: contract,
       now: NOW,
-      llm: classifyLlm({ '本机 Python 统一走 uv。': { domain: 'machine', reason: 'machine env' } }),
+      llm: classifyLlm({ '本机 Python 统一走 uv，不要在项目里建 venv，也不要 pip install 到全局。': { domain: 'machine', reason: 'machine env' } }),
       route: { provider: 'mock', model: 'mock' },
       writer: {
         publishDomainMemory: (input) => { published.push({ identity: input.identity, content: input.content }); return { ok: true as const, id: 900, created: true } },
@@ -168,7 +168,7 @@ describe('autoStageGlobalCandidates', () => {
     })
     expect(result.published).toHaveLength(1)
     expect(result.refused).toHaveLength(0)
-    expect(published).toEqual([{ identity: 'dir:global:machine', content: '本机 Python 统一走 uv。' }])
+    expect(published).toEqual([{ identity: 'dir:global:machine', content: '本机 Python 统一走 uv，不要在项目里建 venv，也不要 pip install 到全局。' }])
     expect(s.getGlobalCandidate(result.staged[0]!.candidateId)?.state).toBe('approved')
   })
 
@@ -200,13 +200,13 @@ describe('autoStageGlobalCandidates', () => {
   it('without a writer, staging parks the candidate as before', async () => {
     const s = storeWithDomains(true, true)
     const contract = makeContract([
-      { id: 23, content: '本机 Python 统一走 uv。', category: 'CONSTRAINTS', seen: 2 },
+      { id: 23, content: '本机 Python 统一走 uv，不要在项目里建 venv，也不要 pip install 到全局。', category: 'CONSTRAINTS', seen: 2 },
     ])
     const result = await autoStageGlobalCandidates({
       store: s,
       corpusDbPath: contract,
       now: NOW,
-      llm: classifyLlm({ '本机 Python 统一走 uv。': { domain: 'machine', reason: 'machine env' } }),
+      llm: classifyLlm({ '本机 Python 统一走 uv，不要在项目里建 venv，也不要 pip install 到全局。': { domain: 'machine', reason: 'machine env' } }),
       route: { provider: 'mock', model: 'mock' },
     })
     expect(result.published).toEqual([])
@@ -329,6 +329,29 @@ describe('autoStageGlobalCandidates', () => {
     })
     expect(result.staged).toHaveLength(0)
     expect(pending(s, 'dir:global:machine')).toBe(0)
+  })
+
+  it('never classifies a row whose text is bare markup', async () => {
+    // Measured 2026-11-28: 5 of the 13 rows this pool held were bare
+    // CONSTRAINTS / ARCHITECTURE open-close tags. They can never pass, so every
+    // tick spent a classifier call on each of them, forever. Length cannot
+    // separate them (15 characters) from a real Chinese constraint (12), so the
+    // filter is the leading angle bracket.
+    const s = storeWithDomains(true, true)
+    const contract = makeContract([
+      { id: 41, content: '</CONSTRAINTS>', category: 'CONSTRAINTS', seen: 2 },
+      { id: 42, content: '<ARCHITECTURE>', category: 'CONSTRAINTS', seen: 2 },
+      { id: 43, content: '跨仓库流水线必须严格串行。', category: 'CONSTRAINTS', seen: 2 },
+    ])
+    const result = await autoStageGlobalCandidates({
+      store: s,
+      corpusDbPath: contract,
+      now: NOW,
+      llm: classifyLlm({ '跨仓库流水线必须严格串行。': { domain: 'project', reason: 'local' } }),
+      route: { provider: 'p', model: 'm' },
+    })
+    // Only the real constraint reaches the classifier.
+    expect(result.skipped).toEqual([{ memoryId: 43, reason: 'project-scope' }])
   })
 
   it('is idempotent: a second pass stages nothing new', async () => {

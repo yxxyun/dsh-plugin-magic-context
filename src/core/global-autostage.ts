@@ -216,6 +216,14 @@ export async function autoStageGlobalCandidates(input: {
          WHERE status = 'active' AND shareable = 0 AND seen_count >= 2
            AND category IN (SELECT value FROM json_each(?))
            AND project_path NOT LIKE 'dir:global:%' AND project_path NOT LIKE 'git:global:%'
+           -- A row that STARTS with markup is a fragment of one, not a fact.
+           -- Measured 2026-11-28: 5 of the 13 rows this pool held were bare
+           -- CONSTRAINTS / ARCHITECTURE open-close tags, classified on every
+           -- tick since they can never pass. Length is not the test: those tags
+           -- are 14-15 characters, the same as a real Chinese constraint
+           -- ("跨仓库流水线必须严格串行。" is 12), so a length floor would filter
+           -- the wrong rows. The leading angle bracket separates them exactly.
+           AND trim(content) NOT GLOB '<*'
          ORDER BY updated_at DESC LIMIT 50`,
       ).all(categories) as unknown as ScanRow[]
     } finally {
