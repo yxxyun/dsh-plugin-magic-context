@@ -1303,6 +1303,7 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
           let reported = false
           let requests = 0
           let missed = 0
+          let partial = 0
           for (const row of rows) {
             const cacheRead = row.cacheReadTokens ?? 0
             const cacheWrite = row.cacheWriteTokens ?? 0
@@ -1313,7 +1314,15 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
             read += cacheRead
             input += inputTokens
             write += cacheWrite
-            if (cacheRead === 0) missed += 1
+            // Bucketed by how much of the prefix went uncached, NOT by
+            // miss-vs-hit. "Total miss" never happened here (630 of 630 requests
+            // read at least the system block) and "partial miss" was all 630, so
+            // both counters were constants carrying no information — measured
+            // 2026-11-28, the same day I added them. What varies and what matters
+            // is the size of the uncached share.
+            const uncachedShare = inputTokens / Math.max(1, cacheRead + inputTokens)
+            if (uncachedShare >= 0.5) missed += 1
+            else if (uncachedShare >= 0.1) partial += 1
           }
           const total = read + input + write
           return {
@@ -1323,6 +1332,7 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
             writeTokens: write,
             requests,
             missedRequests: missed,
+            partialRequests: partial,
             ...reported && total > 0 ? { hitRate: read / total } : {},
           }
         } catch {

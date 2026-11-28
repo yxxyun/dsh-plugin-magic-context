@@ -1164,6 +1164,7 @@ window.__ModuleLoader__.load({
           reported: health.cacheStats.reported === true,
           hitRate: num(health.cacheStats.hitRate),
           missedRequests: num(health.cacheStats.missedRequests),
+          partialRequests: num(health.cacheStats.partialRequests),
           requests: num(health.cacheStats.requests),
           readTokens: num(health.cacheStats.readTokens),
         },

@@ -242,6 +242,8 @@ export function createDashboardService(deps: DashboardDeps): DashboardService {
     let reported = false
     let requests = 0
     let missTokens = 0
+    let totalMiss = 0
+    let partialMiss = 0
     const buckets: Record<string, { miss: number; total: number }> = {
       'lt1m': { miss: 0, total: 0 },
       '1to5m': { miss: 0, total: 0 },
@@ -259,6 +261,11 @@ export function createDashboardService(deps: DashboardDeps): DashboardService {
         input += row.input
         write += row.write
         missTokens += row.input
+        // Same three states as the panel: a zero read is the provider's TTL, a
+        // small read against a large input is a prefix we changed. One counter
+        // would blur the only distinction this card exists to draw.
+        if (row.read === 0) totalMiss += 1
+        else if (row.input > 0) partialMiss += 1
         const previous = index === 0 ? undefined : list[index - 1]
         if (previous === undefined) continue
         const gap = row.at - previous.at
@@ -276,6 +283,8 @@ export function createDashboardService(deps: DashboardDeps): DashboardService {
       inputTokens: input,
       writeTokens: write,
       missTokens,
+      totalMissRequests: totalMiss,
+      partialMissRequests: partialMiss,
       ...reported && total > 0 ? { hitRate: read / total } : {},
       buckets,
     }

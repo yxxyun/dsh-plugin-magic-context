@@ -89,8 +89,19 @@ export interface TelemetryDeps {
     readonly writeTokens?: number
     /** read / (read + input + write); undefined when `reported` is false. */
     readonly hitRate?: number
-    /** Requests whose cache read was zero, i.e. the ones that paid full price. */
+    /**
+     * Requests that went MOSTLY uncached (>= 50% of the prefix re-sent).
+     *
+     * Not "cache read of zero": that never happens here, because the system
+     * block always reads. The useful axis is the uncached SHARE, and the two
+     * thresholds say different things — >= 50% is the provider's TTL expiring,
+     * 10-50% is a prefix we changed. Measured 2026-11-28: an earlier version of
+     * this pair counted zero-read requests and reported `0 misses` while 3.5M
+     * input tokens had gone uncached.
+     */
     readonly missedRequests?: number
+    /** Requests that re-sent 10-50% of the prefix. */
+    readonly partialRequests?: number
     readonly requests?: number
   } | undefined
   /**
