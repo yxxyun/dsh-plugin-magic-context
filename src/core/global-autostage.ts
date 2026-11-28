@@ -53,6 +53,16 @@ export interface AutoStageOutcome {
   /** Memories examined and refused, one readable reason each (deduplicated). */
   readonly skipped: ReadonlyArray<{ readonly memoryId: number; readonly reason: string }>
   /**
+   * How many rows the scan SQL returned.
+   *
+   * Reported because a tick's `itemsProcessed` is `staged + skipped`, and when
+   * that is smaller than this number the difference is rows the loop never
+   * reached — which is invisible otherwise. Measured 2026-11-28: a project with
+   * seven candidates reported three examined, and there was no way to tell from
+   * the outside whether the scan or the loop was responsible.
+   */
+  readonly scanned: number
+  /**
    * Candidates this pass published straight into their domain.
    *
    * There is no human approval step here — the standing rule is to follow
@@ -187,12 +197,12 @@ export async function autoStageGlobalCandidates(input: {
 }): Promise<AutoStageOutcome> {
   const enabled = input.store.listDomains()
     .filter(domain => domain.enabled && (domain.kind === 'machine' || domain.kind === 'org'))
-  if (enabled.length === 0) return { staged: [], skipped: [], published: [], refused: [], reason: 'domain-missing' }
+  if (enabled.length === 0) return { staged: [], skipped: [], published: [], refused: [], scanned: 0, reason: 'domain-missing' }
   if (input.llm === undefined || input.route === undefined) {
     // The user's fail-closed direction: without a classifier nothing moves —
     // the memories stay at project level instead of being silently guessed
     // into a domain.
-    return { staged: [], skipped: [], published: [], refused: [], reason: 'llm-unavailable' }
+    return { staged: [], skipped: [], published: [], refused: [], scanned: 0, reason: 'llm-unavailable' }
   }
   const limit = input.limit ?? DEFAULT_LIMIT
   const maxPending = input.maxPending ?? DEFAULT_MAX_PENDING
@@ -203,7 +213,7 @@ export async function autoStageGlobalCandidates(input: {
   const queueGuard = (domainId: string): boolean =>
     input.store.listGlobalCandidates({ state: 'pending', domainId }).length >= maxPending
   if (enabled.every(domain => queueGuard(domain.domainId))) {
-    return { staged: [], skipped: [], published: [], refused: [], reason: 'queue-full' }
+    return { staged: [], skipped: [], published: [], refused: [], scanned: 0, reason: 'queue-full' }
   }
 
   interface ScanRow {
@@ -244,7 +254,7 @@ export async function autoStageGlobalCandidates(input: {
       db.close()
     }
   } catch {
-    return { staged: [], skipped: [], published: [], refused: [], reason: 'domain-missing' }
+    return { staged: [], skipped: [], published: [], refused: [], scanned: 0, reason: 'domain-missing' }
   }
 
   const staged: Array<{ candidateId: number; memoryId: number; domainId: string }> = []
@@ -339,7 +349,7 @@ export async function autoStageGlobalCandidates(input: {
       }
     }
   }
-  return { staged, skipped, published, refused }
+  return { staged, skipped, published, refused, scanned: scan.length }
 }
 
 function promoteMemoryToCandidate(

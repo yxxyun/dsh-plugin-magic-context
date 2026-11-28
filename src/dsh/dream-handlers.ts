@@ -702,6 +702,12 @@ export function buildAutoStageHandler(deps: DreamHandlerDeps): DreamTaskHandler 
       summary: outcome.staged.length === 0
         ? `nothing staged${outcome.reason === undefined ? '' : ` (${outcome.reason})`}`
           + (reasons === '' ? '' : ` — refused: ${reasons}`)
+          // The gap between what the scan returned and what the loop accounted
+          // for is rows nobody reached. Silent until now; measured 2026-11-28 a
+          // project with seven candidates reported three examined.
+          + (outcome.scanned > outcome.staged.length + outcome.skipped.length
+            ? ` [scanned ${String(outcome.scanned)}, examined ${String(outcome.staged.length + outcome.skipped.length)}]`
+            : '')
         : `staged ${String(outcome.staged.length)}, published ${String(publishedCount)}, `
           + `refused ${String(refusedCount)}, skipped ${String(outcome.skipped.length)}`
           + (reasons === '' ? '' : ` (${reasons})`)
