@@ -245,6 +245,11 @@ describe('m[0] and m[1] on separate anchors', () => {
       // The render-epoch gate fires exactly once and names itself.
       const row = entries.find(entry => entry.kind === 'baseline')
       expect((row?.data as { hardReason?: string } | undefined)?.hardReason).toBe('render-epoch')
+      // And it is in the list, which is what a reader needs when more than one
+      // condition fired: measured 2026-11-28, the first post-upgrade baseline
+      // reported `ttl-fold` alone while this gate had ALSO fired, so the
+      // migration looked like an ordinary idle fold.
+      expect((row?.data as { hardReasons?: string[] } | undefined)?.hardReasons).toEqual(['render-epoch'])
       expect(stores.baselineState(SESSION)?.renderEpoch).toBe(BASELINE_RENDER_EPOCH)
     } finally {
       stores.close()

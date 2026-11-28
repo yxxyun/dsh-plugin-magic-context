@@ -352,10 +352,18 @@ export function createTelemetryService(deps: TelemetryDeps): TelemetryService {
         if (entry.kind !== 'baseline' || entry.data === undefined) continue
         if (entry.data.mode !== 'hard') continue
         const reason = typeof entry.data.hardReason === 'string' ? entry.data.hardReason : undefined
+        // Every condition that fired, not only the leading one. A single reason
+        // hid the render-epoch migration behind an ordinary idle fold on
+        // 2026-11-28; the pair is what tells a reader whether more than one
+        // thing moved at once.
+        const reasons = Array.isArray(entry.data.hardReasons)
+          ? entry.data.hardReasons.filter((item): item is string => typeof item === 'string')
+          : []
         return {
           lastHardRebuild: {
             at: entry.at,
             ...reason === undefined ? {} : { reason },
+            ...reasons.length === 0 ? {} : { reasons },
             ...typeof entry.data.epoch === 'number' ? { epoch: entry.data.epoch } : {},
           },
         }

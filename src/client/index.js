@@ -1181,6 +1181,9 @@ window.__ModuleLoader__.load({
         lastHardRebuild: obj(health.lastHardRebuild) === undefined ? undefined : {
           at: num(health.lastHardRebuild.at),
           reason: typeof health.lastHardRebuild.reason === 'string' ? health.lastHardRebuild.reason : undefined,
+          reasons: Array.isArray(health.lastHardRebuild.reasons)
+            ? health.lastHardRebuild.reasons.filter(item => typeof item === 'string')
+            : undefined,
           epoch: num(health.lastHardRebuild.epoch),
         },
       }
@@ -2227,7 +2230,15 @@ window.__ModuleLoader__.load({
                 ? 'S ✗ @' + served.firstChangeIndex
                 : 'S ✗'
       const hard = health.lastHardRebuild
-      const hardText = hard === undefined || hard.reason === undefined ? '' : 'H ' + hard.reason
+      // Every reason, not only the leading one: "ttl-fold + render-epoch" says the
+      // migration happened during an idle fold, which is a different fact from
+      // either alone.
+      const hardList = hard === undefined
+        ? undefined
+        : hard.reasons !== undefined && hard.reasons.length > 0
+          ? hard.reasons
+          : hard.reason === undefined ? undefined : [hard.reason]
+      const hardText = hardList === undefined ? '' : 'H ' + hardList.join('+')
       const summaryRows = [
         kv([
           pressureExact !== undefined ? 'O ' + pressureExact + '%' : '',

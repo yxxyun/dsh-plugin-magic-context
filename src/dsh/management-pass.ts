@@ -662,21 +662,29 @@ function refreshBaseline(
   const hard = ttlFold || previous === undefined || routeChanged || memoriesChanged || epochChanged || cursorUpgrade || profileChanged || renderEpochChanged || systemHashChanged
   // WHY, not just whether. Reading it back out of the journal used to need a
   // database query and a guess, because only `mode: 'hard'` was recorded while
-  // nine conditions can produce it. The order is the diagnostic priority: a
-  // session's first pass is the benign case and is named first so it is never
-  // mistaken for a cache bust.
-  const hardReason = !hard
-    ? undefined
-    : ttlFold ? 'ttl-fold'
-      : previous === undefined ? 'first-pass'
-        : routeChanged ? 'route-changed'
-          : systemHashChanged ? 'system-prompt-changed'
-            : renderEpochChanged ? 'render-epoch'
-              : epochChanged ? 'epoch-fingerprint'
-                : memoriesChanged ? 'memories-digest'
-                  : profileChanged ? 'profile-changed'
-                    : cursorUpgrade ? 'cursor-upgrade'
-                      : undefined  // Freeze targets for a HARD fold. Falling back to the previous values keeps a
+  // nine conditions can produce it.
+  //
+  // ALL the conditions that fired, not the first one. A single reason silently
+  // hides the others, and it did: measured 2026-11-28, the first baseline after
+  // the render-epoch upgrade reported `ttl-fold` alone while `render-epoch` had
+  // also fired — so the migration this journal entry exists to prove looked like
+  // an ordinary idle fold. The same pass can be several things at once; naming
+  // one of them is naming the wrong one roughly half the time.
+  const hardReasons: string[] = !hard ? [] : [
+    ...ttlFold ? ['ttl-fold'] : [],
+    ...previous === undefined ? ['first-pass'] : [],
+    ...routeChanged ? ['route-changed'] : [],
+    ...systemHashChanged ? ['system-prompt-changed'] : [],
+    ...renderEpochChanged ? ['render-epoch'] : [],
+    ...epochChanged ? ['epoch-fingerprint'] : [],
+    ...memoriesChanged ? ['memories-digest'] : [],
+    ...profileChanged ? ['profile-changed'] : [],
+    ...cursorUpgrade ? ['cursor-upgrade'] : [],
+  ]
+  // The leading reason, kept as its own field: existing queries read
+  // `hardReason`, and the first element is the one they were already getting.
+  const hardReason: string | undefined = hardReasons[0]
+  // Freeze targets for a HARD fold. Falling back to the previous values keeps a
   // pass that has no mutation lane (bridge unavailable) from rewinding them.
   const frozenCursor = updates?.cursor ?? previous?.maxMemoryMutationId
   const frozenEpochFingerprint = updates?.projectEpochFingerprint ?? previous?.projectEpochFingerprint
@@ -793,7 +801,12 @@ function refreshBaseline(
     input.journal?.warn(
       'baseline',
       'baseline not written: no non-placeholder user message to anchor it to',
-      { mode: hard ? 'hard' : 'soft', epoch: state.epoch, ...hardReason === undefined ? {} : { hardReason } },
+      {
+        mode: hard ? 'hard' : 'soft',
+        epoch: state.epoch,
+        ...hardReason === undefined ? {} : { hardReason },
+        ...hardReasons.length === 0 ? {} : { hardReasons },
+      },
       input.sessionId,
     )
     return false
@@ -886,6 +899,7 @@ function refreshBaseline(
       // and a guess. The order in `hardReason` is the diagnostic priority:
       // `first-pass` is the benign case and must never read as a cache bust.
       ...hardReason === undefined ? {} : { hardReason },
+      ...hardReasons.length === 0 ? {} : { hardReasons },
       // Also on the baseline row, for a pass that only refreshes the baseline
       // (no pass row is written then). The accuracy report reads the PASS rows;
       // this one is a convenience for ad-hoc queries.

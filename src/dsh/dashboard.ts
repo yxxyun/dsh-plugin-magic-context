@@ -304,9 +304,13 @@ export function createDashboardService(deps: DashboardDeps): DashboardService {
         }
       }
       if (hardRebuild === undefined && entry.kind === 'baseline' && entry.data !== undefined && entry.data.mode === 'hard') {
+        const reasons = Array.isArray(entry.data.hardReasons)
+          ? entry.data.hardReasons.filter((item): item is string => typeof item === 'string')
+          : []
         hardRebuild = {
           at: entry.at,
           ...typeof entry.data.hardReason === 'string' ? { reason: entry.data.hardReason } : {},
+          ...reasons.length === 0 ? {} : { reasons },
           ...typeof entry.data.epoch === 'number' ? { epoch: entry.data.epoch } : {},
         }
       }
