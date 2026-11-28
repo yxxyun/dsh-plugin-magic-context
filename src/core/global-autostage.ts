@@ -160,6 +160,19 @@ export async function autoStageGlobalCandidates(input: {
   limit?: number
   /** Pending-queue depth at which staging pauses entirely (default 10). */
   maxPending?: number
+  /**
+   * The project this tick runs for.
+   *
+   * Required in practice: the scheduler runs one tick per project (12 of them
+   * here), and without this filter every tick scans the SAME global pool.
+   * Measured 2026-11-28: 12 ticks within four minutes, each examining the same
+   * 8 rows — 8 rows became ~48 examinations per hour, and the classifier was
+   * asked about rows belonging to other projects.
+   *
+   * Absent keeps the old behaviour for callers that mean "scan everything"
+   * (tests, one-off audits); the scheduler always passes it.
+   */
+  projectPath?: string
   now: number
   /** Absent or route absent → NOTHING is staged (project-level stays, never a guessed domain). */
   llm?: AutoStageLlm
@@ -216,6 +229,7 @@ export async function autoStageGlobalCandidates(input: {
          WHERE status = 'active' AND shareable = 0 AND seen_count >= 2
            AND category IN (SELECT value FROM json_each(?))
            AND project_path NOT LIKE 'dir:global:%' AND project_path NOT LIKE 'git:global:%'
+           ${input.projectPath === undefined ? '' : 'AND project_path = ?'}
            -- A row that STARTS with markup is a fragment of one, not a fact.
            -- Measured 2026-11-28: 5 of the 13 rows this pool held were bare
            -- CONSTRAINTS / ARCHITECTURE open-close tags, classified on every
@@ -225,7 +239,7 @@ export async function autoStageGlobalCandidates(input: {
            -- the wrong rows. The leading angle bracket separates them exactly.
            AND trim(content) NOT GLOB '<*'
          ORDER BY updated_at DESC LIMIT 50`,
-      ).all(categories) as unknown as ScanRow[]
+      ).all(...input.projectPath === undefined ? [categories] : [categories, input.projectPath]) as unknown as ScanRow[]
     } finally {
       db.close()
     }

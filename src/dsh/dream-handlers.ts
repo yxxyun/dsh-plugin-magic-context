@@ -666,6 +666,8 @@ export function buildAutoStageHandler(deps: DreamHandlerDeps): DreamTaskHandler 
     const outcome = await autoStageGlobalCandidates({
       store: seam.stores,
       corpusDbPath: seam.writer.dbPath,
+      // One tick per project; without this every tick scans the same pool.
+      projectPath: context.projectPath,
       now: context.now,
       llm: seam.llm as unknown as AutoStageLlm,
       route,

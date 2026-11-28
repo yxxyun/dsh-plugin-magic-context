@@ -80,6 +80,8 @@ interface Row {
   readonly content: string
   readonly category: string
   readonly seen: number
+  /** Owner of the row; the project-scoping test needs more than one. */
+  readonly project?: string
 }
 
 function makeContract(rows: Row[]): string {
@@ -95,7 +97,7 @@ function makeContract(rows: Row[]): string {
     rows.forEach((row, index) => {
       insert.run(
         row.id,
-        'git:proj',
+        row.project ?? 'git:proj',
         row.category,
         row.content,
         `hash-${String(row.id)}`,
@@ -329,6 +331,30 @@ describe('autoStageGlobalCandidates', () => {
     })
     expect(result.staged).toHaveLength(0)
     expect(pending(s, 'dir:global:machine')).toBe(0)
+  })
+
+  it('scans only its own project when a projectPath is given', async () => {
+    // Measured 2026-11-28: 12 ticks within four minutes, each examining the same
+    // 8 rows, because the scan had no project filter — 8 rows became ~48
+    // examinations per hour and the classifier was asked about rows belonging to
+    // other projects.
+    const s = storeWithDomains(true, true)
+    const contract = makeContract([
+      { id: 51, content: '本项目专属的约束甲，跨仓库流水线必须严格串行。', category: 'CONSTRAINTS', seen: 2, project: 'git:aaaa' },
+      { id: 52, content: '别的项目的约束乙，跨仓库流水线必须严格串行。', category: 'CONSTRAINTS', seen: 2, project: 'git:bbbb' },
+    ])
+    const result = await autoStageGlobalCandidates({
+      store: s,
+      corpusDbPath: contract,
+      projectPath: 'git:aaaa',
+      now: NOW,
+      llm: classifyLlm({
+        '本项目专属的约束甲，跨仓库流水线必须严格串行。': { domain: 'project', reason: 'local' },
+      }),
+      route: { provider: 'p', model: 'm' },
+    })
+    // Only this project's row was examined.
+    expect(result.skipped).toEqual([{ memoryId: 51, reason: 'project-scope' }])
   })
 
   it('never classifies a row whose text is bare markup', async () => {
