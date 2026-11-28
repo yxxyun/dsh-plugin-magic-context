@@ -358,9 +358,12 @@ export function calibrationAnchors(): string {
  * review user observations — here, when no profile-collect sink is armed —
  * the run is told NOT to produce them, instead of producing them and
  * discarding them after the fact. Upstream appends this to the per-run USER
- * prompt so its SYSTEM prompt keeps byte-stable across configurations; the
- * adapter's contract above is already a per-call user message, so the same
- * placement costs nothing on the replayed-prefix cache.
+ * prompt so its SYSTEM prompt keeps byte-stable across configurations. The
+ * reason is cache layout, not economy of tokens: the system block precedes every
+ * message, so anything placed there changes the prefix of EVERY request, while
+ * the same text in the per-call user message changes only the suffix that is
+ * rewritten each turn anyway. The adapter's contract is already a per-call user
+ * message, so the toggle belongs beside it.
  */
 export const USER_OBSERVATIONS_DISABLED_TOGGLE = [
   '<user_observation_extraction>disabled</user_observation_extraction>',

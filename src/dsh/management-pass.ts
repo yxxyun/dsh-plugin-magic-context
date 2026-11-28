@@ -576,11 +576,14 @@ function refreshBaseline(
   // because the cached bytes still matched the cached bytes.
   const renderEpochChanged = previous !== undefined
     && (previous.renderEpoch ?? 0) !== BASELINE_RENDER_EPOCH
-  // Upstream `system-prompt-hash.ts:739`: when the system prompt changes, the
-  // provider rewrites its cache from that block onward whatever the messages pass
-  // does — so folding the baseline on the same turn costs nothing. Both sides
-  // must be present: a session whose hash has not been observed yet must not fold
-  // on every pass while it stays unknown.
+  // Upstream `system-prompt-hash.ts:739`. The system prompt precedes every
+  // message, so a change to it invalidates the cache from that block onward for
+  // EVERY request, not just the one that discovers it — unlike the idle-TTL case
+  // above, where the next request may hit again. That is why the two look alike
+  // and are not: here the fold is genuinely free, there it was not.
+  //
+  // Both sides must be present: a session whose hash has not been observed yet
+  // must not fold on every pass while it stays unknown.
   const systemHashChanged = previous !== undefined
     && previous.systemHash !== undefined
     && input.systemHash !== undefined
@@ -620,10 +623,19 @@ function refreshBaseline(
         ? true
         : previous.profileM0Digest !== profile.digest
   )
-  // The idle-TTL rebuild (policy.ttlRebuild): the band fired because `ttlMs`
-  // elapsed, i.e. the provider cache is already gone, so re-rendering here
-  // costs nothing that is not already lost and folds m[1] back into m[0] for
-  // the requests that follow. Off ⇒ the pass only lands queued work.
+  // The idle-TTL rebuild (policy.ttlRebuild). Off ⇒ the pass only lands queued
+  // work.
+  //
+  // THIS COMMENT USED TO ARGUE the opposite of what follows, and the argument
+  // was wrong: "the provider cache is already gone, so re-rendering here costs
+  // nothing that is not already lost". That is true of the ONE request that
+  // discovers the expiry and false of every request after it — the fold moves
+  // m[0], so the next request rebuilds a prefix the previous one had just
+  // rebuilt. It read as rigorous, so it survived ten days and 34 HARD rebuilds
+  // (measured 2026-11-18 → 11-28) and was even cited as a reason to keep the
+  // behaviour. An argument that defends a decision is the one kind of comment
+  // that makes a wrong decision harder to see; the tested mechanism belongs
+  // here instead, and the argument does not.
   //
   // Upstream requires a SECOND half (`transform.rs:3776-3779`):
   //

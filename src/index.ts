@@ -819,7 +819,13 @@ export async function apply(ctx: Context, config: MagicContextDshConfig = {}): P
     // Record the limit the provider just stated. It is the only trustworthy
     // source for this route (`providerProvenLimitTokens`): a catalog value may
     // describe a different deployment, and the emergency latch refuses to disarm
-    // without a proven number. Fail-open — an unparseable message costs nothing.
+    // without a proven number.
+    //
+    // Fail-open, and NOT because a miss is free: a message whose limit cannot be
+    // parsed leaves the latch armed, so the next overflow tries again. The reason
+    // is that the alternative is worse — a throw here would replace the
+    // provider's own error with ours, and the person would lose the message that
+    // said what actually went wrong.
     try {
       const context = payload.agent?.session === undefined
         ? undefined
