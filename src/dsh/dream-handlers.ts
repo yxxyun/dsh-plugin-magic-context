@@ -698,19 +698,25 @@ export function buildAutoStageHandler(deps: DreamHandlerDeps): DreamTaskHandler 
       // pool changes nothing visible until it lands. Counting only `staged`
       // made this lane look idle on a night when rows did reach the domain.
       itemsChanged: publishedCount,
+      // `itemsChanged` counts PUBLISHED rows, not staged ones. A pass that stages
+      // three candidates and publishes none reports 0 changed and 3 processed,
+      // which reads as "three rejections" — the difference matters when reading
+      // a night's log.
+      ...{},
       tokensUsed: 0,
       summary: outcome.staged.length === 0
         ? `nothing staged${outcome.reason === undefined ? '' : ` (${outcome.reason})`}`
           + (reasons === '' ? '' : ` — refused: ${reasons}`)
-          // The gap between what the scan returned and what the loop accounted
-          // for is rows nobody reached. Silent until now; measured 2026-11-28 a
-          // project with seven candidates reported three examined.
-          + (outcome.scanned > outcome.staged.length + outcome.skipped.length
-            ? ` [scanned ${String(outcome.scanned)}, examined ${String(outcome.staged.length + outcome.skipped.length)}]`
-            : '')
+          // ALWAYS reported, not only when it differs. An earlier version showed
+          // this only when scanned > examined, which cannot distinguish "the scan
+          // returned three" from "the scan returned seven and the loop stopped at
+          // three" — and on 2026-11-28 a project with seven candidates reported
+          // three examined with no bracket either way, so the ambiguity stayed.
+          + ` [scanned ${String(outcome.scanned)}, examined ${String(outcome.staged.length + outcome.skipped.length)}]`
         : `staged ${String(outcome.staged.length)}, published ${String(publishedCount)}, `
           + `refused ${String(refusedCount)}, skipped ${String(outcome.skipped.length)}`
           + (reasons === '' ? '' : ` (${reasons})`)
+          + (outcome.staged.length === 0 ? '' : ` · staged ${String(outcome.staged.length)}`)
           + (refusedCount === 0 ? '' : ` — refusals stay pending for review_global`),
     }
   }
